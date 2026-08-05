@@ -8,23 +8,32 @@ db
 libdbms.so
 example_crud
 KeepDBMS.apk
+a.out
+newdb
+*.bak
 
 # Database Files & Journals
 *.db
 *.db-journal
 *.db-wal
+*.vac_tmp
 bench_api_*.db*
 my_app.db*
 test_*.db*
 
-# Tooling & Temporary SDK Downloads
+# Tooling & Temporary Files
 tools/
 Archive/
+Archive.zip
+Backup.tar.gz
+with4extrafeatures.zip
 scratch/
 apps/
 .temp/
 
 # Android Project Build Folders
+Android/
+Android/.gradle/
 apps/android/.gradle/
 apps/android/build/
 apps/android/app/build/
