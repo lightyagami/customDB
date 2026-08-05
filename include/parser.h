@@ -174,6 +174,7 @@ struct Statement {
 
   /* CREATE TABLE */
   TableDef new_table;
+  bool     if_not_exists;   /* true when IF NOT EXISTS was present */
 
   /* CREATE INDEX */
   char     index_name[COL_NAME_SIZE];

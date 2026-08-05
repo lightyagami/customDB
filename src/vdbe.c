@@ -45,12 +45,7 @@ void vdbe_free(Vdbe* vm) {
     if (vm->cursors[c].is_open) {
       if (vm->cursors[c].btree_cursor) {
         free(vm->cursors[c].btree_cursor);
-      }
-      if (vm->cursors[c].table_handle) {
-        if (vm->cursors[c].table_handle->def) {
-          free(vm->cursors[c].table_handle->def);
-        }
-        free(vm->cursors[c].table_handle);
+        vm->cursors[c].btree_cursor = NULL;
       }
     }
   }
@@ -101,9 +96,8 @@ void vdbe_run(Vdbe* vm) {
         break;
       }
       case OP_String: {
-        memcpy(vm->regs[i->p3].val.text_val, i->p4.text_val, sizeof(vm->regs[i->p3].val.text_val) - 1);
-        vm->regs[i->p3].val.text_val[sizeof(vm->regs[i->p3].val.text_val) - 1] = '\0';
-        vm->regs[i->p3].type = COL_VARCHAR;
+        vm->regs[i->p3].val = i->p4;
+        vm->regs[i->p3].type = COL_TEXT;
         vm->regs[i->p3].is_null = false;
         break;
       }
@@ -118,60 +112,51 @@ void vdbe_run(Vdbe* vm) {
         uint32_t cursor_idx = i->p1;
         uint32_t root_page = i->p2;
         char* tbl_name = i->p4.text_val;
-        
-        TableDef* def = NULL;
-        if (strncmp(tbl_name, "_idx_", 5) == 0) {
-          /* Resolve synthetic index TableDef dynamically */
-          for (uint32_t t = 0; t < vm->catalog->num_tables; t++) {
-            TableDef* mdef = &vm->catalog->tables[t];
-            for (uint32_t c = 1; c < mdef->num_cols; c++) {
-              char expected[128];
-              snprintf(expected, sizeof(expected), "_idx_%s_%s", mdef->name, mdef->columns[c].name);
-              if (strcmp(tbl_name, expected) == 0) {
-                def = malloc(sizeof(TableDef));
-                memset(def, 0, sizeof(TableDef));
-                snprintf(def->name, sizeof(def->name), "%.*s", (int)sizeof(def->name) - 1, tbl_name);
-                def->root_page_num = root_page;
-                def->num_cols = 2;
-                memcpy(&def->columns[0], &mdef->columns[c], sizeof(Column));
-                strcpy(def->columns[1].name, "id");
-                def->columns[1].type = COL_INT;
-                def->columns[1].size = 4;
-                tabledef_compute(def);
-                break;
-              }
-            }
-            if (def) break;
-          }
-        } else {
-          TableDef* catalog_def = catalog_find(vm->catalog, tbl_name);
-          if (catalog_def) {
-            def = malloc(sizeof(TableDef));
-            memcpy(def, catalog_def, sizeof(TableDef));
-            def->root_page_num = root_page;
-          }
-        }
-
-        if (!def) {
-          fprintf(stderr, "VM Error: Table or index '%s' not found.\n", tbl_name);
-          exit(1);
-        }
-
         VmCursor* vc = &vm->cursors[cursor_idx];
-        if (vc->is_open) {
-          if (vc->btree_cursor) free(vc->btree_cursor);
-          if (vc->table_handle) {
-            if (vc->table_handle->def) free(vc->table_handle->def);
-            free(vc->table_handle);
+
+        if (!vc->is_open) {
+          bool found = false;
+          if (strncmp(tbl_name, "_idx_", 5) == 0) {
+            /* Resolve synthetic index TableDef dynamically */
+            for (uint32_t t = 0; t < vm->catalog->num_tables; t++) {
+              TableDef* mdef = &vm->catalog->tables[t];
+              for (uint32_t c = 1; c < mdef->num_cols; c++) {
+                char expected[128];
+                snprintf(expected, sizeof(expected), "_idx_%s_%s", mdef->name, mdef->columns[c].name);
+                if (strcmp(tbl_name, expected) == 0) {
+                  memset(&vc->def, 0, sizeof(TableDef));
+                  snprintf(vc->def.name, sizeof(vc->def.name), "%.*s", (int)sizeof(vc->def.name) - 1, tbl_name);
+                  vc->def.root_page_num = root_page;
+                  vc->def.num_cols = 2;
+                  memcpy(&vc->def.columns[0], &mdef->columns[c], sizeof(Column));
+                  strcpy(vc->def.columns[1].name, "id");
+                  vc->def.columns[1].type = COL_INT;
+                  vc->def.columns[1].size = 4;
+                  tabledef_compute(&vc->def);
+                  found = true;
+                  break;
+                }
+              }
+              if (found) break;
+            }
+          } else {
+            TableDef* catalog_def = catalog_find(vm->catalog, tbl_name);
+            if (catalog_def) {
+              memcpy(&vc->def, catalog_def, sizeof(TableDef));
+              found = true;
+            }
           }
+
+          if (!found) {
+            fprintf(stderr, "VM Error: Table or index '%s' not found.\n", tbl_name);
+            exit(1);
+          }
+
+          vc->table_handle.pager = vm->pager;
+          vc->table_handle.def = &vc->def;
+          vc->btree_cursor = NULL;
+          vc->is_open = true;
         }
-        vc->def = def;
-        
-        vc->table_handle = malloc(sizeof(Table));
-        vc->table_handle->pager = vm->pager;
-        vc->table_handle->def = def;
-        vc->btree_cursor = NULL;
-        vc->is_open = true;
         break;
       }
       case OP_Rewind: {
@@ -179,7 +164,7 @@ void vdbe_run(Vdbe* vm) {
         uint32_t jump_pc = i->p2;
         VmCursor* vc = &vm->cursors[cursor_idx];
         if (vc->btree_cursor) free(vc->btree_cursor);
-        vc->btree_cursor = btree_start(vc->table_handle);
+        vc->btree_cursor = btree_start(&vc->table_handle);
         if (vc->btree_cursor->end_of_table) {
           vm->pc = jump_pc;
         }
@@ -204,7 +189,7 @@ void vdbe_run(Vdbe* vm) {
         VmCursor* vc = &vm->cursors[cursor_idx];
         if (vc->btree_cursor) free(vc->btree_cursor);
         
-        vc->btree_cursor = btree_find(vc->table_handle, &vm->regs[reg_idx].val);
+        vc->btree_cursor = btree_find(&vc->table_handle, &vm->regs[reg_idx].val);
         void* node = get_page(vm->pager, vc->btree_cursor->page_num);
         uint32_t num_cells = *(uint32_t*)((uint8_t*)node + 6);
         if (vc->btree_cursor->cell_num >= num_cells) {
@@ -219,7 +204,7 @@ void vdbe_run(Vdbe* vm) {
         VmCursor* vc = &vm->cursors[cursor_idx];
         if (vc->btree_cursor) free(vc->btree_cursor);
         
-        vc->btree_cursor = btree_find(vc->table_handle, &vm->regs[reg_idx].val);
+        vc->btree_cursor = btree_find(&vc->table_handle, &vm->regs[reg_idx].val);
         void* node = get_page(vm->pager, vc->btree_cursor->page_num);
         uint32_t num_cells = *(uint32_t*)((uint8_t*)node + 6);
         if (vc->btree_cursor->cell_num >= num_cells) {
@@ -228,7 +213,7 @@ void vdbe_run(Vdbe* vm) {
           /* Skip keys that are equal to register value */
           Value existing_val;
           btree_key_value(vc->btree_cursor, &existing_val);
-          int cmp = compare_values(vc->def->columns[0].type, &existing_val, &vm->regs[reg_idx].val);
+          int cmp = compare_values(vc->def.columns[0].type, &existing_val, &vm->regs[reg_idx].val);
           if (cmp == 0) {
             cursor_advance(vc->btree_cursor);
             if (vc->btree_cursor->end_of_table) {
@@ -244,9 +229,9 @@ void vdbe_run(Vdbe* vm) {
         uint32_t dest_reg = i->p3;
         VmCursor* vc = &vm->cursors[cursor_idx];
         Value row_vals[MAX_COLUMNS];
-        deserialize_row(vc->def, cursor_value(vc->btree_cursor), row_vals);
+        deserialize_row(&vc->def, cursor_value(vc->btree_cursor), row_vals);
         vm->regs[dest_reg].val = row_vals[col_idx];
-        vm->regs[dest_reg].type = vc->def->columns[col_idx].type;
+        vm->regs[dest_reg].type = vc->def.columns[col_idx].type;
         vm->regs[dest_reg].is_null = row_vals[col_idx].is_null;
         break;
       }
@@ -302,7 +287,7 @@ void vdbe_run(Vdbe* vm) {
           case OP_LT:  vm->cmp_result = (cmp < 0); break;
           case OP_GTE: vm->cmp_result = (cmp >= 0); break;
           case OP_LTE: vm->cmp_result = (cmp <= 0); break;
-          case OP_MATCH: vm->cmp_result = (strstr(ra->val.text_val, rb->val.text_val) != NULL || strcasestr(ra->val.text_val, rb->val.text_val) != NULL); break;
+          case OP_MATCH: vm->cmp_result = (strstr(ra->val.text_val, rb->val.text_val) != NULL); break;
           default:     vm->cmp_result = false; break;
         }
         break;
@@ -357,15 +342,15 @@ void vdbe_run(Vdbe* vm) {
         
         Value values[MAX_COLUMNS];
         memset(values, 0, sizeof(values));
-        for (uint32_t c = 0; c < vc->def->num_cols; c++) {
+        for (uint32_t c = 0; c < vc->def.num_cols; c++) {
           values[c] = vm->regs[start_reg + c].val;
           values[c].is_null = vm->regs[start_reg + c].is_null;
         }
 
-        /* Seek and insert */
-        Cursor* bcur = btree_find(vc->table_handle, &values[0]);
-        btree_insert(bcur, values);
-        free(bcur);
+        /* Seek and insert using stack Cursor */
+        Cursor bcur;
+        btree_find_out(&vc->table_handle, &values[0], &bcur);
+        btree_insert(&bcur, values);
         break;
       }
       case OP_Delete: {

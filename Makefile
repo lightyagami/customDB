@@ -1,18 +1,24 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -Iinclude -O2
-SRCS = src/pager.c src/catalog.c src/btree.c src/cursor.c src/parser.c src/vdbe.c src/executor.c src/main.c
+CFLAGS = -Wall -Wextra -Iinclude -O2 -fPIC
+SRCS = src/pager.c src/catalog.c src/btree.c src/cursor.c src/parser.c src/vdbe.c src/executor.c src/api.c
+MAIN_SRC = src/main.c
 OBJS = $(SRCS:.c=.o)
+MAIN_OBJ = src/main.o
 TARGET = db
+LIB_TARGET = libdbms.so
 
-all: $(TARGET)
+all: $(TARGET) $(LIB_TARGET)
 
-$(TARGET): $(OBJS)
+$(TARGET): $(OBJS) $(MAIN_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^
+
+$(LIB_TARGET): $(OBJS)
+	$(CC) -shared -fPIC $(CFLAGS) -o $@ $^
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f src/*.o $(TARGET) $(LIB_TARGET)
 
-.PHONY: all clean
+.PHONY: all lib clean

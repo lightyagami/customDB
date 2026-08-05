@@ -593,13 +593,16 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       if (strncasecmp(p, "add column", 10) == 0) p += 10;
       else p += 3;
       p = skip_whitespace(p);
-      TableDef dummy_def;
-      memset(&dummy_def, 0, sizeof(TableDef));
-      dummy_def.num_cols = 0;
-      parse_create_cols(p, &dummy_def);
-      if (dummy_def.num_cols > 0) {
-        out->new_col = dummy_def.columns[0];
-      }
+      Column col;
+      memset(&col, 0, sizeof(Column));
+      p = parse_identifier(p, col.name, COL_NAME_SIZE);
+      p = skip_whitespace(p);
+      char type_buf[32];
+      p = parse_identifier(p, type_buf, sizeof(type_buf));
+      if (strcasecmp(type_buf, "int") == 0 || strcasecmp(type_buf, "integer") == 0) { col.type = COL_INT; col.size = 4; }
+      else if (strcasecmp(type_buf, "double") == 0 || strcasecmp(type_buf, "real") == 0) { col.type = COL_DOUBLE; col.size = 8; }
+      else { col.type = COL_TEXT; col.size = MAX_TEXT_SIZE; }
+      out->new_col = col;
     } else if (strncasecmp(p, "drop column", 11) == 0 || strncasecmp(p, "drop", 4) == 0) {
       out->alter_type = ALTER_DROP_COLUMN;
       if (strncasecmp(p, "drop column", 11) == 0) p += 11;
@@ -1043,6 +1046,9 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
     p = skip_whitespace(p);
     if (strncasecmp(p, "virtual table", 13) == 0) {
       p += 13;
+      p = skip_whitespace(p);
+      /* Skip optional IF NOT EXISTS */
+      if (strncasecmp(p, "if not exists", 13) == 0) { p += 13; p = skip_whitespace(p); out->if_not_exists = true; }
       out->type = STATEMENT_CREATE_VTABLE;
       p = parse_identifier(p, out->table_name, TBL_NAME_SIZE);
       if (strlen(out->table_name) == 0) return PREPARE_SYNTAX_ERROR;
@@ -1168,6 +1174,9 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
 
     if (strncasecmp(p, "table", 5) == 0) {
       p += 5;
+      p = skip_whitespace(p);
+      /* Skip optional IF NOT EXISTS */
+      if (strncasecmp(p, "if not exists", 13) == 0) { p += 13; p = skip_whitespace(p); out->if_not_exists = true; }
       out->type = STATEMENT_CREATE_TABLE;
       p = parse_identifier(p, out->new_table.name, TBL_NAME_SIZE);
       if (strlen(out->new_table.name) == 0) return PREPARE_SYNTAX_ERROR;

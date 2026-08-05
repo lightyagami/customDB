@@ -40,7 +40,25 @@ static void fire_triggers(Catalog* catalog, Pager* pager, const char* table_name
 }
 
 /* Compile and run INSERT statement on VDBE */
+static void vm_reset_static(Vdbe* vm) {
+  for (uint32_t c = 0; c < MAX_CURSORS; c++) {
+    if (vm->cursors[c].is_open && vm->cursors[c].btree_cursor) {
+      free(vm->cursors[c].btree_cursor);
+      vm->cursors[c].btree_cursor = NULL;
+    }
+  }
+}
+
 static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* catalog, Pager* pager) {
+  bool auto_tx = false;
+  if (!pager->in_transaction) {
+    pager_begin_transaction(pager);
+    if (pager->lock_error) {
+      return EXECUTE_BUSY;
+    }
+    auto_tx = true;
+  }
+
   fire_triggers(catalog, pager, def->name, TRIGGER_BEFORE, TRIGGER_INSERT);
 
   /* AUTOINCREMENT auto-assignment */
@@ -64,7 +82,26 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     }
   }
 
-  Vdbe* vm = vdbe_create(pager, catalog);
+  static Vdbe static_insert_vm;
+  static bool static_insert_vm_inited = false;
+  if (!static_insert_vm_inited) {
+    memset(&static_insert_vm, 0, sizeof(Vdbe));
+    static_insert_vm.max_insts = 64;
+    static_insert_vm.insts = malloc(sizeof(Instruction) * 64);
+    static_insert_vm_inited = true;
+  }
+
+  Vdbe* vm = &static_insert_vm;
+  vm->pager = pager;
+  vm->catalog = catalog;
+  vm->num_insts = 0;
+  vm->pc = 0;
+  memset(vm->regs, 0, sizeof(vm->regs));
+  for (uint32_t c = 0; c < MAX_CURSORS; c++) {
+    vm->cursors[c].is_open = false;
+    vm->cursors[c].btree_cursor = NULL;
+  }
+
   Value tbl_name_val;
   memset(&tbl_name_val, 0, sizeof(Value));
   strncpy(tbl_name_val.text_val, def->name, sizeof(tbl_name_val.text_val)-1);
@@ -73,7 +110,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
   /* Load insert values into registers 1 to N */
   for (uint32_t i = 0; i < def->num_cols; i++) {
     Column* col = &def->columns[i];
-    char* raw = stmt->raw_values[i];
+    char* raw = (i < stmt->num_values) ? stmt->raw_values[i] : NULL;
     Value v;
     memset(&v, 0, sizeof(Value));
 
@@ -84,7 +121,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
 
     /* NOT NULL constraint */
     if ((raw == NULL || strlen(raw) == 0 || strcasecmp(raw, "null") == 0) && col->is_not_null) {
-      vdbe_free(vm);
+      vm_reset_static(vm);
       return EXECUTE_CONSTRAINT_NOT_NULL;
     }
 
@@ -128,7 +165,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
         default:     pass = false; break;
       }
       if (!pass) {
-        vdbe_free(vm);
+        vm_reset_static(vm);
         return EXECUTE_CONSTRAINT_CHECK;
       }
     }
@@ -137,7 +174,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     if (col->has_fk && raw != NULL && strlen(raw) > 0 && strcasecmp(raw, "null") != 0) {
       TableDef* target_def = catalog_find(catalog, col->fk_target_table);
       if (target_def == NULL) {
-        vdbe_free(vm);
+        vm_reset_static(vm);
         return EXECUTE_CONSTRAINT_FOREIGN_KEY;
       }
       Table target_table = { pager, target_def };
@@ -175,7 +212,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
       free(target_cursor);
 
       if (!fk_found) {
-        vdbe_free(vm);
+        vm_reset_static(vm);
         return EXECUTE_CONSTRAINT_FOREIGN_KEY;
       }
     }
@@ -206,10 +243,11 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
         case COL_TEXT:
         case COL_VARCHAR:
           if (col->type != COL_BLOB && strlen(raw) >= col->size) {
-            vdbe_free(vm);
+            vm_reset_static(vm);
             return EXECUTE_BAD_SCHEMA;
           }
-          strncpy(v.text_val, raw, sizeof(v.text_val) - 1);
+          memcpy(v.text_val, raw, sizeof(v.text_val) - 1);
+          v.text_val[sizeof(v.text_val) - 1] = '\0';
           vdbe_add_inst(vm, OP_String, 0, 0, i + 1, v);
           break;
       }
@@ -245,7 +283,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
         }
         free(u_cur);
         if (u_dup) {
-          vdbe_free(vm);
+          vm_reset_static(vm);
           return EXECUTE_CONSTRAINT_UNIQUE;
         }
       }
@@ -263,7 +301,12 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
   vdbe_add_inst(vm, OP_Halt, 0, 0, 0, (Value){0});
 
   vdbe_run(vm);
-  vdbe_free(vm);
+  for (uint32_t c = 0; c < MAX_CURSORS; c++) {
+    if (vm->cursors[c].is_open && vm->cursors[c].btree_cursor) {
+      free(vm->cursors[c].btree_cursor);
+      vm->cursors[c].btree_cursor = NULL;
+    }
+  }
 
   /* Maintain secondary indexes (directly for simple index synchronization) */
   Value values[MAX_COLUMNS];
@@ -338,6 +381,10 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     }
   }
 
+  if (auto_tx && pager->in_transaction) {
+    catalog_save(catalog, pager);
+    pager_commit(pager);
+  }
   fire_triggers(catalog, pager, def->name, TRIGGER_AFTER, TRIGGER_INSERT);
   return EXECUTE_SUCCESS;
 }
@@ -468,7 +515,7 @@ static void eval_expr_string(const char* expr, TableDef* def, Value* row_vals, c
   if (strncasecmp(expr, "json_extract(", 13) == 0) {
     const char* p = expr + 13;
     p = skip_space(p);
-    char arg1[256] = {0};
+    char arg1[MAX_TEXT_SIZE] = {0};
     char arg2[128] = {0};
 
     if (*p == '\'' || *p == '"') {
@@ -2255,7 +2302,8 @@ static ExecuteResult execute_create_table(Statement* stmt, Catalog* catalog, Pag
 
   TableDef* existing = catalog_find(catalog, stmt->new_table.name);
   if (existing != NULL) {
-    return EXECUTE_TABLE_EXISTS;
+    /* Only suppress error when IF NOT EXISTS was explicitly written */
+    return stmt->if_not_exists ? EXECUTE_SUCCESS : EXECUTE_TABLE_EXISTS;
   }
 
   /* Add to catalog */
@@ -2839,8 +2887,48 @@ static ExecuteResult execute_alter_table(Statement* stmt, Catalog* catalog, Page
     if (def->num_cols >= MAX_COLUMNS) {
       return EXECUTE_BAD_SCHEMA;
     }
-    def->columns[def->num_cols++] = stmt->new_col;
-    tabledef_compute(def);
+
+    Table old_tbl = { pager, def };
+    Cursor* cur = btree_start(&old_tbl);
+
+    TableDef new_def = *def;
+    new_def.columns[new_def.num_cols] = stmt->new_col;
+    new_def.num_cols++;
+    tabledef_compute(&new_def);
+
+    uint32_t new_root = get_unused_page_num(pager);
+    void* root_node = get_page(pager, new_root);
+    initialize_root_leaf(root_node);
+    new_def.root_page_num = new_root;
+
+    Table new_tbl = { pager, &new_def };
+
+    /* Rewrite every existing row so it's serialized with the new column
+     * count too — this table previously only updated the schema and left
+     * old rows on disk serialized with the old (smaller) column count,
+     * which caused deserialize_row to read past each old row's actual
+     * data (and potentially past the page) once def->num_cols grew. */
+    while (!cur->end_of_table) {
+      Value old_vals[MAX_COLUMNS];
+      deserialize_row(def, cursor_value(cur), old_vals);
+
+      Value new_vals[MAX_COLUMNS];
+      memset(new_vals, 0, sizeof(new_vals));
+      for (uint32_t c = 0; c < def->num_cols; c++) {
+        new_vals[c] = old_vals[c];
+      }
+      /* New column defaults to NULL/zero for pre-existing rows. */
+      new_vals[def->num_cols].is_null = true;
+
+      Cursor* ins_cur = btree_find(&new_tbl, &new_vals[0]);
+      btree_insert(ins_cur, new_vals);
+      free(ins_cur);
+
+      cursor_advance(cur);
+    }
+    free(cur);
+
+    *def = new_def;
     catalog_save(catalog, pager);
     printf("Column '%s' added to table '%s'.\n", stmt->new_col.name, def->name);
     return EXECUTE_SUCCESS;

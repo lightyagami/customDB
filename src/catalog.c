@@ -104,6 +104,11 @@ void catalog_load(Catalog* catalog, Pager* pager) {
 }
 
 void catalog_save(Catalog* catalog, Pager* pager) {
+  /* Refuse to write if a lock could not be acquired — safer than corrupting data */
+  if (pager->lock_error) {
+    fprintf(stderr, "Error: catalog_save aborted — database is locked.\n");
+    return;
+  }
   pager->reserved_catalog_pages = 33;
 
   uint8_t* page0 = (uint8_t*)get_page(pager, 0);
@@ -172,8 +177,8 @@ void catalog_save(Catalog* catalog, Pager* pager) {
   uint8_t av_byte = pager->auto_vacuum ? 1 : 0;
   memcpy(vt_page_ptr + 500, &av_byte, 1);
 
-  for (uint32_t p = 0; p <= pager->num_pages; p++) {
-    if (p < pager->max_pages && pager->pages[p]) {
+  for (uint32_t p = 0; p < pager->max_pages; p++) {
+    if (pager->pages[p] != NULL) {
       pager_flush(pager, p);
     }
   }

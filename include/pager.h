@@ -22,6 +22,7 @@ typedef struct {
   char     journal_filename[512];
   char     main_filename[256];
   bool*    page_is_journaled;
+  bool*    is_dirty;
   
   /* Concurrency Lock State */
   PagerLockState lock_state;
@@ -47,6 +48,11 @@ typedef struct {
 
   /* In-Memory Database Mode */
   bool     is_memory;
+
+  /* Set to true if a lock could not be acquired after retries.
+   * Callers should check this and propagate the error rather than
+   * proceeding with potentially unsafe writes. */
+  bool     lock_error;
 } Pager;
 
 Pager*   pager_open(const char* filename);

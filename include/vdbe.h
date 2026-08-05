@@ -69,9 +69,9 @@ typedef struct {
 
 typedef struct {
   Cursor*   btree_cursor;
-  TableDef* def;
+  TableDef  def;
   bool      is_open;
-  Table*    table_handle;
+  Table     table_handle;
 } VmCursor;
 
 typedef struct {

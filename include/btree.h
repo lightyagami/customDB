@@ -8,7 +8,9 @@ void initialize_root_leaf(void* node);
 
 /* ── B+ Tree core operations ─────────────────────────────────────────────── */
 Cursor* btree_find(Table* table, Value* key_value);
+void    btree_find_out(Table* table, Value* key_value, Cursor* out_cursor);
 Cursor* btree_start(Table* table);
+void    btree_start_out(Table* table, Cursor* out_cursor);
 
 /* Insert a new row */
 void    btree_insert(Cursor* cursor, Value* values);

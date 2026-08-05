@@ -166,6 +166,9 @@ int main(int argc, char* argv[]) {
       case EXECUTE_CONSTRAINT_FOREIGN_KEY:
         printf("Error: FOREIGN KEY constraint failed.\n");
         break;
+      case EXECUTE_BUSY:
+        printf("Error: Database is locked.\n");
+        break;
     }
   }
 

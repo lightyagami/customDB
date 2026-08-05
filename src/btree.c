@@ -105,6 +105,7 @@ static inline void* internal_node_cell(void* node, uint32_t i) {
 static inline uint32_t* internal_node_child(void* node, uint32_t i) {
   uint32_t n = *internal_node_num_keys(node);
   if (i > n) { fprintf(stderr, "internal_node_child: index %u > num_keys %u\n", i, n); exit(1); }
+  if (i == n) return internal_node_right_child(node);
   return (uint32_t*)internal_node_cell(node, i);
 }
 static inline void* internal_node_key(void* node, uint32_t i) {
@@ -476,6 +477,24 @@ Cursor* btree_find(Table* table, Value* key_value) {
   return internal_node_find(table, table->def->root_page_num, raw_key);
 }
 
+void btree_find_out(Table* table, Value* key_value, Cursor* out_cursor) {
+  uint8_t raw_key[INTERNAL_NODE_KEY_SIZE];
+  serialize_col0_key(table->def, key_value, raw_key);
+
+  uint32_t page_num = table->def->root_page_num;
+  void* node = get_page(table->pager, page_num);
+  while (get_node_type(node) == NODE_INTERNAL) {
+    uint32_t child_idx = internal_node_find_child(node, raw_key, table->def);
+    page_num = *internal_node_child(node, child_idx);
+    node = get_page(table->pager, page_num);
+  }
+
+  out_cursor->table = table;
+  out_cursor->page_num = page_num;
+  out_cursor->end_of_table = false;
+  out_cursor->cell_num = leaf_node_find(node, raw_key, table->def);
+}
+
 Cursor* btree_start(Table* table) {
   Value dummy_key;
   memset(&dummy_key, 0, sizeof(Value));
@@ -484,6 +503,15 @@ Cursor* btree_start(Table* table) {
   pager_journal_page(table->pager, c->page_num);
   c->end_of_table = (*leaf_node_num_cells(node) == 0);
   return c;
+}
+
+void btree_start_out(Table* table, Cursor* out_cursor) {
+  Value dummy_key;
+  memset(&dummy_key, 0, sizeof(Value));
+  btree_find_out(table, &dummy_key, out_cursor);
+  void* node = get_page(table->pager, out_cursor->page_num);
+  pager_journal_page(table->pager, out_cursor->page_num);
+  out_cursor->end_of_table = (*leaf_node_num_cells(node) == 0);
 }
 
 void btree_key_value(Cursor* cursor, Value* out_val) {
@@ -747,6 +775,7 @@ static void leaf_node_split_and_insert(Cursor* cursor, Value* values) {
   bool was_root = is_node_root(old_node);
   initialize_leaf_node(old_node);
   if (was_root) set_node_root(old_node, true);
+  *leaf_node_next_leaf(old_node) = new_page;
 
   /* Populate left child (old_node) */
   uint16_t old_offset = 4096;

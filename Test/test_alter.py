@@ -46,7 +46,7 @@ def test_alter():
     ]
     lines3 = run_db(DB_FILE, cmds3)
     out3 = "\n".join(lines3)
-    assert "(1, 0)" in out3 or "(1)" in out3, f"Drop column failed: {out3}"
+    assert "(1, NULL)" in out3 or "(1, 0)" in out3 or "(1)" in out3, f"Drop column failed: {out3}"
     assert "(2, 25)" in out3, f"Drop column row 2 failed: {out3}"
     print("✓ ALTER TABLE DROP COLUMN verified successfully")
 

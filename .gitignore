@@ -1,0 +1,42 @@
+# C Engine Build Binaries & Objects
+src/*.o
+*.o
+*.so
+*.a
+*.exe
+db
+libdbms.so
+example_crud
+KeepDBMS.apk
+
+# Database Files & Journals
+*.db
+*.db-journal
+*.db-wal
+bench_api_*.db*
+my_app.db*
+test_*.db*
+
+# Tooling & Temporary SDK Downloads
+tools/
+Archive/
+scratch/
+apps/
+.temp/
+
+# Android Project Build Folders
+apps/android/.gradle/
+apps/android/build/
+apps/android/app/build/
+apps/android/app/.cxx/
+apps/android/local.properties
+.idea/
+*.iml
+
+# WebAssembly Output Files
+apps/web/libdbms.js
+apps/web/libdbms.wasm
+
+# Operating System Files
+.DS_Store
+Thumbs.db
