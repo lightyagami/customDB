@@ -1,7 +1,5 @@
 #include "btree.h"
 
-/* cursor.c: Table lifecycle. Cursor ops live in btree.c (btree_find, etc.) */
-
 Table* table_open(TableDef* def, Pager* pager) {
   Table* t  = malloc(sizeof(Table));
   t->pager  = pager;

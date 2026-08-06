@@ -408,9 +408,6 @@ void pager_commit(Pager* pager) {
     }
   }
 
-  /* Crash-safe ordering: journal must be durable before we start
-   * overwriting main DB pages — but only needs ONE fsync for the whole
-   * transaction, not one per page. */
   if (pager->journal_fd != -1) {
     fdatasync(pager->journal_fd);
   }
@@ -424,9 +421,6 @@ void pager_commit(Pager* pager) {
     }
   }
 
-  /* One durability sync for the whole transaction, after all dirty pages
-   * are written — matches how commit-time fsync works in practice (SQLite
-   * does the same: write all dirty pages, fsync once at commit). */
   if (pager->use_wal && pager->wal_fd != -1) {
     fdatasync(pager->wal_fd);
   } else if (pager->file_descriptor != -1) {
@@ -600,10 +594,7 @@ void pager_close(Pager* pager) {
   if (pager->in_transaction) {
     pager_commit(pager);
   }
-  /* Flush ALL allocated pages (num_pages may be 0 on fresh DB). Only
-   * pages still marked dirty actually need a write — pager_commit()
-   * above (if a transaction was open) already flushed the rest, and
-   * re-writing already-clean pages here would be redundant I/O. */
+
   for (uint32_t i = 0; i < pager->max_pages; i++) {
     if (pager->pages[i] != NULL) {
       if (pager->is_dirty == NULL || pager->is_dirty[i]) {
