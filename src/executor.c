@@ -8,7 +8,7 @@ static void make_idx_name(char dst[IDX_NAME_SIZE],
   snprintf(dst, IDX_NAME_SIZE, "_idx_%.31s_%.31s", tbl, col);
 }
 
-static bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog* catalog, Pager* pager);
+bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog* catalog, Pager* pager);
 static ExecuteResult execute_vacuum(Catalog* catalog, Pager* pager);
 
 /* Compile and run transaction statement on VDBE */
@@ -1450,7 +1450,7 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
   return EXECUTE_SUCCESS;
 }
 
-static bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog* catalog, Pager* pager);
+bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog* catalog, Pager* pager);
 
 /* Compile and run aggregate SELECT statement */
 static ExecuteResult run_aggregate_select(Statement* stmt, TableDef* def, Catalog* catalog, Pager* pager) {
@@ -1706,7 +1706,7 @@ static ExecuteResult run_group_by_select(Statement* stmt, TableDef* def, Catalog
   return EXECUTE_SUCCESS;
 }
 
-static bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog* catalog, Pager* pager) {
+bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog* catalog, Pager* pager) {
   if (wc == NULL || !wc->has_where) return true;
   for (uint32_t i = 0; i < wc->num_conds; i++) {
     SingleCond* cond = &wc->conds[i];

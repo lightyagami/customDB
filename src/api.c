@@ -12,21 +12,6 @@
 #include <string.h>
 #include <ctype.h>
 
-/* ---------------------------------------------------------------------------
- * resolve_param_placeholders
- * Walk every WHERE condition in `stmt`.  For each condition whose raw_val
- * begins with '?' resolve it to the corresponding bound value stored in
- * stmt->raw_values[].
- *
- * Positional syntax supported:
- *   ?      – auto-numbered (condition index, 0-based)
- *   ?1     – explicitly the first bound value (raw_values[0])
- *   ?2     – second bound value (raw_values[1])  … etc.
- *
- * The replacement is a *literal copy* of the user-supplied string, so even
- * if the caller passes "' OR '1'='1" it is compared as a string value, never
- * interpreted as SQL, giving genuine parameterised-query protection.
- * ---------------------------------------------------------------------------*/
 static void resolve_param_placeholders(Statement* stmt) {
   WhereClause* wc = &stmt->where_clause;
   if (!wc->has_where) return;
@@ -40,7 +25,6 @@ static void resolve_param_placeholders(Statement* stmt) {
 
     int p_idx;
     if (rv[1] >= '1' && rv[1] <= '9') {
-      /* Explicit: ?1 -> raw_values[0], ?2 -> raw_values[1] … */
       p_idx = rv[1] - '1';
     } else {
       /* Implicit positional */
@@ -73,10 +57,7 @@ struct dbms_stmt {
   
   /* Result cursor data */
   TableDef* target_def;
-  Table target_table;   /* backing storage for btree_cur — MUST outlive the
-                            dbms_step() call that creates it, since btree_cur
-                            keeps a pointer back into this struct across
-                            multiple dbms_step() calls (row-by-row iteration) */
+  Table target_table;
   Cursor* btree_cur;
   Value current_row_vals[MAX_COLUMNS];
   bool has_current_row;
@@ -256,24 +237,8 @@ int dbms_step(dbms_stmt* pStmt) {
   if (pStmt == NULL || pStmt->db == NULL) return DBMS_MISUSE;
 
   if (pStmt->stmt.type == STATEMENT_SELECT) {
-    /* Resolve bound '?' parameters before any scan/filter. */
-    if (!pStmt->executed) resolve_param_placeholders(&pStmt->stmt);
-
-    /* If a WHERE clause is present, delegate to execute_statement which
-       runs the full run_select_vm pipeline (with WHERE evaluation).
-       We do this once and store matching rows in the result set. */
-    if (pStmt->stmt.where_clause.has_where) {
-      if (!pStmt->executed) {
-        ExecuteResult res = execute_statement(&pStmt->stmt, &pStmt->db->catalog, pStmt->db->pager);
-        pStmt->executed = true;
-        (void)res;
-      }
-      pStmt->has_current_row = false;
-      return DBMS_DONE;
-    }
-
-    /* No WHERE — use the efficient step-by-step btree cursor path. */
     if (!pStmt->executed) {
+      resolve_param_placeholders(&pStmt->stmt);
       pStmt->target_def = catalog_find(&pStmt->db->catalog, pStmt->stmt.table_name);
       if (pStmt->target_def == NULL) return DBMS_ERROR;
 
@@ -285,6 +250,13 @@ int dbms_step(dbms_stmt* pStmt) {
     while (pStmt->btree_cur && !pStmt->btree_cur->end_of_table) {
       deserialize_row(pStmt->target_def, cursor_value(pStmt->btree_cur), pStmt->current_row_vals);
       cursor_advance(pStmt->btree_cur);
+
+      if (pStmt->stmt.where_clause.has_where) {
+        if (!eval_where_clause(pStmt->target_def, pStmt->current_row_vals, &pStmt->stmt.where_clause, &pStmt->db->catalog, pStmt->db->pager)) {
+          continue;
+        }
+      }
+
       pStmt->has_current_row = true;
       return DBMS_ROW;
     }
@@ -299,9 +271,6 @@ int dbms_step(dbms_stmt* pStmt) {
     resolve_param_placeholders(&pStmt->stmt);
 
     if (pStmt->stmt.type == STATEMENT_INSERT && pStmt->compiled_vm != NULL) {
-      /* Fast path: reuse the VDBE program compiled once at dbms_prepare_v2
-         time. Patch this call's bound values into the existing instruction
-         operands instead of re-parsing/re-planning the SQL from scratch. */
       Vdbe* vm = pStmt->compiled_vm;
       TableDef* def = pStmt->target_def;
       for (uint32_t i = 0; i < def->num_cols; i++) {

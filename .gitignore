@@ -8,6 +8,10 @@ db
 libdbms.so
 example_crud
 KeepDBMS.apk
+KeepDBMS_Release.apk
+KeepDBMS_Release.aab
+*.jks
+*.keystore
 a.out
 newdb
 *.bak
