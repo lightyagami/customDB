@@ -1,8 +1,9 @@
 #include "catalog.h"
 
 /* ── On-disk catalog entry layout ────────────────────────────────────────── */
-#define DISK_COL_SIZE  120u
-#define DISK_ENTRY_SIZE (IDX_NAME_SIZE + 4u + 4u + MAX_COLUMNS * DISK_COL_SIZE + 328u)
+#define DISK_COL_SIZE    200u
+#define VTAB_BASE_OFFSET (IDX_NAME_SIZE + 4u + 4u + MAX_COLUMNS * DISK_COL_SIZE)
+#define DISK_ENTRY_SIZE  (VTAB_BASE_OFFSET + 1u + 64u + 256u)
 
 /* ── Computed fields ─────────────────────────────────────────────────────── */
 void tabledef_compute(TableDef* def) {
@@ -82,10 +83,10 @@ void catalog_load(Catalog* catalog, Pager* pager) {
     }
 
     uint8_t is_v = 0;
-    memcpy(&is_v, base + 1000, 1);
+    memcpy(&is_v, base + VTAB_BASE_OFFSET, 1);
     def->is_virtual = (is_v == 1);
-    memcpy(def->vtab_module, base + 1001, 64); def->vtab_module[63] = '\0';
-    memcpy(def->vtab_args, base + 1065, 256); def->vtab_args[255] = '\0';
+    memcpy(def->vtab_module, base + VTAB_BASE_OFFSET + 1, 64); def->vtab_module[63] = '\0';
+    memcpy(def->vtab_args, base + VTAB_BASE_OFFSET + 65, 256); def->vtab_args[255] = '\0';
     tabledef_compute(def);
   }
 
@@ -162,9 +163,9 @@ void catalog_save(Catalog* catalog, Pager* pager) {
     }
 
     uint8_t is_v = def->is_virtual ? 1 : 0;
-    memcpy(base + 1000, &is_v, 1);
-    memcpy(base + 1001, def->vtab_module, 64);
-    memcpy(base + 1065, def->vtab_args, 256);
+    memcpy(base + VTAB_BASE_OFFSET, &is_v, 1);
+    memcpy(base + VTAB_BASE_OFFSET + 1, def->vtab_module, 64);
+    memcpy(base + VTAB_BASE_OFFSET + 65, def->vtab_args, 256);
   }
 
   uint8_t* vt_page_ptr = (uint8_t*)get_page(pager, 15);
