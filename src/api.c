@@ -11,6 +11,53 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <pthread.h>
+
+typedef struct PathMutexNode {
+  char filename[256];
+  pthread_mutex_t file_mutex;
+  int ref_count;
+  struct PathMutexNode* next;
+} PathMutexNode;
+
+static PathMutexNode* g_path_mutex_head = NULL;
+static pthread_mutex_t g_dbms_global_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_mutex_t* get_file_path_mutex(const char* filename) {
+  PathMutexNode* curr = g_path_mutex_head;
+  while (curr) {
+    if (strcmp(curr->filename, filename) == 0) {
+      curr->ref_count++;
+      return &curr->file_mutex;
+    }
+    curr = curr->next;
+  }
+  PathMutexNode* node = malloc(sizeof(PathMutexNode));
+  strncpy(node->filename, filename, sizeof(node->filename) - 1);
+  node->filename[sizeof(node->filename) - 1] = '\0';
+  pthread_mutex_init(&node->file_mutex, NULL);
+  node->ref_count = 1;
+  node->next = g_path_mutex_head;
+  g_path_mutex_head = node;
+  return &node->file_mutex;
+}
+
+static void release_file_path_mutex(const char* filename) {
+  PathMutexNode** pp = &g_path_mutex_head;
+  while (*pp) {
+    if (strcmp((*pp)->filename, filename) == 0) {
+      (*pp)->ref_count--;
+      if ((*pp)->ref_count <= 0) {
+        PathMutexNode* to_free = *pp;
+        *pp = (*pp)->next;
+        pthread_mutex_destroy(&to_free->file_mutex);
+        free(to_free);
+      }
+      return;
+    }
+    pp = &(*pp)->next;
+  }
+}
 
 static void resolve_param_placeholders(Statement* stmt) {
   WhereClause* wc = &stmt->where_clause;
@@ -46,6 +93,9 @@ struct dbms {
   char last_error[256];
   int last_changes;
   int64_t last_rowid;
+  pthread_mutex_t mutex;
+  pthread_mutex_t* file_mutex;
+  char filename[256];
 };
 
 struct dbms_stmt {
@@ -65,28 +115,64 @@ struct dbms_stmt {
 
 int dbms_open(const char* filename, dbms** ppDb) {
   if (ppDb == NULL) return DBMS_MISUSE;
+
+  pthread_mutex_lock(&g_dbms_global_mutex);
+
+  pthread_mutex_t* fmutex = get_file_path_mutex(filename);
+  pthread_mutex_lock(fmutex);
+
   dbms* db = malloc(sizeof(dbms));
   memset(db, 0, sizeof(dbms));
+  pthread_mutex_init(&db->mutex, NULL);
+  db->file_mutex = fmutex;
+  strncpy(db->filename, filename, sizeof(db->filename) - 1);
 
   db->pager = pager_open(filename);
   if (db->pager == NULL) {
+    pthread_mutex_destroy(&db->mutex);
+    release_file_path_mutex(filename);
     free(db);
     *ppDb = NULL;
+    pthread_mutex_unlock(fmutex);
+    pthread_mutex_unlock(&g_dbms_global_mutex);
     return DBMS_ERROR;
   }
 
   catalog_load(&db->catalog, db->pager);
   *ppDb = db;
+
+  pthread_mutex_unlock(fmutex);
+  pthread_mutex_unlock(&g_dbms_global_mutex);
   return DBMS_OK;
 }
 
 int dbms_close(dbms* pDb) {
   if (pDb == NULL) return DBMS_OK;
+
+  pthread_mutex_lock(&g_dbms_global_mutex);
+  pthread_mutex_t* fmutex = pDb->file_mutex;
+  if (fmutex) pthread_mutex_lock(fmutex);
+  pthread_mutex_lock(&pDb->mutex);
+
   if (pDb->pager) {
     catalog_save(&pDb->catalog, pDb->pager);
     pager_close(pDb->pager);
   }
+
+  pthread_mutex_unlock(&pDb->mutex);
+  pthread_mutex_destroy(&pDb->mutex);
+
+  char fn[256];
+  strncpy(fn, pDb->filename, sizeof(fn) - 1);
+  fn[sizeof(fn) - 1] = '\0';
+
   free(pDb);
+
+  if (fmutex) {
+    pthread_mutex_unlock(fmutex);
+    release_file_path_mutex(fn);
+  }
+  pthread_mutex_unlock(&g_dbms_global_mutex);
   return DBMS_OK;
 }
 
@@ -100,12 +186,17 @@ int dbms_exec(dbms* pDb, const char* sql, int (*callback)(void*, int, char**, ch
   (void)arg;
   if (pDb == NULL || sql == NULL) return DBMS_MISUSE;
 
+  if (pDb->file_mutex) pthread_mutex_lock(pDb->file_mutex);
+  pthread_mutex_lock(&pDb->mutex);
+
   Statement stmt;
   memset(&stmt, 0, sizeof(Statement));
   PrepareResult prep = prepare_statement(sql, &stmt);
   if (prep != PREPARE_SUCCESS) {
     snprintf(pDb->last_error, sizeof(pDb->last_error), "SQL parse error");
     if (errmsg) *errmsg = strdup(pDb->last_error);
+    pthread_mutex_unlock(&pDb->mutex);
+    if (pDb->file_mutex) pthread_mutex_unlock(pDb->file_mutex);
     return DBMS_ERROR;
   }
 
@@ -113,20 +204,29 @@ int dbms_exec(dbms* pDb, const char* sql, int (*callback)(void*, int, char**, ch
   if (pDb->pager->lock_error) {
     snprintf(pDb->last_error, sizeof(pDb->last_error), "Database is locked by another process");
     if (errmsg) *errmsg = strdup(pDb->last_error);
+    pthread_mutex_unlock(&pDb->mutex);
+    if (pDb->file_mutex) pthread_mutex_unlock(pDb->file_mutex);
     return DBMS_BUSY;
   }
   if (res != EXECUTE_SUCCESS) {
     snprintf(pDb->last_error, sizeof(pDb->last_error), "SQL execution error (%d)", res);
     if (errmsg) *errmsg = strdup(pDb->last_error);
+    pthread_mutex_unlock(&pDb->mutex);
+    if (pDb->file_mutex) pthread_mutex_unlock(pDb->file_mutex);
     return DBMS_ERROR;
   }
 
   catalog_load(&pDb->catalog, pDb->pager);
+  pthread_mutex_unlock(&pDb->mutex);
+  if (pDb->file_mutex) pthread_mutex_unlock(pDb->file_mutex);
   return DBMS_OK;
 }
 
 int dbms_prepare_v2(dbms* pDb, const char* zSql, int nByte, dbms_stmt** ppStmt, const char** pzTail) {
   if (pDb == NULL || zSql == NULL || ppStmt == NULL) return DBMS_MISUSE;
+
+  if (pDb->file_mutex) pthread_mutex_lock(pDb->file_mutex);
+  pthread_mutex_lock(&pDb->mutex);
   catalog_load(&pDb->catalog, pDb->pager);
 
   char sql_buf[512];
@@ -149,6 +249,8 @@ int dbms_prepare_v2(dbms* pDb, const char* zSql, int nByte, dbms_stmt** ppStmt, 
     snprintf(pDb->last_error, sizeof(pDb->last_error), "Prepare error");
     free(stmt);
     *ppStmt = NULL;
+    pthread_mutex_unlock(&pDb->mutex);
+    if (pDb->file_mutex) pthread_mutex_unlock(pDb->file_mutex);
     return DBMS_ERROR;
   }
 
@@ -190,6 +292,9 @@ int dbms_prepare_v2(dbms* pDb, const char* zSql, int nByte, dbms_stmt** ppStmt, 
   if (pzTail) *pzTail = zSql + (nByte > 0 ? nByte : (int)strlen(zSql));
   stmt->target_def = catalog_find(&pDb->catalog, stmt->stmt.table_name);
   *ppStmt = stmt;
+
+  pthread_mutex_unlock(&pDb->mutex);
+  if (pDb->file_mutex) pthread_mutex_unlock(pDb->file_mutex);
   return DBMS_OK;
 }
 
@@ -236,11 +341,18 @@ int dbms_bind_null(dbms_stmt* pStmt, int index) {
 int dbms_step(dbms_stmt* pStmt) {
   if (pStmt == NULL || pStmt->db == NULL) return DBMS_MISUSE;
 
+  if (pStmt->db->file_mutex) pthread_mutex_lock(pStmt->db->file_mutex);
+  pthread_mutex_lock(&pStmt->db->mutex);
+
   if (pStmt->stmt.type == STATEMENT_SELECT) {
     if (!pStmt->executed) {
       resolve_param_placeholders(&pStmt->stmt);
       pStmt->target_def = catalog_find(&pStmt->db->catalog, pStmt->stmt.table_name);
-      if (pStmt->target_def == NULL) return DBMS_ERROR;
+      if (pStmt->target_def == NULL) {
+        pthread_mutex_unlock(&pStmt->db->mutex);
+        if (pStmt->db->file_mutex) pthread_mutex_unlock(pStmt->db->file_mutex);
+        return DBMS_ERROR;
+      }
 
       pStmt->target_table = (Table){ pStmt->db->pager, pStmt->target_def };
       pStmt->btree_cur = btree_start(&pStmt->target_table);
@@ -258,10 +370,14 @@ int dbms_step(dbms_stmt* pStmt) {
       }
 
       pStmt->has_current_row = true;
+      pthread_mutex_unlock(&pStmt->db->mutex);
+      if (pStmt->db->file_mutex) pthread_mutex_unlock(pStmt->db->file_mutex);
       return DBMS_ROW;
     }
 
     pStmt->has_current_row = false;
+    pthread_mutex_unlock(&pStmt->db->mutex);
+    if (pStmt->db->file_mutex) pthread_mutex_unlock(pStmt->db->file_mutex);
     return DBMS_DONE;
   }
 
@@ -293,21 +409,31 @@ int dbms_step(dbms_stmt* pStmt) {
     } else {
       ExecuteResult res = execute_statement(&pStmt->stmt, &pStmt->db->catalog, pStmt->db->pager);
       pStmt->executed = true;
-      if (res != EXECUTE_SUCCESS) return DBMS_ERROR;
+      if (res != EXECUTE_SUCCESS) {
+        pthread_mutex_unlock(&pStmt->db->mutex);
+        if (pStmt->db->file_mutex) pthread_mutex_unlock(pStmt->db->file_mutex);
+        return DBMS_ERROR;
+      }
     }
   }
 
+  pthread_mutex_unlock(&pStmt->db->mutex);
+  if (pStmt->db->file_mutex) pthread_mutex_unlock(pStmt->db->file_mutex);
   return DBMS_DONE;
 }
 
 int dbms_reset(dbms_stmt* pStmt) {
   if (pStmt == NULL) return DBMS_MISUSE;
+  if (pStmt->db && pStmt->db->file_mutex) pthread_mutex_lock(pStmt->db->file_mutex);
+  if (pStmt->db) pthread_mutex_lock(&pStmt->db->mutex);
   if (pStmt->btree_cur) {
     free(pStmt->btree_cur);
     pStmt->btree_cur = NULL;
   }
   pStmt->executed = false;
   pStmt->has_current_row = false;
+  if (pStmt->db) pthread_mutex_unlock(&pStmt->db->mutex);
+  if (pStmt->db && pStmt->db->file_mutex) pthread_mutex_unlock(pStmt->db->file_mutex);
   return DBMS_OK;
 }
 
