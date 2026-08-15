@@ -110,6 +110,14 @@ typedef enum {
   JOIN_FULL
 } JoinType;
 
+#define MAX_JOINS 8
+typedef struct {
+  JoinType type;
+  char     right_table[TBL_NAME_SIZE];
+  char     left_col[COL_NAME_SIZE];
+  char     right_col[COL_NAME_SIZE];
+} JoinItem;
+
 typedef struct {
   JoinType type;
   char     left_col[COL_NAME_SIZE];
@@ -206,6 +214,8 @@ struct Statement {
   bool       has_join;
   char       join_table_name[TBL_NAME_SIZE];
   JoinClause join_clause;
+  uint32_t   num_joins;
+  JoinItem   joins[MAX_JOINS];
 
   /* ORDER BY */
   bool          has_order_by;

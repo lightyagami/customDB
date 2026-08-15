@@ -480,7 +480,15 @@ double dbms_column_double(dbms_stmt* pStmt, int col) {
 const char* dbms_column_text(dbms_stmt* pStmt, int col) {
   if (pStmt == NULL || !pStmt->has_current_row) return "";
   int actual = get_projected_col_idx(pStmt, col);
-  if (actual < 0 || actual >= MAX_COLUMNS) return "";
+  if (actual < 0) {
+    if (pStmt->stmt.num_select_cols > 0 && col >= 0 && col < (int)pStmt->stmt.num_select_cols) {
+      static __thread char expr_buf[256];
+      eval_expr_string(pStmt->stmt.select_cols[col].col_name, pStmt->target_def, pStmt->current_row_vals, expr_buf, sizeof(expr_buf));
+      return expr_buf;
+    }
+    return "";
+  }
+  if (actual >= MAX_COLUMNS) return "";
   if (pStmt->target_def && actual < (int)pStmt->target_def->num_cols) {
     if (pStmt->target_def->columns[actual].type == COL_INT) {
       static __thread char int_buf[32];

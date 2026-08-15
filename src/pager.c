@@ -80,6 +80,10 @@ Pager* pager_open(const char* filename) {
   pager->journal_fd = -1;
   pager->page_is_journaled = NULL;
 
+  for (int t = 0; t < MAX_TABLES; t++) {
+    pthread_rwlock_init(&pager->table_rwlocks[t], NULL);
+  }
+
   return pager;
 }
 

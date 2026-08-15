@@ -855,71 +855,67 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       return PREPARE_SUCCESS;
     }
 
-    p = skip_whitespace(p);
-    out->join_clause.type = JOIN_INNER;
-    if (strncasecmp(p, "left", 4) == 0) {
-      out->join_clause.type = JOIN_LEFT;
-      p += 4;
+    out->num_joins = 0;
+    while (*p) {
       p = skip_whitespace(p);
-      if (strncasecmp(p, "outer", 5) == 0) { p += 5; p = skip_whitespace(p); }
-      if (strncasecmp(p, "join", 4) == 0) { p += 4; }
-      out->has_join = true;
-    } else if (strncasecmp(p, "right", 5) == 0) {
-      out->join_clause.type = JOIN_RIGHT;
-      p += 5;
-      p = skip_whitespace(p);
-      if (strncasecmp(p, "outer", 5) == 0) { p += 5; p = skip_whitespace(p); }
-      if (strncasecmp(p, "join", 4) == 0) { p += 4; }
-      out->has_join = true;
-    } else if (strncasecmp(p, "full", 4) == 0) {
-      out->join_clause.type = JOIN_FULL;
-      p += 4;
-      p = skip_whitespace(p);
-      if (strncasecmp(p, "outer", 5) == 0) { p += 5; p = skip_whitespace(p); }
-      if (strncasecmp(p, "join", 4) == 0) { p += 4; }
-      out->has_join = true;
-    } else if (strncasecmp(p, "inner", 5) == 0) {
-      out->join_clause.type = JOIN_INNER;
-      p += 5;
-      p = skip_whitespace(p);
-      if (strncasecmp(p, "join", 4) == 0) { p += 4; }
-      out->has_join = true;
-    } else if (strncasecmp(p, "join", 4) == 0) {
-      out->join_clause.type = JOIN_INNER;
-      p += 4;
-      out->has_join = true;
-    }
+      JoinType j_type = JOIN_INNER;
+      bool is_join = false;
+      if (strncasecmp(p, "left", 4) == 0) {
+        j_type = JOIN_LEFT; p += 4; p = skip_whitespace(p);
+        if (strncasecmp(p, "outer", 5) == 0) { p += 5; p = skip_whitespace(p); }
+        if (strncasecmp(p, "join", 4) == 0) { p += 4; }
+        is_join = true;
+      } else if (strncasecmp(p, "right", 5) == 0) {
+        j_type = JOIN_RIGHT; p += 5; p = skip_whitespace(p);
+        if (strncasecmp(p, "outer", 5) == 0) { p += 5; p = skip_whitespace(p); }
+        if (strncasecmp(p, "join", 4) == 0) { p += 4; }
+        is_join = true;
+      } else if (strncasecmp(p, "full", 4) == 0) {
+        j_type = JOIN_FULL; p += 4; p = skip_whitespace(p);
+        if (strncasecmp(p, "outer", 5) == 0) { p += 5; p = skip_whitespace(p); }
+        if (strncasecmp(p, "join", 4) == 0) { p += 4; }
+        is_join = true;
+      } else if (strncasecmp(p, "inner", 5) == 0) {
+        j_type = JOIN_INNER; p += 5; p = skip_whitespace(p);
+        if (strncasecmp(p, "join", 4) == 0) { p += 4; }
+        is_join = true;
+      } else if (strncasecmp(p, "join", 4) == 0) {
+        j_type = JOIN_INNER; p += 4;
+        is_join = true;
+      }
 
-    if (out->has_join) {
-      p = parse_identifier(p, out->join_table_name, TBL_NAME_SIZE);
-      if (strlen(out->join_table_name) == 0) return PREPARE_SYNTAX_ERROR;
+      if (!is_join) break;
+      if (out->num_joins >= MAX_JOINS) return PREPARE_SYNTAX_ERROR;
+
+      JoinItem* ji = &out->joins[out->num_joins++];
+      ji->type = j_type;
+      p = parse_identifier(p, ji->right_table, TBL_NAME_SIZE);
+      if (strlen(ji->right_table) == 0) return PREPARE_SYNTAX_ERROR;
 
       p = skip_whitespace(p);
       if (strncasecmp(p, "on", 2) != 0) return PREPARE_SYNTAX_ERROR;
       p += 2;
 
-      /* Parse left column (handles both users.id or id) */
       char left_tok[COL_NAME_SIZE];
       p = parse_identifier(p, left_tok, sizeof(left_tok));
       char* left_dot = strchr(left_tok, '.');
-      if (left_dot != NULL) {
-        snprintf(out->join_clause.left_col, COL_NAME_SIZE, "%s", left_dot + 1);
-      } else {
-        snprintf(out->join_clause.left_col, COL_NAME_SIZE, "%s", left_tok);
-      }
+      snprintf(ji->left_col, COL_NAME_SIZE, "%s", left_dot ? left_dot + 1 : left_tok);
 
       p = skip_whitespace(p);
       if (*p != '=') return PREPARE_SYNTAX_ERROR;
       p++;
 
-      /* Parse right column (handles both orders.user_id or user_id) */
       char right_tok[COL_NAME_SIZE];
       p = parse_identifier(p, right_tok, sizeof(right_tok));
       char* right_dot = strchr(right_tok, '.');
-      if (right_dot != NULL) {
-        snprintf(out->join_clause.right_col, COL_NAME_SIZE, "%s", right_dot + 1);
-      } else {
-        snprintf(out->join_clause.right_col, COL_NAME_SIZE, "%s", right_tok);
+      snprintf(ji->right_col, COL_NAME_SIZE, "%s", right_dot ? right_dot + 1 : right_tok);
+
+      out->has_join = true;
+      if (out->num_joins == 1) {
+        out->join_clause.type = ji->type;
+        strcpy(out->join_table_name, ji->right_table);
+        strcpy(out->join_clause.left_col, ji->left_col);
+        strcpy(out->join_clause.right_col, ji->right_col);
       }
     }
 

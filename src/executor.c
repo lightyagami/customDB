@@ -49,7 +49,7 @@ static void fire_triggers(Catalog* catalog, Pager* pager, const char* table_name
 }
 
 typedef struct {
-  Value row[MAX_COLUMNS];
+  Value row[MAX_COLUMNS * 8];
   Value sort_keys[4];
   ColumnType sort_types[4];
   CollationType sort_colls[4];
@@ -592,7 +592,7 @@ static void eval_json_extract(const char* json_str, const char* path, char* out_
   }
 }
 
-static void eval_expr_string(const char* expr, TableDef* def, Value* row_vals, char* out_buf, size_t out_size) {
+void eval_expr_string(const char* expr, TableDef* def, Value* row_vals, char* out_buf, size_t out_size) {
   out_buf[0] = '\0';
   time_t t = time(NULL);
   struct tm* tm_info = localtime(&t);
@@ -841,9 +841,20 @@ static void print_projected_row(Statement* stmt, TableDef* def, Value* row_vals)
     int col_idx = -1;
     if (def != NULL) {
       for (uint32_t c = 0; c < def->num_cols; c++) {
-        if (strcmp(def->columns[c].name, sc->col_name) == 0) {
+        if (strcasecmp(def->columns[c].name, sc->col_name) == 0) {
           col_idx = (int)c;
           break;
+        }
+      }
+      if (col_idx == -1) {
+        const char* dot = strchr(sc->col_name, '.');
+        if (dot != NULL) {
+          for (uint32_t c = 0; c < def->num_cols; c++) {
+            if (strcasecmp(def->columns[c].name, dot + 1) == 0) {
+              col_idx = (int)c;
+              break;
+            }
+          }
         }
       }
     }
@@ -1525,313 +1536,356 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
   return EXECUTE_SUCCESS;
 }
 
-/* Compile and run multi-table JOIN statement on VDBE */
+typedef struct HashJoinNode {
+  Value key;
+  Value vals[MAX_COLUMNS];
+  bool  matched;
+  struct HashJoinNode* next;
+} HashJoinNode;
+
+#define HASH_JOIN_BUCKETS 1024
+
+static inline uint32_t compute_hash_join_key(const Value* v) {
+  if (v == NULL || v->is_null) return 0;
+  uint32_t h = 2166136261u;
+  if (v->int_val != 0) {
+    const uint8_t* p = (const uint8_t*)&v->int_val;
+    for (size_t i = 0; i < 4; i++) { h ^= p[i]; h *= 16777619u; }
+  } else if (v->double_val != 0.0) {
+    const uint8_t* p = (const uint8_t*)&v->double_val;
+    for (size_t i = 0; i < 8; i++) { h ^= p[i]; h *= 16777619u; }
+  } else {
+    for (const char* p = v->text_val; *p; p++) { h ^= (uint8_t)*p; h *= 16777619u; }
+  }
+  return h % HASH_JOIN_BUCKETS;
+}
+
+typedef struct {
+  uint32_t num_vals;
+  Value vals[MAX_COLUMNS * 8];
+} JoinedStreamRow;
+
+/* Compile and run multi-table chained Hash Join engine */
 static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Catalog* catalog, Pager* pager) {
-  TableDef* right_def = catalog_find(catalog, stmt->join_table_name);
-  if (right_def == NULL) {
-    return EXECUTE_TABLE_NOT_FOUND;
+  uint32_t num_joins = (stmt->num_joins > 0) ? stmt->num_joins : 1;
+  JoinItem joins_copy[MAX_JOINS];
+  if (stmt->num_joins > 0) {
+    for (uint32_t j = 0; j < stmt->num_joins; j++) joins_copy[j] = stmt->joins[j];
+  } else {
+    joins_copy[0].type = stmt->join_clause.type;
+    strcpy(joins_copy[0].right_table, stmt->join_table_name);
+    strcpy(joins_copy[0].left_col, stmt->join_clause.left_col);
+    strcpy(joins_copy[0].right_col, stmt->join_clause.right_col);
   }
 
-  /* Resolve column indices */
-  int left_col_idx = -1;
-  for (uint32_t i = 0; i < left_def->num_cols; i++) {
-    if (strcmp(left_def->columns[i].name, stmt->join_clause.left_col) == 0) {
-      left_col_idx = (int)i;
-      break;
-    }
-  }
-  int right_col_idx = -1;
-  for (uint32_t i = 0; i < right_def->num_cols; i++) {
-    if (strcmp(right_def->columns[i].name, stmt->join_clause.right_col) == 0) {
-      right_col_idx = (int)i;
-      break;
-    }
-  }
-
-  if (left_col_idx == -1 || right_col_idx == -1) {
-    return EXECUTE_BAD_SCHEMA;
-  }
-
-  if (stmt->join_clause.type != JOIN_INNER) {
-    Table left_tbl = { pager, left_def };
-    Table right_tbl = { pager, right_def };
-
-    TableDef combined_def;
-    memset(&combined_def, 0, sizeof(TableDef));
-    snprintf(combined_def.name, sizeof(combined_def.name), "%.*s_%.*s",
-             (int)(IDX_NAME_SIZE / 2 - 1), left_def->name,
-             (int)(IDX_NAME_SIZE / 2 - 1), right_def->name);
-    combined_def.num_cols = left_def->num_cols + right_def->num_cols;
-    for (uint32_t i = 0; i < left_def->num_cols; i++) combined_def.columns[i] = left_def->columns[i];
-    for (uint32_t i = 0; i < right_def->num_cols; i++) combined_def.columns[left_def->num_cols + i] = right_def->columns[i];
-
-    uint32_t r_capacity = 16;
-    bool* right_matched = calloc(r_capacity, sizeof(bool));
-
-    Cursor* l_cur = btree_start(&left_tbl);
-    while (!l_cur->end_of_table) {
-      Value l_vals[MAX_COLUMNS];
-      deserialize_row(left_def, cursor_value(l_cur), l_vals);
-      Value* l_key = &l_vals[left_col_idx];
-
-      bool l_matched = false;
-      Cursor* r_cur = btree_start(&right_tbl);
-      uint32_t r_idx = 0;
-
-      while (!r_cur->end_of_table) {
-        if (r_idx >= r_capacity) {
-          uint32_t old_cap = r_capacity;
-          r_capacity *= 2;
-          right_matched = realloc(right_matched, sizeof(bool) * r_capacity);
-          memset(right_matched + old_cap, 0, sizeof(bool) * (r_capacity - old_cap));
-        }
-
-        Value r_vals[MAX_COLUMNS];
-        deserialize_row(right_def, cursor_value(r_cur), r_vals);
-        Value* r_key = &r_vals[right_col_idx];
-
-        bool keys_match = false;
-        if (!l_key->is_null && !r_key->is_null) {
-          ColumnType ktype = left_def->columns[left_col_idx].type;
-          if (ktype == COL_INT) keys_match = (l_key->int_val == r_key->int_val);
-          else if (ktype == COL_FLOAT) keys_match = (l_key->float_val == r_key->float_val);
-          else if (ktype == COL_DOUBLE) keys_match = (l_key->double_val == r_key->double_val);
-          else if (ktype == COL_BOOL) keys_match = (l_key->bool_val == r_key->bool_val);
-          else keys_match = (strcmp(l_key->text_val, r_key->text_val) == 0);
-        }
-
-        if (keys_match) {
-          l_matched = true;
-          right_matched[r_idx] = true;
-
-          Value comb[MAX_COLUMNS * 2];
-          for (uint32_t i = 0; i < left_def->num_cols; i++) comb[i] = l_vals[i];
-          for (uint32_t i = 0; i < right_def->num_cols; i++) comb[left_def->num_cols + i] = r_vals[i];
-
-          if (eval_where_clause(&combined_def, comb, &stmt->where_clause, catalog, pager)) {
-            print_projected_row(stmt, &combined_def, comb);
-          }
-        }
-        r_idx++;
-        cursor_advance(r_cur);
-      }
-      free(r_cur);
-
-      if (!l_matched && (stmt->join_clause.type == JOIN_LEFT || stmt->join_clause.type == JOIN_FULL)) {
-        Value comb[MAX_COLUMNS * 2];
-        for (uint32_t i = 0; i < left_def->num_cols; i++) comb[i] = l_vals[i];
-        for (uint32_t i = 0; i < right_def->num_cols; i++) {
-          memset(&comb[left_def->num_cols + i], 0, sizeof(Value));
-          comb[left_def->num_cols + i].is_null = true;
-        }
-        if (eval_where_clause(&combined_def, comb, &stmt->where_clause, catalog, pager)) {
-          print_projected_row(stmt, &combined_def, comb);
-        }
-      }
-      cursor_advance(l_cur);
-    }
-    free(l_cur);
-
-    if (stmt->join_clause.type == JOIN_RIGHT || stmt->join_clause.type == JOIN_FULL) {
-      Cursor* r_cur = btree_start(&right_tbl);
-      uint32_t r_idx = 0;
-      while (!r_cur->end_of_table) {
-        if (!right_matched[r_idx]) {
-          Value r_vals[MAX_COLUMNS];
-          deserialize_row(right_def, cursor_value(r_cur), r_vals);
-
-          Value comb[MAX_COLUMNS * 2];
-          for (uint32_t i = 0; i < left_def->num_cols; i++) {
-            memset(&comb[i], 0, sizeof(Value));
-            comb[i].is_null = true;
-          }
-          for (uint32_t i = 0; i < right_def->num_cols; i++) comb[left_def->num_cols + i] = r_vals[i];
-
-          if (eval_where_clause(&combined_def, comb, &stmt->where_clause, catalog, pager)) {
-            print_projected_row(stmt, &combined_def, comb);
-          }
-        }
-        r_idx++;
-        cursor_advance(r_cur);
-      }
-      free(r_cur);
-    }
-
-    free(right_matched);
-    return EXECUTE_SUCCESS;
-  }
-
-  Vdbe* vm = vdbe_create(pager, catalog);
-
-  /* Open cursor 0 for left table */
-  Value l_tbl;
-  memset(&l_tbl, 0, sizeof(Value));
-  strncpy(l_tbl.text_val, left_def->name, sizeof(l_tbl.text_val)-1);
-  vdbe_add_inst(vm, OP_OpenRead, 0, left_def->root_page_num, 0, l_tbl);
-
-  /* Open cursor 1 for right table */
-  Value r_tbl;
-  memset(&r_tbl, 0, sizeof(Value));
-  strncpy(r_tbl.text_val, right_def->name, sizeof(r_tbl.text_val)-1);
-  vdbe_add_inst(vm, OP_OpenRead, 1, right_def->root_page_num, 0, r_tbl);
-
-  /* Left loop rewind */
-  vdbe_add_inst(vm, OP_Rewind, 0, 999, 0, (Value){0}); // jump to halt if empty
-  
-  int left_loop_body = vm->num_insts;
-  
-  /* Load left columns to registers 1 .. N */
+  /* Combined schema representing current joined stream */
+  TableDef combined_def;
+  memset(&combined_def, 0, sizeof(TableDef));
+  snprintf(combined_def.name, sizeof(combined_def.name), "%s", left_def->name);
+  combined_def.num_cols = left_def->num_cols;
   for (uint32_t c = 0; c < left_def->num_cols; c++) {
-    vdbe_add_inst(vm, OP_Column, 0, c, c + 1, (Value){0});
+    combined_def.columns[c] = left_def->columns[c];
   }
 
-  /* Right seek: Load join key from register left_col_idx + 1 */
-  int join_key_reg = left_col_idx + 1;
+  /* Initial stream from base table left_def */
+  Table left_tbl = { pager, left_def };
+  Cursor* l_cur = btree_start(&left_tbl);
+  uint32_t stream_cap = 64;
+  uint32_t stream_count = 0;
+  JoinedStreamRow* stream = malloc(sizeof(JoinedStreamRow) * stream_cap);
+  if (!stream) {
+    free(l_cur);
+    return EXECUTE_CATALOG_FULL;
+  }
 
-  /* If right column is primary key (id), seek directly! */
-  int right_next_pc = 0;
-  if (right_col_idx == 0) {
-    vdbe_add_inst(vm, OP_SeekGE, 1, 998, join_key_reg, (Value){0}); // jump to next left if empty
-    
-    /* Load right columns to registers N+1 .. N+M */
-    for (uint32_t c = 0; c < right_def->num_cols; c++) {
-      vdbe_add_inst(vm, OP_Column, 1, c, left_def->num_cols + c + 1, (Value){0});
+  while (!l_cur->end_of_table) {
+    if (stream_count >= stream_cap) {
+      stream_cap *= 2;
+      stream = realloc(stream, sizeof(JoinedStreamRow) * stream_cap);
+    }
+    Value row_vals[MAX_COLUMNS];
+    deserialize_row(left_def, cursor_value(l_cur), row_vals);
+    stream[stream_count].num_vals = left_def->num_cols;
+    for (uint32_t c = 0; c < left_def->num_cols; c++) {
+      stream[stream_count].vals[c] = row_vals[c];
+    }
+    stream_count++;
+    cursor_advance(l_cur);
+  }
+  free(l_cur);
+
+  /* Iteratively execute chained joins */
+  for (uint32_t j = 0; j < num_joins; j++) {
+    JoinItem* ji = &joins_copy[j];
+    TableDef* right_def = catalog_find(catalog, ji->right_table);
+    if (right_def == NULL) {
+      free(stream);
+      return EXECUTE_TABLE_NOT_FOUND;
     }
 
-    /* Verify keys match */
-    vdbe_add_inst(vm, OP_Compare, left_def->num_cols + 1, join_key_reg, OP_EQ, (Value){0});
-    vdbe_add_inst(vm, OP_IfFalse, 998, 0, 0, (Value){0});
-
-    /* Evaluate WHERE conditions */
-    if (stmt->where_clause.has_where) {
-      for (uint32_t cond_idx = 0; cond_idx < stmt->where_clause.num_conds; cond_idx++) {
-        SingleCond* cond = &stmt->where_clause.conds[cond_idx];
-        int const_reg = 10 + cond_idx;
-        
-        int reg_idx = -1;
-        ColumnType ctype;
-        for (uint32_t c = 0; c < left_def->num_cols; c++) {
-          if (strcmp(left_def->columns[c].name, cond->col_name) == 0) {
-            reg_idx = c + 1;
-            ctype = left_def->columns[c].type;
+    /* Resolve left join column in combined_def */
+    int left_col_idx = -1;
+    for (uint32_t c = 0; c < combined_def.num_cols; c++) {
+      if (strcasecmp(combined_def.columns[c].name, ji->left_col) == 0) {
+        left_col_idx = (int)c;
+        break;
+      }
+    }
+    if (left_col_idx == -1) {
+      char* ldot = strchr(ji->left_col, '.');
+      if (ldot) {
+        for (uint32_t c = 0; c < combined_def.num_cols; c++) {
+          if (strcasecmp(combined_def.columns[c].name, ldot + 1) == 0) {
+            left_col_idx = (int)c;
             break;
           }
-        }
-        if (reg_idx == -1) {
-          for (uint32_t c = 0; c < right_def->num_cols; c++) {
-            if (strcmp(right_def->columns[c].name, cond->col_name) == 0) {
-              reg_idx = left_def->num_cols + c + 1;
-              ctype = right_def->columns[c].type;
-              break;
-            }
-          }
-        }
-        
-        if (reg_idx != -1) {
-          load_const_reg(vm, const_reg, ctype, cond->raw_val);
-          vdbe_add_inst(vm, OP_Compare, reg_idx, const_reg, cond->op, (Value){0});
-          vdbe_add_inst(vm, OP_IfFalse, 998, 0, 0, (Value){0});
         }
       }
     }
 
-    /* Result Output */
-    vdbe_add_inst(vm, OP_ResultRow, 1, left_def->num_cols + right_def->num_cols, 0, (Value){0});
-    right_next_pc = vm->num_insts;
-  } else {
-    /* Fallback to nested loop scan */
-    vdbe_add_inst(vm, OP_Rewind, 1, 998, 0, (Value){0});
-    int right_loop_body = vm->num_insts;
-    
+    /* Resolve right join column in right_def */
+    int right_col_idx = -1;
     for (uint32_t c = 0; c < right_def->num_cols; c++) {
-      vdbe_add_inst(vm, OP_Column, 1, c, left_def->num_cols + c + 1, (Value){0});
+      if (strcasecmp(right_def->columns[c].name, ji->right_col) == 0) {
+        right_col_idx = (int)c;
+        break;
+      }
     }
-
-    vdbe_add_inst(vm, OP_Compare, left_def->num_cols + right_col_idx + 1, join_key_reg, OP_EQ, (Value){0});
-    int skip_join_match = vm->num_insts;
-    vdbe_add_inst(vm, OP_IfFalse, 997, 0, 0, (Value){0}); // jump to next right if false
-
-    /* Evaluate WHERE conditions */
-    if (stmt->where_clause.has_where) {
-      for (uint32_t cond_idx = 0; cond_idx < stmt->where_clause.num_conds; cond_idx++) {
-        SingleCond* cond = &stmt->where_clause.conds[cond_idx];
-        int const_reg = 10 + cond_idx;
-        
-        int reg_idx = -1;
-        ColumnType ctype;
-        for (uint32_t c = 0; c < left_def->num_cols; c++) {
-          if (strcmp(left_def->columns[c].name, cond->col_name) == 0) {
-            reg_idx = c + 1;
-            ctype = left_def->columns[c].type;
+    if (right_col_idx == -1) {
+      char* rdot = strchr(ji->right_col, '.');
+      if (rdot) {
+        for (uint32_t c = 0; c < right_def->num_cols; c++) {
+          if (strcasecmp(right_def->columns[c].name, rdot + 1) == 0) {
+            right_col_idx = (int)c;
             break;
           }
-        }
-        if (reg_idx == -1) {
-          for (uint32_t c = 0; c < right_def->num_cols; c++) {
-            if (strcmp(right_def->columns[c].name, cond->col_name) == 0) {
-              reg_idx = left_def->num_cols + c + 1;
-              ctype = right_def->columns[c].type;
-              break;
-            }
-          }
-        }
-        
-        if (reg_idx != -1) {
-          load_const_reg(vm, const_reg, ctype, cond->raw_val);
-          vdbe_add_inst(vm, OP_Compare, reg_idx, const_reg, cond->op, (Value){0});
-          vdbe_add_inst(vm, OP_IfFalse, 997, 0, 0, (Value){0});
         }
       }
     }
 
-    vdbe_add_inst(vm, OP_ResultRow, 1, left_def->num_cols + right_def->num_cols, 0, (Value){0});
-    
-    right_next_pc = vm->num_insts;
-    vdbe_add_inst(vm, OP_Next, 1, right_loop_body, 0, (Value){0});
-    
-    /* Patch inner skip */
-    vm->insts[skip_join_match].p1 = right_next_pc;
+    if (left_col_idx == -1 || right_col_idx == -1) {
+      free(stream);
+      return EXECUTE_BAD_SCHEMA;
+    }
+
+    /* Build In-Memory Hash Table on right_def */
+    HashJoinNode* buckets[HASH_JOIN_BUCKETS];
+    memset(buckets, 0, sizeof(buckets));
+
+    Table right_tbl = { pager, right_def };
+    Cursor* r_cur = btree_start(&right_tbl);
+    while (!r_cur->end_of_table) {
+      Value r_vals[MAX_COLUMNS];
+      deserialize_row(right_def, cursor_value(r_cur), r_vals);
+      Value* key = &r_vals[right_col_idx];
+
+      HashJoinNode* node = malloc(sizeof(HashJoinNode));
+      if (node) {
+        node->key = *key;
+        for (uint32_t c = 0; c < right_def->num_cols; c++) {
+          node->vals[c] = r_vals[c];
+        }
+        uint32_t bucket = compute_hash_join_key(key);
+        node->next = buckets[bucket];
+        buckets[bucket] = node;
+      }
+      cursor_advance(r_cur);
+    }
+    free(r_cur);
+
+    /* Probe Hash Table from current stream */
+    uint32_t next_cap = stream_count * 2 + 16;
+    uint32_t next_count = 0;
+    JoinedStreamRow* next_stream = malloc(sizeof(JoinedStreamRow) * next_cap);
+    if (!next_stream) {
+      for (int b = 0; b < HASH_JOIN_BUCKETS; b++) {
+        HashJoinNode* cur = buckets[b];
+        while (cur) { HashJoinNode* nx = cur->next; free(cur); cur = nx; }
+      }
+      free(stream);
+      return EXECUTE_CATALOG_FULL;
+    }
+
+    ColumnType l_type = combined_def.columns[left_col_idx].type;
+
+    for (uint32_t i = 0; i < stream_count; i++) {
+      Value* l_key = &stream[i].vals[left_col_idx];
+      bool matched = false;
+
+      if (!l_key->is_null) {
+        uint32_t bucket = compute_hash_join_key(l_key);
+        HashJoinNode* cur = buckets[bucket];
+        while (cur) {
+          if (!cur->key.is_null && compare_values(l_type, l_key, &cur->key) == 0) {
+            matched = true;
+            cur->matched = true;
+            if (next_count >= next_cap) {
+              next_cap *= 2;
+              next_stream = realloc(next_stream, sizeof(JoinedStreamRow) * next_cap);
+            }
+            JoinedStreamRow* nr = &next_stream[next_count++];
+            nr->num_vals = combined_def.num_cols + right_def->num_cols;
+            for (uint32_t c = 0; c < combined_def.num_cols; c++) {
+              nr->vals[c] = stream[i].vals[c];
+            }
+            for (uint32_t c = 0; c < right_def->num_cols; c++) {
+              nr->vals[combined_def.num_cols + c] = cur->vals[c];
+            }
+          }
+          cur = cur->next;
+        }
+      }
+
+      if (!matched && (ji->type == JOIN_LEFT || ji->type == JOIN_FULL)) {
+        if (next_count >= next_cap) {
+          next_cap *= 2;
+          next_stream = realloc(next_stream, sizeof(JoinedStreamRow) * next_cap);
+        }
+        JoinedStreamRow* nr = &next_stream[next_count++];
+        nr->num_vals = combined_def.num_cols + right_def->num_cols;
+        for (uint32_t c = 0; c < combined_def.num_cols; c++) {
+          nr->vals[c] = stream[i].vals[c];
+        }
+        for (uint32_t c = 0; c < right_def->num_cols; c++) {
+          memset(&nr->vals[combined_def.num_cols + c], 0, sizeof(Value));
+          nr->vals[combined_def.num_cols + c].is_null = true;
+        }
+      }
+    }
+
+    if (ji->type == JOIN_RIGHT || ji->type == JOIN_FULL) {
+      for (int b = 0; b < HASH_JOIN_BUCKETS; b++) {
+        HashJoinNode* cur = buckets[b];
+        while (cur) {
+          if (!cur->matched) {
+            if (next_count >= next_cap) {
+              next_cap *= 2;
+              next_stream = realloc(next_stream, sizeof(JoinedStreamRow) * next_cap);
+            }
+            JoinedStreamRow* nr = &next_stream[next_count++];
+            nr->num_vals = combined_def.num_cols + right_def->num_cols;
+            for (uint32_t c = 0; c < combined_def.num_cols; c++) {
+              memset(&nr->vals[c], 0, sizeof(Value));
+              nr->vals[c].is_null = true;
+            }
+            for (uint32_t c = 0; c < right_def->num_cols; c++) {
+              nr->vals[combined_def.num_cols + c] = cur->vals[c];
+            }
+          }
+          cur = cur->next;
+        }
+      }
+    }
+
+    for (int b = 0; b < HASH_JOIN_BUCKETS; b++) {
+      HashJoinNode* cur = buckets[b];
+      while (cur) { HashJoinNode* nx = cur->next; free(cur); cur = nx; }
+    }
+
+    /* Update combined_def schema */
+    for (uint32_t c = 0; c < right_def->num_cols; c++) {
+      if (combined_def.num_cols < MAX_COLUMNS * 8) {
+        combined_def.columns[combined_def.num_cols++] = right_def->columns[c];
+      }
+    }
+
+    free(stream);
+    stream = next_stream;
+    stream_count = next_count;
   }
 
-  int left_next_pc = vm->num_insts;
-  vdbe_add_inst(vm, OP_Next, 0, left_loop_body, 0, (Value){0});
-  
-  int halt_pc = vm->num_insts;
-  vdbe_add_inst(vm, OP_Halt, 0, 0, 0, (Value){0});
+  /* Filter with WHERE clause, apply ORDER BY, LIMIT, and projection */
+  RowSortEntry* sort_entries = NULL;
+  uint32_t sort_count = 0;
+  uint32_t sort_capacity = 0;
+  if (stmt->has_order_by) {
+    sort_capacity = stream_count + 16;
+    sort_entries = malloc(sizeof(RowSortEntry) * sort_capacity);
+  }
 
-  /* Patch jump targets */
-  for (uint32_t i = 0; i < vm->num_insts; i++) {
-    if (vm->insts[i].op == OP_Rewind && vm->insts[i].p1 == 0 && vm->insts[i].p2 == 999) {
-      vm->insts[i].p2 = halt_pc;
-    }
-    if (vm->insts[i].op == OP_Rewind && vm->insts[i].p1 == 1 && vm->insts[i].p2 == 998) {
-      vm->insts[i].p2 = left_next_pc;
-    }
-    if (vm->insts[i].op == OP_SeekGE && vm->insts[i].p1 == 1 && vm->insts[i].p2 == 998) {
-      vm->insts[i].p2 = left_next_pc;
-    }
-    if (vm->insts[i].op == OP_IfFalse && vm->insts[i].p1 == 998) {
-      vm->insts[i].p1 = left_next_pc;
-    }
-    if (vm->insts[i].op == OP_IfFalse && vm->insts[i].p1 == 997) {
-      vm->insts[i].p1 = right_next_pc;
+  int order_by_idx = -1;
+  if (stmt->has_order_by) {
+    for (uint32_t c = 0; c < combined_def.num_cols; c++) {
+      if (strcasecmp(combined_def.columns[c].name, stmt->order_by_col) == 0) {
+        order_by_idx = (int)c;
+        break;
+      }
     }
   }
 
-  if (stmt->is_explain) {
-    printf("QUERY PLAN:\n");
-    printf("  SCAN TABLE %s\n", left_def->name);
-    if (right_col_idx == 0) {
-      printf("  SEARCH TABLE %s USING PRIMARY KEY\n", right_def->name);
-    } else {
-      printf("  SCAN TABLE %s\n", right_def->name);
+  int rows_emitted = 0;
+  int rows_skipped = 0;
+
+  for (uint32_t i = 0; i < stream_count; i++) {
+    if (!eval_where_clause(&combined_def, stream[i].vals, &stmt->where_clause, catalog, pager)) {
+      continue;
     }
-    printf("\n");
-    vdbe_print_program(vm);
-  } else {
-    vdbe_run(vm);
+
+    if (stmt->has_order_by) {
+      if (sort_count >= sort_capacity) {
+        sort_capacity *= 2;
+        sort_entries = realloc(sort_entries, sizeof(RowSortEntry) * sort_capacity);
+      }
+      RowSortEntry* e = &sort_entries[sort_count++];
+      memset(e, 0, sizeof(RowSortEntry));
+      for (uint32_t c = 0; c < combined_def.num_cols; c++) e->row[c] = stream[i].vals[c];
+      if (stmt->num_order_by > 0) {
+        e->num_sort_keys = stmt->num_order_by;
+        for (uint32_t k = 0; k < stmt->num_order_by; k++) {
+          int k_idx = -1;
+          for (uint32_t c = 0; c < combined_def.num_cols; c++) {
+            if (strcasecmp(combined_def.columns[c].name, stmt->order_by_items[k].col_name) == 0) {
+              k_idx = (int)c;
+              break;
+            }
+          }
+          if (k_idx != -1) {
+            e->sort_keys[k] = stream[i].vals[k_idx];
+            e->sort_types[k] = combined_def.columns[k_idx].type;
+          }
+          e->sort_descs[k] = stmt->order_by_items[k].is_desc;
+          e->sort_colls[k] = stmt->order_by_items[k].collation;
+        }
+      } else {
+        e->num_sort_keys = 1;
+        e->sort_keys[0] = (order_by_idx != -1) ? stream[i].vals[order_by_idx] : (Value){0};
+        e->sort_types[0] = (order_by_idx != -1) ? combined_def.columns[order_by_idx].type : COL_INT;
+        e->sort_descs[0] = stmt->order_by_desc;
+        e->sort_colls[0] = stmt->order_by_collation;
+      }
+      continue;
+    }
+
+    if (stmt->has_offset && rows_skipped < stmt->offset_val) {
+      rows_skipped++;
+      continue;
+    }
+
+    if (stmt->has_limit && rows_emitted >= stmt->limit_val) {
+      break;
+    }
+
+    print_projected_row(stmt, &combined_def, stream[i].vals);
+    rows_emitted++;
   }
-  vdbe_free(vm);
+
+  if (stmt->has_order_by && sort_entries) {
+    qsort(sort_entries, sort_count, sizeof(RowSortEntry), compare_row_sort_entries);
+    for (uint32_t i = 0; i < sort_count; i++) {
+      if (stmt->has_offset && rows_skipped < stmt->offset_val) {
+        rows_skipped++;
+        continue;
+      }
+      if (stmt->has_limit && rows_emitted >= stmt->limit_val) {
+        break;
+      }
+      print_projected_row(stmt, &combined_def, sort_entries[i].row);
+      rows_emitted++;
+    }
+    free(sort_entries);
+  }
+
+  free(stream);
   return EXECUTE_SUCCESS;
 }
 
@@ -2175,9 +2229,20 @@ bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog*
 
     int col_idx = -1;
     for (uint32_t c = 0; c < def->num_cols; c++) {
-      if (strcmp(def->columns[c].name, cond->col_name) == 0) {
+      if (strcasecmp(def->columns[c].name, cond->col_name) == 0) {
         col_idx = (int)c;
         break;
+      }
+    }
+    if (col_idx == -1) {
+      const char* dot = strchr(cond->col_name, '.');
+      if (dot != NULL) {
+        for (uint32_t c = 0; c < def->num_cols; c++) {
+          if (strcasecmp(def->columns[c].name, dot + 1) == 0) {
+            col_idx = (int)c;
+            break;
+          }
+        }
       }
     }
     if (col_idx == -1) return false;
