@@ -214,7 +214,7 @@ static uint32_t put_varint(uint8_t* p, uint64_t v) {
 static uint32_t get_varint(const uint8_t* p, uint64_t* v) {
   uint64_t result = 0;
   uint32_t i = 0;
-  while (1) {
+  while (i < 10) {
     uint8_t b = p[i++];
     result |= ((uint64_t)(b & 0x7f)) << (7 * (i - 1));
     if (!(b & 0x80)) break;
@@ -227,10 +227,10 @@ static uint32_t get_varint(const uint8_t* p, uint64_t* v) {
 uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
   uint8_t* out = (uint8_t*)dest;
   
-  uint8_t hdr_buf[512];
+  uint8_t hdr_buf[PAGE_SIZE];
   uint32_t hdr_len = 0;
   
-  uint8_t body_buf[2048];
+  uint8_t body_buf[PAGE_SIZE];
   uint32_t body_len = 0;
 
   for (uint32_t i = 0; i < def->num_cols; i++) {
@@ -249,16 +249,20 @@ uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
             serial_type = 9;
           } else if (val >= -128 && val <= 127) {
             serial_type = 1;
-            body_buf[body_len++] = (uint8_t)val;
+            if (body_len < sizeof(body_buf)) body_buf[body_len++] = (uint8_t)val;
           } else if (val >= -32768 && val <= 32767) {
             serial_type = 2;
             int16_t short_val = (int16_t)val;
-            memcpy(body_buf + body_len, &short_val, 2);
-            body_len += 2;
+            if (body_len + 2 <= sizeof(body_buf)) {
+              memcpy(body_buf + body_len, &short_val, 2);
+              body_len += 2;
+            }
           } else {
             serial_type = 4;
-            memcpy(body_buf + body_len, &val, 4);
-            body_len += 4;
+            if (body_len + 4 <= sizeof(body_buf)) {
+              memcpy(body_buf + body_len, &val, 4);
+              body_len += 4;
+            }
           }
           break;
         }
@@ -270,8 +274,10 @@ uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
         case COL_FLOAT: {
           serial_type = 7;
           double val = (values[i].double_val != 0.0) ? values[i].double_val : (double)values[i].float_val;
-          memcpy(body_buf + body_len, &val, 8);
-          body_len += 8;
+          if (body_len + 8 <= sizeof(body_buf)) {
+            memcpy(body_buf + body_len, &val, 8);
+            body_len += 8;
+          }
           break;
         }
         case COL_DOUBLE:
@@ -279,15 +285,19 @@ uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
         case COL_DECIMAL: {
           serial_type = 7;
           double val = values[i].double_val;
-          memcpy(body_buf + body_len, &val, 8);
-          body_len += 8;
+          if (body_len + 8 <= sizeof(body_buf)) {
+            memcpy(body_buf + body_len, &val, 8);
+            body_len += 8;
+          }
           break;
         }
         case COL_BLOB: {
           uint32_t len = (uint32_t)strlen(values[i].text_val);
           serial_type = 12 + 2 * len;
-          memcpy(body_buf + body_len, values[i].text_val, len);
-          body_len += len;
+          if (body_len + len <= sizeof(body_buf)) {
+            memcpy(body_buf + body_len, values[i].text_val, len);
+            body_len += len;
+          }
           break;
         }
         case COL_DATETIME:
@@ -298,14 +308,18 @@ uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
         case COL_VARCHAR: {
           uint32_t len = (uint32_t)strlen(values[i].text_val);
           serial_type = 13 + 2 * len;
-          memcpy(body_buf + body_len, values[i].text_val, len);
-          body_len += len;
+          if (body_len + len <= sizeof(body_buf)) {
+            memcpy(body_buf + body_len, values[i].text_val, len);
+            body_len += len;
+          }
           break;
         }
       }
     }
     
-    hdr_len += put_varint(hdr_buf + hdr_len, serial_type);
+    if (hdr_len + 16 <= sizeof(hdr_buf)) {
+      hdr_len += put_varint(hdr_buf + hdr_len, serial_type);
+    }
   }
 
   /* Compute and write header size varint (including its own size) */

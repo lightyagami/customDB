@@ -121,9 +121,9 @@ static bool is_byte_locked(int fd, off_t offset, short lock_type) {
   return (lock.l_type != F_UNLCK);
 }
 
-#define PENDING_BYTE  0x10000
-#define RESERVED_BYTE 0x10001
-#define SHARED_BYTE   0x10002
+#define PENDING_BYTE  0x40000000
+#define RESERVED_BYTE 0x40000001
+#define SHARED_BYTE   0x40000002
 
 bool pager_lock(Pager* pager, PagerLockState lock_type) {
   if (pager->is_memory) return true;
@@ -211,6 +211,7 @@ void pager_begin_transaction(Pager* pager) {
       pager_flush(pager, i);
     }
   }
+  pager->num_pages_at_tx_start = pager->num_pages;
   pager->file_length = (uint32_t)lseek(pager->file_descriptor, 0, SEEK_END);
 
   pager->journal_fd = open(pager->journal_filename, O_RDWR | O_CREAT | O_TRUNC, S_IWUSR | S_IRUSR);
@@ -360,10 +361,13 @@ void pager_flush(Pager* pager, uint32_t page_num) {
     }
     if (pager->wal_fd != -1) {
       uint32_t crc = calculate_crc32((const uint8_t*)pager->pages[page_num], PAGE_SIZE);
+      uint8_t frame_buf[4 + 4 + PAGE_SIZE];
+      memcpy(frame_buf, &page_num, 4);
+      memcpy(frame_buf + 4, &crc, 4);
+      memcpy(frame_buf + 8, pager->pages[page_num], PAGE_SIZE);
       lseek(pager->wal_fd, 0, SEEK_END);
-      write(pager->wal_fd, &page_num, 4);
-      write(pager->wal_fd, &crc, 4);
-      write(pager->wal_fd, pager->pages[page_num], PAGE_SIZE);
+      ssize_t w = write(pager->wal_fd, frame_buf, sizeof(frame_buf));
+      (void)w;
       /* No fdatasync here — batched once per transaction by the caller
        * (pager_commit), not once per page. Fsyncing every individual page
        * flush turns an O(1)-syncs-per-transaction commit into O(pages),
@@ -489,6 +493,25 @@ void pager_rollback(Pager* pager) {
     free(pager->page_is_journaled);
     pager->page_is_journaled = NULL;
   }
+  if (pager->is_dirty) {
+    free(pager->is_dirty);
+    pager->is_dirty = NULL;
+  }
+
+  /* Discard any newly allocated in-memory pages beyond baseline */
+  if (pager->num_pages_at_tx_start > 0 && pager->num_pages > pager->num_pages_at_tx_start) {
+    for (uint32_t p = pager->num_pages_at_tx_start; p < pager->num_pages; p++) {
+      if (p < pager->max_pages && pager->pages[p]) {
+        free(pager->pages[p]);
+        pager->pages[p] = NULL;
+      }
+    }
+    pager->num_pages = pager->num_pages_at_tx_start;
+    pager->file_length = pager->num_pages * PAGE_SIZE;
+    if (pager->file_descriptor != -1 && !pager->is_memory) {
+      ftruncate(pager->file_descriptor, (off_t)pager->file_length);
+    }
+  }
 
   pager->in_transaction = false;
   pager->num_savepoints = 0;
@@ -606,7 +629,14 @@ void pager_close(Pager* pager) {
   }
   fdatasync(pager->file_descriptor);
   pager_unlock(pager);
-  free(pager->pages);
+  if (pager->page_is_journaled) {
+    free(pager->page_is_journaled);
+    pager->page_is_journaled = NULL;
+  }
+  if (pager->is_dirty) {
+    free(pager->is_dirty);
+    pager->is_dirty = NULL;
+  }
   if (pager->wal_fd != -1) {
     close(pager->wal_fd);
   }

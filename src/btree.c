@@ -242,7 +242,7 @@ void initialize_root_leaf(void* node) {
 static uint32_t btree_get_varint(const uint8_t* p, uint64_t* v) {
   uint64_t result = 0;
   uint32_t i = 0;
-  while (1) {
+  while (i < 10) {
     uint8_t b = p[i++];
     result |= ((uint64_t)(b & 0x7f)) << (7 * (i - 1));
     if (!(b & 0x80)) break;
@@ -452,6 +452,19 @@ static Cursor* leaf_node_navigate(Table* table, uint32_t page_num, const uint8_t
   c->page_num    = page_num;
   c->end_of_table= false;
   c->cell_num    = leaf_node_find(node, raw_key, table->def);
+  if (c->cell_num >= *leaf_node_num_cells(node)) {
+    uint32_t next = *leaf_node_next_leaf(node);
+    if (next == 0) {
+      c->end_of_table = true;
+    } else {
+      c->page_num = next;
+      c->cell_num = 0;
+      void* next_node = get_page(table->pager, next);
+      if (*leaf_node_num_cells(next_node) == 0) {
+        c->end_of_table = true;
+      }
+    }
+  }
   return c;
 }
 
@@ -493,6 +506,19 @@ void btree_find_out(Table* table, Value* key_value, Cursor* out_cursor) {
   out_cursor->page_num = page_num;
   out_cursor->end_of_table = false;
   out_cursor->cell_num = leaf_node_find(node, raw_key, table->def);
+  if (out_cursor->cell_num >= *leaf_node_num_cells(node)) {
+    uint32_t next = *leaf_node_next_leaf(node);
+    if (next == 0) {
+      out_cursor->end_of_table = true;
+    } else {
+      out_cursor->page_num = next;
+      out_cursor->cell_num = 0;
+      void* next_node = get_page(table->pager, next);
+      if (*leaf_node_num_cells(next_node) == 0) {
+        out_cursor->end_of_table = true;
+      }
+    }
+  }
 }
 
 Cursor* btree_start(Table* table) {

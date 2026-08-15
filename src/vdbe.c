@@ -10,8 +10,6 @@ Vdbe* vdbe_create(Pager* pager, Catalog* catalog) {
   return vm;
 }
 
-static int g_desc_flag = 0;
-
 static int compare_sorter_entries(const void* a, const void* b) {
   const SorterEntry* sa = (const SorterEntry*)a;
   const SorterEntry* sb = (const SorterEntry*)b;
@@ -34,7 +32,7 @@ static int compare_sorter_entries(const void* a, const void* b) {
     cmp = compare_strings_collated(sa->sort_key.text_val, sb->sort_key.text_val, sa->sort_collation);
   }
 
-  if (g_desc_flag) {
+  if (sa->sort_desc) {
     return -cmp;
   }
   return cmp;
@@ -379,8 +377,10 @@ void vdbe_run(Vdbe* vm) {
       }
       case OP_SorterSort: {
         int desc_flag = i->p1;
-        g_desc_flag = desc_flag;
         if (vm->sorter.count > 0) {
+          for (uint32_t e = 0; e < vm->sorter.count; e++) {
+            vm->sorter.entries[e].sort_desc = (desc_flag != 0);
+          }
           qsort(vm->sorter.entries, vm->sorter.count, sizeof(SorterEntry), compare_sorter_entries);
         }
         break;

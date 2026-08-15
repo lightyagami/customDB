@@ -52,6 +52,7 @@ typedef struct {
   Value         sort_key;
   ColumnType    sort_type;
   CollationType sort_collation;
+  bool          sort_desc;
 } SorterEntry;
 
 typedef struct {

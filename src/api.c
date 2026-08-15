@@ -386,34 +386,12 @@ int dbms_step(dbms_stmt* pStmt) {
     /* Resolve bound '?' parameters before execution */
     resolve_param_placeholders(&pStmt->stmt);
 
-    if (pStmt->stmt.type == STATEMENT_INSERT && pStmt->compiled_vm != NULL) {
-      Vdbe* vm = pStmt->compiled_vm;
-      TableDef* def = pStmt->target_def;
-      for (uint32_t i = 0; i < def->num_cols; i++) {
-        Instruction* inst = &vm->insts[1 + i]; /* slot 0 is OP_OpenWrite */
-        Column* col = &def->columns[i];
-        const char* raw = pStmt->stmt.raw_values[i];
-        if (col->type == COL_INT) {
-          inst->p1 = atoi(raw);
-        } else if (col->type == COL_FLOAT) {
-          inst->p4.float_val = (float)atof(raw);
-        } else if (col->type == COL_DOUBLE || col->type == COL_NUMERIC || col->type == COL_DECIMAL) {
-          inst->p4.double_val = atof(raw);
-        } else {
-          memset(&inst->p4, 0, sizeof(Value));
-          strncpy(inst->p4.text_val, raw, sizeof(inst->p4.text_val) - 1);
-        }
-      }
-      vdbe_run(vm);
-      pStmt->executed = true;
-    } else {
-      ExecuteResult res = execute_statement(&pStmt->stmt, &pStmt->db->catalog, pStmt->db->pager);
-      pStmt->executed = true;
-      if (res != EXECUTE_SUCCESS) {
-        pthread_mutex_unlock(&pStmt->db->mutex);
-        if (pStmt->db->file_mutex) pthread_mutex_unlock(pStmt->db->file_mutex);
-        return DBMS_ERROR;
-      }
+    ExecuteResult res = execute_statement(&pStmt->stmt, &pStmt->db->catalog, pStmt->db->pager);
+    pStmt->executed = true;
+    if (res != EXECUTE_SUCCESS) {
+      pthread_mutex_unlock(&pStmt->db->mutex);
+      if (pStmt->db->file_mutex) pthread_mutex_unlock(pStmt->db->file_mutex);
+      return DBMS_ERROR;
     }
   }
 
@@ -448,44 +426,76 @@ int dbms_finalize(dbms_stmt* pStmt) {
   return DBMS_OK;
 }
 
+static int get_projected_col_idx(dbms_stmt* pStmt, int col) {
+  if (pStmt->stmt.num_select_cols == 0) return col;
+  if (col < 0 || col >= (int)pStmt->stmt.num_select_cols) return -1;
+  const char* req_name = pStmt->stmt.select_cols[col].col_name;
+  if (pStmt->target_def) {
+    for (uint32_t c = 0; c < pStmt->target_def->num_cols; c++) {
+      if (strcmp(pStmt->target_def->columns[c].name, req_name) == 0) {
+        return (int)c;
+      }
+    }
+  }
+  return -1;
+}
+
 int dbms_column_count(dbms_stmt* pStmt) {
   if (pStmt == NULL || pStmt->target_def == NULL) return 0;
+  if (pStmt->stmt.num_select_cols > 0) return pStmt->stmt.num_select_cols;
   return pStmt->target_def->num_cols;
 }
 
 const char* dbms_column_name(dbms_stmt* pStmt, int col) {
-  if (pStmt == NULL || pStmt->target_def == NULL || col < 0 || col >= (int)pStmt->target_def->num_cols) return "";
+  if (pStmt == NULL || pStmt->target_def == NULL) return "";
+  if (pStmt->stmt.num_select_cols > 0) {
+    if (col < 0 || col >= (int)pStmt->stmt.num_select_cols) return "";
+    return pStmt->stmt.select_cols[col].col_name;
+  }
+  if (col < 0 || col >= (int)pStmt->target_def->num_cols) return "";
   return pStmt->target_def->columns[col].name;
 }
 
 int dbms_column_type(dbms_stmt* pStmt, int col) {
-  if (pStmt == NULL || pStmt->target_def == NULL || col < 0 || col >= (int)pStmt->target_def->num_cols) return 0;
-  return (int)pStmt->target_def->columns[col].type;
+  if (pStmt == NULL || pStmt->target_def == NULL) return 0;
+  int actual = get_projected_col_idx(pStmt, col);
+  if (actual < 0 || actual >= (int)pStmt->target_def->num_cols) return 0;
+  return (int)pStmt->target_def->columns[actual].type;
 }
 
 int dbms_column_int(dbms_stmt* pStmt, int col) {
-  if (pStmt == NULL || !pStmt->has_current_row || col < 0 || col >= MAX_COLUMNS) return 0;
-  return pStmt->current_row_vals[col].int_val;
+  if (pStmt == NULL || !pStmt->has_current_row) return 0;
+  int actual = get_projected_col_idx(pStmt, col);
+  if (actual < 0 || actual >= MAX_COLUMNS) return 0;
+  return pStmt->current_row_vals[actual].int_val;
 }
 
 double dbms_column_double(dbms_stmt* pStmt, int col) {
-  if (pStmt == NULL || !pStmt->has_current_row || col < 0 || col >= MAX_COLUMNS) return 0.0;
-  return pStmt->current_row_vals[col].double_val;
+  if (pStmt == NULL || !pStmt->has_current_row) return 0.0;
+  int actual = get_projected_col_idx(pStmt, col);
+  if (actual < 0 || actual >= MAX_COLUMNS) return 0.0;
+  return pStmt->current_row_vals[actual].double_val;
 }
 
 const char* dbms_column_text(dbms_stmt* pStmt, int col) {
-  if (pStmt == NULL || !pStmt->has_current_row || col < 0 || col >= MAX_COLUMNS) return "";
-  return pStmt->current_row_vals[col].text_val;
+  if (pStmt == NULL || !pStmt->has_current_row) return "";
+  int actual = get_projected_col_idx(pStmt, col);
+  if (actual < 0 || actual >= MAX_COLUMNS) return "";
+  return pStmt->current_row_vals[actual].text_val;
 }
 
 const void* dbms_column_blob(dbms_stmt* pStmt, int col) {
-  if (pStmt == NULL || !pStmt->has_current_row || col < 0 || col >= MAX_COLUMNS) return "";
-  return pStmt->current_row_vals[col].text_val;
+  if (pStmt == NULL || !pStmt->has_current_row) return "";
+  int actual = get_projected_col_idx(pStmt, col);
+  if (actual < 0 || actual >= MAX_COLUMNS) return "";
+  return pStmt->current_row_vals[actual].text_val;
 }
 
 int dbms_column_bytes(dbms_stmt* pStmt, int col) {
-  if (pStmt == NULL || !pStmt->has_current_row || col < 0 || col >= MAX_COLUMNS) return 0;
-  return (int)strlen(pStmt->current_row_vals[col].text_val);
+  if (pStmt == NULL || !pStmt->has_current_row) return 0;
+  int actual = get_projected_col_idx(pStmt, col);
+  if (actual < 0 || actual >= MAX_COLUMNS) return 0;
+  return (int)strlen(pStmt->current_row_vals[actual].text_val);
 }
 
 int64_t dbms_last_insert_rowid(dbms* pDb) {

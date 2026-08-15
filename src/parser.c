@@ -39,13 +39,21 @@ static const char* parse_value_token(const char* p, char* dest, uint32_t max_len
     }
   } else if (*p == '\'' || *p == '"') {
     char quote = *p++;
-    while (*p && *p != quote) {
+    while (*p) {
+      if (*p == quote) {
+        if (p[1] == quote) {
+          if (len < max_len - 1) dest[len++] = quote;
+          p += 2;
+          continue;
+        }
+        p++;
+        break;
+      }
       if (len < max_len - 1) {
         dest[len++] = *p;
       }
       p++;
     }
-    if (*p == quote) p++;
   } else {
     while (*p && !isspace((unsigned char)*p) && *p != ',' && *p != ')' && *p != '=') {
       if (len < max_len - 1) {

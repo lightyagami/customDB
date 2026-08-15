@@ -23,6 +23,7 @@ typedef struct {
   char     main_filename[256];
   bool*    page_is_journaled;
   bool*    is_dirty;
+  uint32_t num_pages_at_tx_start;
   
   /* Concurrency Lock State */
   PagerLockState lock_state;
