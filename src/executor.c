@@ -549,7 +549,7 @@ static void eval_json_extract(const char* json_str, const char* path, char* out_
   if (strncmp(target_key, "$.", 2) == 0) target_key += 2;
 
   const char* p = json_str;
-  char key_pattern[128];
+  char key_pattern[256];
   snprintf(key_pattern, sizeof(key_pattern), "\"%s\"", target_key);
 
   const char* key_pos = strstr(p, key_pattern);

@@ -3,7 +3,7 @@
 static void check_and_recover_journal(Pager* pager) {
   struct stat st;
   if (stat(pager->journal_filename, &st) == 0 && st.st_size > 0) {
-    int jfd = open(pager->journal_filename, O_RDONLY);
+    int jfd = open(pager->journal_filename, O_RDONLY | O_BINARY);
     if (jfd != -1) {
       uint32_t pnum;
       uint8_t page_buf[PAGE_SIZE];
@@ -37,7 +37,7 @@ Pager* pager_open(const char* filename) {
     return pager;
   }
 
-  int fd = open(filename, O_RDWR | O_CREAT, S_IWUSR | S_IRUSR);
+  int fd = open(filename, O_RDWR | O_CREAT | O_BINARY, S_IWUSR | S_IRUSR);
   if (fd == -1) {
     fprintf(stderr, "Unable to open file '%s': %s\n", filename, strerror(errno));
     exit(EXIT_FAILURE);
@@ -54,7 +54,7 @@ Pager* pager_open(const char* filename) {
   struct stat wal_st;
   if (stat(pager->wal_filename, &wal_st) == 0 && wal_st.st_size > 0) {
     pager->use_wal = true;
-    pager->wal_fd = open(pager->wal_filename, O_RDWR, S_IWUSR | S_IRUSR);
+    pager->wal_fd = open(pager->wal_filename, O_RDWR | O_BINARY, S_IWUSR | S_IRUSR);
   }
 
   /* Check for uncommitted journal from crash and recover */
@@ -100,6 +100,46 @@ static uint32_t calculate_crc32(const uint8_t *data, size_t length) {
   return ~crc;
 }
 
+#ifdef _WIN32
+static ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
+  off_t orig = _lseek(fd, 0, SEEK_CUR);
+  if (_lseek(fd, offset, SEEK_SET) == -1) return -1;
+  ssize_t res = _read(fd, buf, (unsigned int)count);
+  _lseek(fd, orig, SEEK_SET);
+  return res;
+}
+
+static int lock_file_byte(int fd, off_t offset, short lock_type, bool wait) {
+  (void)wait;
+  HANDLE h = (HANDLE)_get_osfhandle(fd);
+  if (h == INVALID_HANDLE_VALUE) return -1;
+  OVERLAPPED ov;
+  memset(&ov, 0, sizeof(ov));
+  ov.Offset = (DWORD)offset;
+  ov.OffsetHigh = (DWORD)((uint64_t)offset >> 32);
+  if (lock_type == F_UNLCK) {
+    UnlockFileEx(h, 0, 1, 0, &ov);
+    return 0;
+  } else {
+    DWORD flags = (lock_type == F_WRLCK) ? LOCKFILE_EXCLUSIVE_LOCK : 0;
+    if (!wait) flags |= LOCKFILE_FAIL_IMMEDIATELY;
+    return LockFileEx(h, flags, 0, 1, 0, &ov) ? 0 : -1;
+  }
+}
+
+static bool is_byte_locked(int fd, off_t offset, short lock_type) {
+  (void)lock_type;
+  HANDLE h = (HANDLE)_get_osfhandle(fd);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  OVERLAPPED ov;
+  memset(&ov, 0, sizeof(ov));
+  ov.Offset = (DWORD)offset;
+  ov.OffsetHigh = (DWORD)((uint64_t)offset >> 32);
+  if (!LockFileEx(h, LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov)) return true;
+  UnlockFileEx(h, 0, 1, 0, &ov);
+  return false;
+}
+#else
 static int lock_file_byte(int fd, off_t offset, short lock_type, bool wait) {
   struct flock lock;
   memset(&lock, 0, sizeof(lock));
@@ -123,6 +163,7 @@ static bool is_byte_locked(int fd, off_t offset, short lock_type) {
   if (fcntl(fd, F_GETLK, &lock) == -1) return true;
   return (lock.l_type != F_UNLCK);
 }
+#endif
 
 #define PENDING_BYTE  0x40000000
 #define RESERVED_BYTE 0x40000001
@@ -217,7 +258,7 @@ void pager_begin_transaction(Pager* pager) {
   pager->num_pages_at_tx_start = pager->num_pages;
   pager->file_length = (uint32_t)lseek(pager->file_descriptor, 0, SEEK_END);
 
-  pager->journal_fd = open(pager->journal_filename, O_RDWR | O_CREAT | O_TRUNC, S_IWUSR | S_IRUSR);
+  pager->journal_fd = open(pager->journal_filename, O_RDWR | O_CREAT | O_TRUNC | O_BINARY, S_IWUSR | S_IRUSR);
   if (pager->journal_fd == -1) {
     /* Journal open failed — continue without journaling (no crash) */
     pager->in_transaction = true;
@@ -360,7 +401,7 @@ void pager_flush(Pager* pager, uint32_t page_num) {
 
   if (pager->use_wal) {
     if (pager->wal_fd == -1) {
-      pager->wal_fd = open(pager->wal_filename, O_RDWR | O_CREAT, S_IWUSR | S_IRUSR);
+      pager->wal_fd = open(pager->wal_filename, O_RDWR | O_CREAT | O_BINARY, S_IWUSR | S_IRUSR);
     }
     if (pager->wal_fd != -1) {
       uint32_t crc = calculate_crc32((const uint8_t*)pager->pages[page_num], PAGE_SIZE);
@@ -500,7 +541,7 @@ void pager_rollback(Pager* pager) {
     pager->journal_fd = -1;
   }
 
-  int jfd = open(pager->journal_filename, O_RDONLY);
+  int jfd = open(pager->journal_filename, O_RDONLY | O_BINARY);
   if (jfd != -1) {
     uint32_t pnum;
     uint8_t page_buf[PAGE_SIZE];
@@ -580,7 +621,7 @@ void pager_rollback_to_savepoint(Pager* pager, const char* name) {
   }
 
   off_t target_offset = pager->savepoints[idx].journal_offset;
-  int jfd = open(pager->journal_filename, O_RDWR);
+  int jfd = open(pager->journal_filename, O_RDWR | O_BINARY);
   if (jfd != -1) {
     off_t current_len = lseek(jfd, 0, SEEK_END);
     if (current_len > target_offset) {
@@ -669,6 +710,9 @@ void pager_close(Pager* pager) {
     close(pager->wal_fd);
   }
   close(pager->file_descriptor);
+  if (pager->pages) {
+    free(pager->pages);
+  }
   free(pager);
 }
 
@@ -677,7 +721,7 @@ void pager_set_wal_mode(Pager* pager, bool enable_wal) {
     if (pager->use_wal) return;
     pager->use_wal = true;
     if (pager->wal_fd == -1) {
-      pager->wal_fd = open(pager->wal_filename, O_RDWR | O_CREAT, S_IWUSR | S_IRUSR);
+      pager->wal_fd = open(pager->wal_filename, O_RDWR | O_CREAT | O_BINARY, S_IWUSR | S_IRUSR);
     }
     printf("[WAL] Journal mode set to WAL mode.\n");
   } else {
