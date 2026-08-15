@@ -1,4 +1,3 @@
-#define _GNU_SOURCE
 #include "pager.h"
 
 static void check_and_recover_journal(Pager* pager) {
@@ -390,10 +389,35 @@ void pager_flush(Pager* pager, uint32_t page_num) {
 }
 
 uint32_t get_unused_page_num(Pager* pager) {
+  if (pager->freelist_head != 0 && pager->freelist_head != INVALID_PAGE_NUM && pager->freelist_head >= pager->reserved_catalog_pages) {
+    uint32_t reused_page = pager->freelist_head;
+    void* free_page_buf = get_page(pager, reused_page);
+    uint32_t next_free = 0;
+    memcpy(&next_free, free_page_buf, 4);
+    pager->freelist_head = next_free;
+    memset(free_page_buf, 0, PAGE_SIZE);
+    
+    void* p0 = get_page(pager, 0);
+    memcpy((uint8_t*)p0 + 4092, &pager->freelist_head, 4);
+    return reused_page;
+  }
   if (pager->num_pages < pager->reserved_catalog_pages) {
     return pager->reserved_catalog_pages;
   }
   return pager->num_pages;
+}
+
+void pager_free_page(Pager* pager, uint32_t page_num) {
+  if (page_num < pager->reserved_catalog_pages || page_num == 0 || page_num == INVALID_PAGE_NUM) {
+    return;
+  }
+  void* page_buf = get_page(pager, page_num);
+  memset(page_buf, 0, PAGE_SIZE);
+  memcpy(page_buf, &pager->freelist_head, 4);
+  pager->freelist_head = page_num;
+
+  void* p0 = get_page(pager, 0);
+  memcpy((uint8_t*)p0 + 4092, &pager->freelist_head, 4);
 }
 
 void pager_commit(Pager* pager) {

@@ -40,7 +40,7 @@ typedef enum { NODE_INTERNAL = 0, NODE_LEAF = 1 } NodeType;
 #define INTERNAL_NODE_CHILD_SIZE         4u
 #define INTERNAL_NODE_KEY_SIZE           32u
 #define INTERNAL_NODE_CELL_SIZE          (INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE)
-#define INTERNAL_NODE_MAX_KEYS           3u
+#define INTERNAL_NODE_MAX_KEYS           32u
 
 /* Underflow limits */
 const uint32_t LEAF_NODE_MIN_CELLS = 2u;

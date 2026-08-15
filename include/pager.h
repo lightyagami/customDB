@@ -50,6 +50,9 @@ typedef struct {
   /* In-Memory Database Mode */
   bool     is_memory;
 
+  /* Freelist */
+  uint32_t freelist_head;
+
   /* Set to true if a lock could not be acquired after retries.
    * Callers should check this and propagate the error rather than
    * proceeding with potentially unsafe writes. */
@@ -60,6 +63,7 @@ Pager*   pager_open(const char* filename);
 void*    get_page(Pager* pager, uint32_t page_num);
 void     pager_flush(Pager* pager, uint32_t page_num);
 uint32_t get_unused_page_num(Pager* pager);
+void     pager_free_page(Pager* pager, uint32_t page_num);
 void     pager_close(Pager* pager);
 
 /* Concurrency Locks */

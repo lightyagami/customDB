@@ -178,6 +178,17 @@ static const char* parse_where_clause(const char* p, WhereClause* wc) {
       } else if (strncasecmp(p, "match", 5) == 0 && (isspace((unsigned char)p[5]) || p[5] == '\0' || p[5] == '\'')) {
         cond->op = OP_MATCH;
         p += 5;
+      } else if (strncasecmp(p, "like", 4) == 0 && (isspace((unsigned char)p[4]) || p[4] == '\'' || p[4] == '"')) {
+        cond->op = OP_LIKE;
+        p += 4;
+      } else if (strncasecmp(p, "between", 7) == 0 && isspace((unsigned char)p[7])) {
+        cond->op = OP_BETWEEN;
+        p += 7;
+        p = parse_value_token(p, cond->raw_val, MAX_RAW_VAL);
+        p = skip_whitespace(p);
+        if (strncasecmp(p, "and", 3) != 0) return NULL;
+        p += 3;
+        p = parse_value_token(p, cond->raw_val2, MAX_RAW_VAL);
       } else if (strncasecmp(p, "in", 2) == 0 && (isspace((unsigned char)p[2]) || p[2] == '(')) {
         cond->op = OP_IN;
         p += 2;
@@ -218,7 +229,7 @@ static const char* parse_where_clause(const char* p, WhereClause* wc) {
       }
     }
 
-    if (!cond->is_subquery && !cond->is_exists && !cond->is_not_exists && cond->op != OP_IS_NULL && cond->op != OP_IS_NOT_NULL) {
+    if (!cond->is_subquery && !cond->is_exists && !cond->is_not_exists && cond->op != OP_IS_NULL && cond->op != OP_IS_NOT_NULL && cond->op != OP_BETWEEN) {
       p = parse_value_token(p, cond->raw_val, MAX_RAW_VAL);
       if (strlen(cond->raw_val) == 0) return NULL;
     }
@@ -636,29 +647,63 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
     if (strlen(out->table_name) == 0) return PREPARE_SYNTAX_ERROR;
 
     p = skip_whitespace(p);
+    if (strncasecmp(p, "select", 6) == 0) {
+      out->is_insert_select = true;
+      out->insert_select_stmt = malloc(sizeof(Statement));
+      memset(out->insert_select_stmt, 0, sizeof(Statement));
+      PrepareResult pr = prepare_statement(p, out->insert_select_stmt);
+      if (pr != PREPARE_SUCCESS) {
+        free(out->insert_select_stmt);
+        out->insert_select_stmt = NULL;
+        return pr;
+      }
+      return PREPARE_SUCCESS;
+    }
+
     if (strncasecmp(p, "values", 6) == 0) {
       p += 6;
     }
 
-    p = skip_whitespace(p);
-    if (*p != '(') return PREPARE_SYNTAX_ERROR;
-    p++;
-
     out->num_values = 0;
-    while (*p && *p != ')') {
-      if (out->num_values >= MAX_COLUMNS) return PREPARE_SYNTAX_ERROR;
-      
-      p = parse_value_token(p, out->raw_values[out->num_values], MAX_RAW_VAL);
-      out->num_values++;
+    out->num_multi_rows = 0;
+
+    while (*p) {
+      p = skip_whitespace(p);
+      if (*p != '(') break;
+      p++;
+
+      uint32_t col_idx = 0;
+      while (*p && *p != ')') {
+        if (col_idx >= MAX_COLUMNS) return PREPARE_SYNTAX_ERROR;
+        
+        p = parse_value_token(p, out->multi_raw_values[out->num_multi_rows][col_idx], MAX_RAW_VAL);
+        if (out->num_multi_rows == 0) {
+          strncpy(out->raw_values[col_idx], out->multi_raw_values[0][col_idx], MAX_RAW_VAL - 1);
+        }
+        col_idx++;
+
+        p = skip_whitespace(p);
+        if (*p == ',') {
+          p++;
+        } else if (*p != ')') {
+          return PREPARE_SYNTAX_ERROR;
+        }
+      }
+      if (*p == ')') p++;
+      out->num_values = col_idx;
+      out->num_multi_rows++;
 
       p = skip_whitespace(p);
       if (*p == ',') {
         p++;
-      } else if (*p != ')') {
-        return PREPARE_SYNTAX_ERROR;
+      } else {
+        break;
       }
     }
-    return PREPARE_SUCCESS;
+    if (out->num_multi_rows > 1) {
+      out->is_multi_insert = true;
+    }
+    return (out->num_values > 0) ? PREPARE_SUCCESS : PREPARE_SYNTAX_ERROR;
   }
 
   if (strncasecmp(p, "select", 6) == 0) {
@@ -666,6 +711,11 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
     p += 6;
 
     p = skip_whitespace(p);
+    if (strncasecmp(p, "distinct", 8) == 0 && (isspace((unsigned char)p[8]) || p[8] == '*' || isalpha(p[8]))) {
+      out->is_distinct = true;
+      p += 8;
+      p = skip_whitespace(p);
+    }
     if (*p == '*') {
       p++;
     } else {
@@ -944,32 +994,51 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
     if (strncasecmp(p, "order by", 8) == 0) {
       p += 8;
       out->has_order_by = true;
-      p = skip_whitespace(p);
-      p = parse_identifier(p, out->order_by_col, COL_NAME_SIZE);
-      if (strlen(out->order_by_col) == 0) return PREPARE_SYNTAX_ERROR;
-
-      p = skip_whitespace(p);
-      if (strncasecmp(p, "collate", 7) == 0) {
-        p += 7;
+      out->num_order_by = 0;
+      while (*p) {
         p = skip_whitespace(p);
-        if (strncasecmp(p, "nocase", 6) == 0) { out->order_by_collation = COLL_NOCASE; p += 6; }
-        else if (strncasecmp(p, "rtrim", 5) == 0) { out->order_by_collation = COLL_RTRIM; p += 5; }
-        else if (strncasecmp(p, "binary", 6) == 0) { out->order_by_collation = COLL_BINARY; p += 6; }
-      }
+        if (out->num_order_by >= 4) break;
+        OrderByItem* item = &out->order_by_items[out->num_order_by++];
+        p = parse_identifier(p, item->col_name, COL_NAME_SIZE);
+        if (strlen(item->col_name) == 0) return PREPARE_SYNTAX_ERROR;
 
-      p = skip_whitespace(p);
-      if (strncasecmp(p, "desc", 4) == 0) {
-        out->order_by_desc = true;
-        p += 4;
-      } else if (strncasecmp(p, "asc", 3) == 0) {
-        out->order_by_desc = false;
-        p += 3;
-      } else {
-        out->order_by_desc = false;
+        p = skip_whitespace(p);
+        if (strncasecmp(p, "collate", 7) == 0) {
+          p += 7;
+          p = skip_whitespace(p);
+          if (strncasecmp(p, "nocase", 6) == 0) { item->collation = COLL_NOCASE; p += 6; }
+          else if (strncasecmp(p, "rtrim", 5) == 0) { item->collation = COLL_RTRIM; p += 5; }
+          else if (strncasecmp(p, "binary", 6) == 0) { item->collation = COLL_BINARY; p += 6; }
+        } else {
+          item->collation = COLL_BINARY;
+        }
+
+        p = skip_whitespace(p);
+        if (strncasecmp(p, "desc", 4) == 0) {
+          item->is_desc = true;
+          p += 4;
+        } else if (strncasecmp(p, "asc", 3) == 0) {
+          item->is_desc = false;
+          p += 3;
+        } else {
+          item->is_desc = false;
+        }
+
+        p = skip_whitespace(p);
+        if (*p == ',') {
+          p++;
+        } else {
+          break;
+        }
+      }
+      if (out->num_order_by > 0) {
+        snprintf(out->order_by_col, sizeof(out->order_by_col), "%s", out->order_by_items[0].col_name);
+        out->order_by_desc = out->order_by_items[0].is_desc;
+        out->order_by_collation = out->order_by_items[0].collation;
       }
     }
 
-    /* Parse LIMIT */
+    /* Parse LIMIT & OFFSET */
     p = skip_whitespace(p);
     if (strncasecmp(p, "limit", 5) == 0) {
       p += 5;
@@ -980,6 +1049,24 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       p = parse_identifier(p, limit_tok, sizeof(limit_tok));
       if (strlen(limit_tok) == 0) return PREPARE_SYNTAX_ERROR;
       out->limit_val = atoi(limit_tok);
+
+      p = skip_whitespace(p);
+      if (strncasecmp(p, "offset", 6) == 0) {
+        p += 6;
+        out->has_offset = true;
+        p = skip_whitespace(p);
+        char offset_tok[32];
+        p = parse_identifier(p, offset_tok, sizeof(offset_tok));
+        out->offset_val = atoi(offset_tok);
+      } else if (*p == ',') {
+        p++;
+        out->has_offset = true;
+        out->offset_val = out->limit_val;
+        p = skip_whitespace(p);
+        char count_tok[32];
+        p = parse_identifier(p, count_tok, sizeof(count_tok));
+        out->limit_val = atoi(count_tok);
+      }
     }
 
     return PREPARE_SUCCESS;

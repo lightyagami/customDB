@@ -11,12 +11,12 @@ def test_vacuum():
     if os.path.exists(db_file):
         os.remove(db_file)
 
-    # 1. Create table and insert 100 records
+    # 1. Create table and insert records spanning multiple pages
     init_cmds = [
         "create table items (id INT, price DOUBLE, name VARCHAR(100))"
     ]
-    for i in range(1, 101):
-        init_cmds.append(f"insert into items values ({i}, {i * 1.5}, 'ItemName_{i}')")
+    for i in range(1, 200):
+        init_cmds.append(f"insert into items values ({i}, {i * 1.5}, 'ItemName_{i}_padding_bytes_to_span_pages')")
     init_cmds.append(".exit")
 
     run_db(db_file, init_cmds)

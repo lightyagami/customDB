@@ -481,6 +481,17 @@ const char* dbms_column_text(dbms_stmt* pStmt, int col) {
   if (pStmt == NULL || !pStmt->has_current_row) return "";
   int actual = get_projected_col_idx(pStmt, col);
   if (actual < 0 || actual >= MAX_COLUMNS) return "";
+  if (pStmt->target_def && actual < (int)pStmt->target_def->num_cols) {
+    if (pStmt->target_def->columns[actual].type == COL_INT) {
+      static __thread char int_buf[32];
+      snprintf(int_buf, sizeof(int_buf), "%d", pStmt->current_row_vals[actual].int_val);
+      return int_buf;
+    } else if (pStmt->target_def->columns[actual].type == COL_DOUBLE || pStmt->target_def->columns[actual].type == COL_FLOAT) {
+      static __thread char dbl_buf[64];
+      snprintf(dbl_buf, sizeof(dbl_buf), "%.8g", pStmt->current_row_vals[actual].double_val);
+      return dbl_buf;
+    }
+  }
   return pStmt->current_row_vals[actual].text_val;
 }
 

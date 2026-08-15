@@ -27,6 +27,7 @@ void catalog_load(Catalog* catalog, Pager* pager) {
   memcpy(&num, page0, 4);
   catalog->num_tables = (num <= MAX_TABLES) ? num : 0;
   pager->reserved_catalog_pages = 33;
+  memcpy(&pager->freelist_head, page0 + 4092, 4);
 
   for (uint32_t t = 0; t < catalog->num_tables; t++) {
     uint32_t page_num = (t == 0) ? 0 : (t < 15 ? t : t + 1);
@@ -177,6 +178,9 @@ void catalog_save(Catalog* catalog, Pager* pager) {
 
   uint8_t av_byte = pager->auto_vacuum ? 1 : 0;
   memcpy(vt_page_ptr + 500, &av_byte, 1);
+
+  uint8_t* p0 = (uint8_t*)get_page(pager, 0);
+  memcpy(p0 + 4092, &pager->freelist_head, 4);
 
   for (uint32_t p = 0; p < pager->max_pages; p++) {
     if (pager->pages[p] != NULL) {

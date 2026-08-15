@@ -28,51 +28,92 @@ static ExecuteResult run_transaction_vm(Statement* stmt, Catalog* catalog, Pager
 }
 
 static void fire_triggers(Catalog* catalog, Pager* pager, const char* table_name, TriggerTiming timing, TriggerEvent event) {
+  static __thread int s_trigger_depth = 0;
+  if (s_trigger_depth >= 4) return;
+  s_trigger_depth++;
+
   for (uint32_t i = 0; i < catalog->num_triggers; i++) {
     TriggerDef* t = &catalog->triggers[i];
     if (strcmp(t->target_table, table_name) == 0 && t->timing == timing && t->event == event) {
-      Statement tr_stmt;
-      if (prepare_statement(t->action_sql, &tr_stmt) == PREPARE_SUCCESS) {
-        execute_statement(&tr_stmt, catalog, pager);
+      Statement* tr_stmt = malloc(sizeof(Statement));
+      if (tr_stmt) {
+        if (prepare_statement(t->action_sql, tr_stmt) == PREPARE_SUCCESS) {
+          execute_statement(tr_stmt, catalog, pager);
+        }
+        free(tr_stmt);
       }
     }
   }
+
+  s_trigger_depth--;
 }
 
 typedef struct {
   Value row[MAX_COLUMNS];
-  Value sort_key;
-  ColumnType sort_type;
-  CollationType sort_coll;
-  bool sort_desc;
+  Value sort_keys[4];
+  ColumnType sort_types[4];
+  CollationType sort_colls[4];
+  bool sort_descs[4];
+  uint32_t num_sort_keys;
 } RowSortEntry;
 
 static int compare_row_sort_entries(const void* a, const void* b) {
   const RowSortEntry* ra = (const RowSortEntry*)a;
   const RowSortEntry* rb = (const RowSortEntry*)b;
-  ColumnType type = ra->sort_type;
-  int cmp = 0;
-
-  if (type == COL_INT) {
-    int32_t va = ra->sort_key.int_val;
-    int32_t vb = rb->sort_key.int_val;
-    cmp = (va > vb) - (va < vb);
-  } else if (type == COL_DOUBLE || type == COL_FLOAT) {
-    double va = (type == COL_DOUBLE) ? ra->sort_key.double_val : ra->sort_key.float_val;
-    double vb = (type == COL_DOUBLE) ? rb->sort_key.double_val : rb->sort_key.float_val;
-    cmp = (va > vb) - (va < vb);
-  } else if (type == COL_BOOL) {
-    bool va = ra->sort_key.bool_val;
-    bool vb = rb->sort_key.bool_val;
-    cmp = (va > vb) - (va < vb);
-  } else {
-    cmp = compare_strings_collated(ra->sort_key.text_val, rb->sort_key.text_val, ra->sort_coll);
+  for (uint32_t k = 0; k < ra->num_sort_keys; k++) {
+    ColumnType type = ra->sort_types[k];
+    int cmp = 0;
+    if (type == COL_INT) {
+      int32_t va = ra->sort_keys[k].int_val;
+      int32_t vb = rb->sort_keys[k].int_val;
+      cmp = (va > vb) - (va < vb);
+    } else if (type == COL_DOUBLE || type == COL_FLOAT) {
+      double va = (type == COL_DOUBLE) ? ra->sort_keys[k].double_val : ra->sort_keys[k].float_val;
+      double vb = (type == COL_DOUBLE) ? rb->sort_keys[k].double_val : rb->sort_keys[k].float_val;
+      cmp = (va > vb) - (va < vb);
+    } else if (type == COL_BOOL) {
+      bool va = ra->sort_keys[k].bool_val;
+      bool vb = rb->sort_keys[k].bool_val;
+      cmp = (va > vb) - (va < vb);
+    } else {
+      cmp = compare_strings_collated(ra->sort_keys[k].text_val, rb->sort_keys[k].text_val, ra->sort_colls[k]);
+    }
+    if (cmp != 0) {
+      if (ra->sort_descs[k]) return -cmp;
+      return cmp;
+    }
   }
+  return 0;
+}
 
-  if (ra->sort_desc) {
-    return -cmp;
+static bool sql_like_match(const char* pattern, const char* str, CollationType coll) {
+  while (*pattern) {
+    if (*pattern == '%') {
+      pattern++;
+      if (*pattern == '\0') return true;
+      while (*str) {
+        if (sql_like_match(pattern, str, coll)) return true;
+        str++;
+      }
+      return false;
+    }
+    if (!*str) return false;
+    if (*pattern == '_') {
+      pattern++;
+      str++;
+      continue;
+    }
+    char p = *pattern;
+    char s = *str;
+    if (coll == COLL_NOCASE) {
+      if (tolower((unsigned char)p) != tolower((unsigned char)s)) return false;
+    } else {
+      if (p != s) return false;
+    }
+    pattern++;
+    str++;
   }
-  return cmp;
+  return *str == '\0';
 }
 
 static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* catalog, Pager* pager) {
@@ -635,6 +676,157 @@ static void eval_expr_string(const char* expr, TableDef* def, Value* row_vals, c
     if (end_paren) *end_paren = '}';
     return;
   }
+
+  if (strncasecmp(expr, "case", 4) == 0 && isspace((unsigned char)expr[4])) {
+    const char* p = expr + 4;
+    p = skip_space(p);
+    bool matched = false;
+    while (strncasecmp(p, "when", 4) == 0 && isspace((unsigned char)p[4])) {
+      p += 4;
+      p = skip_space(p);
+      char col_tok[COL_NAME_SIZE] = {0};
+      uint32_t c_idx = 0;
+      while (*p && !isspace((unsigned char)*p) && *p != '=' && *p != '>' && *p != '<' && c_idx < sizeof(col_tok)-1) {
+        col_tok[c_idx++] = *p++;
+      }
+      p = skip_space(p);
+      char op_tok[4] = {0};
+      uint32_t o_idx = 0;
+      while (*p && (*p == '=' || *p == '>' || *p == '<' || *p == '!') && o_idx < sizeof(op_tok)-1) {
+        op_tok[o_idx++] = *p++;
+      }
+      p = skip_space(p);
+      char val_tok[MAX_RAW_VAL] = {0};
+      uint32_t v_idx = 0;
+      if (*p == '\'' || *p == '"') {
+        char q = *p++;
+        while (*p && *p != q && v_idx < sizeof(val_tok)-1) val_tok[v_idx++] = *p++;
+        if (*p == q) p++;
+      } else {
+        while (*p && !isspace((unsigned char)*p) && v_idx < sizeof(val_tok)-1) val_tok[v_idx++] = *p++;
+      }
+
+      bool cond_true = false;
+      if (def && row_vals) {
+        int target_col = -1;
+        for (uint32_t c = 0; c < def->num_cols; c++) {
+          if (strcmp(def->columns[c].name, col_tok) == 0) { target_col = (int)c; break; }
+        }
+        if (target_col != -1) {
+          Value* cv = &row_vals[target_col];
+          int cmp = 0;
+          if (def->columns[target_col].type == COL_INT) {
+            int iv = atoi(val_tok);
+            cmp = (cv->int_val > iv) - (cv->int_val < iv);
+          } else if (def->columns[target_col].type == COL_DOUBLE || def->columns[target_col].type == COL_FLOAT) {
+            double dv = atof(val_tok);
+            cmp = (cv->double_val > dv) - (cv->double_val < dv);
+          } else {
+            cmp = strcmp(cv->text_val, val_tok);
+          }
+          if (strcmp(op_tok, "=") == 0 || strcmp(op_tok, "==") == 0) cond_true = (cmp == 0);
+          else if (strcmp(op_tok, ">") == 0) cond_true = (cmp > 0);
+          else if (strcmp(op_tok, "<") == 0) cond_true = (cmp < 0);
+          else if (strcmp(op_tok, ">=") == 0) cond_true = (cmp >= 0);
+          else if (strcmp(op_tok, "<=") == 0) cond_true = (cmp <= 0);
+          else if (strcmp(op_tok, "!=") == 0 || strcmp(op_tok, "<>") == 0) cond_true = (cmp != 0);
+        }
+      }
+
+      p = skip_space(p);
+      if (strncasecmp(p, "then", 4) == 0) {
+        p += 4;
+        p = skip_space(p);
+        char then_val[MAX_RAW_VAL] = {0};
+        uint32_t t_idx = 0;
+        if (*p == '\'' || *p == '"') {
+          char q = *p++;
+          while (*p && *p != q && t_idx < sizeof(then_val)-1) then_val[t_idx++] = *p++;
+          if (*p == q) p++;
+        } else {
+          while (*p && !isspace((unsigned char)*p) && t_idx < sizeof(then_val)-1) then_val[t_idx++] = *p++;
+        }
+        if (cond_true && !matched) {
+          snprintf(out_buf, out_size, "%s", then_val);
+          matched = true;
+        }
+      }
+      p = skip_space(p);
+    }
+    if (strncasecmp(p, "else", 4) == 0) {
+      p += 4;
+      p = skip_space(p);
+      char else_val[MAX_RAW_VAL] = {0};
+      uint32_t e_idx = 0;
+      if (*p == '\'' || *p == '"') {
+        char q = *p++;
+        while (*p && *p != q && e_idx < sizeof(else_val)-1) else_val[e_idx++] = *p++;
+        if (*p == q) p++;
+      } else {
+        while (*p && !isspace((unsigned char)*p) && e_idx < sizeof(else_val)-1) else_val[e_idx++] = *p++;
+      }
+      if (!matched) {
+        snprintf(out_buf, out_size, "%s", else_val);
+        matched = true;
+      }
+    }
+    return;
+  }
+
+  /* Arithmetic expressions: +, -, *, / */
+  const char* op_ptr = NULL;
+  char op_char = 0;
+  for (const char* ch = expr; *ch; ch++) {
+    if (*ch == '+' || *ch == '-' || *ch == '*' || *ch == '/') {
+      if (ch > expr && (ch[-1] == ' ' || isalnum(ch[-1])) && (ch[1] == ' ' || isalnum(ch[1]))) {
+        op_ptr = ch;
+        op_char = *ch;
+        break;
+      }
+    }
+  }
+  if (op_ptr != NULL) {
+    char left_tok[128] = {0};
+    char right_tok[128] = {0};
+    uint32_t llen = op_ptr - expr;
+    if (llen < sizeof(left_tok)) strncpy(left_tok, expr, llen);
+    while (llen > 0 && isspace((unsigned char)left_tok[llen-1])) left_tok[--llen] = '\0';
+    char* lstart = left_tok;
+    while (*lstart && isspace((unsigned char)*lstart)) lstart++;
+
+    strncpy(right_tok, op_ptr + 1, sizeof(right_tok) - 1);
+    char* rstart = right_tok;
+    while (*rstart && isspace((unsigned char)*rstart)) rstart++;
+    uint32_t rlen = strlen(rstart);
+    while (rlen > 0 && isspace((unsigned char)rstart[rlen-1])) rstart[--rlen] = '\0';
+
+    double left_val = 0.0, right_val = 0.0;
+    bool left_found = false, right_found = false;
+    if (def && row_vals) {
+      for (uint32_t c = 0; c < def->num_cols; c++) {
+        if (strcmp(def->columns[c].name, lstart) == 0) {
+          left_val = (def->columns[c].type == COL_INT) ? (double)row_vals[c].int_val : row_vals[c].double_val;
+          left_found = true;
+        }
+        if (strcmp(def->columns[c].name, rstart) == 0) {
+          right_val = (def->columns[c].type == COL_INT) ? (double)row_vals[c].int_val : row_vals[c].double_val;
+          right_found = true;
+        }
+      }
+    }
+    if (!left_found) left_val = atof(lstart);
+    if (!right_found) right_val = atof(rstart);
+
+    double res = 0.0;
+    if (op_char == '+') res = left_val + right_val;
+    else if (op_char == '-') res = left_val - right_val;
+    else if (op_char == '*') res = left_val * right_val;
+    else if (op_char == '/' && right_val != 0.0) res = left_val / right_val;
+
+    if ((double)(long long)res == res) snprintf(out_buf, out_size, "%lld", (long long)res);
+    else snprintf(out_buf, out_size, "%.8g", res);
+    return;
+  }
 }
 
 static void print_projected_row(Statement* stmt, TableDef* def, Value* row_vals) {
@@ -700,6 +892,51 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
   Vdbe* vm = vdbe_create(pager, catalog);
   WhereClause* wc = &stmt->where_clause;
 
+  if (stmt->is_explain) {
+    bool use_index = false;
+    uint32_t idx_col_idx = 0;
+    if (wc->has_where && wc->num_conds > 0) {
+      for (uint32_t c = 1; c < def->num_cols; c++) {
+        if (strcmp(def->columns[c].name, wc->conds[0].col_name) == 0 && def->columns[c].has_index) {
+          use_index = true;
+          idx_col_idx = c;
+          break;
+        }
+      }
+    }
+    bool pk_seek = (!use_index && wc->has_where && wc->num_conds > 0 &&
+                    strcmp(wc->conds[0].col_name, "id") == 0 &&
+                    (wc->conds[0].op == OP_EQ || wc->conds[0].op == OP_GT || wc->conds[0].op == OP_GTE));
+    printf("QUERY PLAN:\n");
+    if (use_index) {
+      const char* op_str = "=";
+      if (wc->conds[0].op == OP_GT) op_str = ">";
+      else if (wc->conds[0].op == OP_GTE) op_str = ">=";
+      else if (wc->conds[0].op == OP_LT) op_str = "<";
+      else if (wc->conds[0].op == OP_LTE) op_str = "<=";
+      printf("  SEARCH TABLE %s USING INDEX _idx_%s_%s (%s %s %s)\n",
+             def->name, def->name, def->columns[idx_col_idx].name,
+             def->columns[idx_col_idx].name, op_str, wc->conds[0].raw_val);
+    } else if (pk_seek) {
+      printf("  SEARCH TABLE %s USING PRIMARY KEY (id = %s)\n",
+             def->name, wc->conds[0].raw_val);
+    } else {
+      printf("  SCAN TABLE %s\n", def->name);
+    }
+    printf("\n");
+    Value tbl_name_val;
+    memset(&tbl_name_val, 0, sizeof(Value));
+    strncpy(tbl_name_val.text_val, def->name, sizeof(tbl_name_val.text_val)-1);
+    vdbe_add_inst(vm, OP_OpenRead, 0, def->root_page_num, 0, tbl_name_val);
+    vdbe_add_inst(vm, OP_Rewind, 0, 4, 0, (Value){0});
+    vdbe_add_inst(vm, OP_ResultRow, 1, def->num_cols, 0, (Value){0});
+    vdbe_add_inst(vm, OP_Next, 0, 2, 0, (Value){0});
+    vdbe_add_inst(vm, OP_Halt, 0, 0, 0, (Value){0});
+    vdbe_print_program(vm);
+    vdbe_free(vm);
+    return EXECUTE_SUCCESS;
+  }
+
   if (def->is_virtual) {
     if (strcasecmp(def->vtab_module, "csv") == 0) {
       FILE* fp = fopen(def->vtab_args, "r");
@@ -736,17 +973,6 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
       fclose(fp);
       vdbe_free(vm);
       return EXECUTE_SUCCESS;
-    }
-  }
-
-  /* Check if any WHERE condition contains a subquery */
-  bool has_subquery = false;
-  if (wc->has_where) {
-    for (uint32_t i = 0; i < wc->num_conds; i++) {
-      if (wc->conds[i].is_subquery || wc->conds[i].is_exists || wc->conds[i].is_not_exists) {
-        has_subquery = true;
-        break;
-      }
     }
   }
 
@@ -869,7 +1095,7 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
     return EXECUTE_SUCCESS;
   }
 
-  if (has_subquery || (stmt->num_select_cols > 0 && !stmt->is_aggregate)) {
+  if (true) {
     vdbe_free(vm);
     Table table = { pager, def };
     Cursor* cursor = btree_start(&table);
@@ -877,16 +1103,6 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
     uint32_t capacity = 16;
     uint32_t count = 0;
     RowSortEntry* entries = malloc(sizeof(RowSortEntry) * capacity);
-
-    int sort_col_idx = -1;
-    if (stmt->has_order_by) {
-      for (uint32_t c = 0; c < def->num_cols; c++) {
-        if (strcmp(def->columns[c].name, stmt->order_by_col) == 0) {
-          sort_col_idx = (int)c;
-          break;
-        }
-      }
-    }
 
     while (!cursor->end_of_table) {
       Value row_vals[MAX_COLUMNS];
@@ -897,11 +1113,24 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
           entries = realloc(entries, sizeof(RowSortEntry) * capacity);
         }
         for (uint32_t c = 0; c < def->num_cols; c++) entries[count].row[c] = row_vals[c];
-        if (sort_col_idx >= 0) {
-          entries[count].sort_key = row_vals[sort_col_idx];
-          entries[count].sort_type = def->columns[sort_col_idx].type;
-          entries[count].sort_coll = stmt->order_by_collation;
-          entries[count].sort_desc = stmt->order_by_desc;
+        entries[count].num_sort_keys = 0;
+        if (stmt->has_order_by) {
+          uint32_t num_items = (stmt->num_order_by > 0) ? stmt->num_order_by : 1;
+          for (uint32_t k = 0; k < num_items; k++) {
+            const char* target_col = (stmt->num_order_by > 0) ? stmt->order_by_items[k].col_name : stmt->order_by_col;
+            bool target_desc = (stmt->num_order_by > 0) ? stmt->order_by_items[k].is_desc : stmt->order_by_desc;
+            CollationType target_coll = (stmt->num_order_by > 0) ? stmt->order_by_items[k].collation : stmt->order_by_collation;
+            for (uint32_t c = 0; c < def->num_cols; c++) {
+              if (strcmp(def->columns[c].name, target_col) == 0) {
+                uint32_t sk_idx = entries[count].num_sort_keys++;
+                entries[count].sort_keys[sk_idx] = row_vals[c];
+                entries[count].sort_types[sk_idx] = def->columns[c].type;
+                entries[count].sort_colls[sk_idx] = target_coll;
+                entries[count].sort_descs[sk_idx] = target_desc;
+                break;
+              }
+            }
+          }
         }
         count++;
       }
@@ -909,16 +1138,60 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
     }
     free(cursor);
 
-    if (stmt->has_order_by && count > 1 && sort_col_idx >= 0) {
+    if (stmt->has_order_by && count > 1) {
       qsort(entries, count, sizeof(RowSortEntry), compare_row_sort_entries);
     }
 
-    uint32_t limit = count;
-    if (stmt->has_limit && stmt->limit_val >= 0 && (uint32_t)stmt->limit_val < limit) {
-      limit = (uint32_t)stmt->limit_val;
+    /* Deduplication for DISTINCT */
+    if (stmt->is_distinct && count > 0) {
+      uint32_t write_idx = 0;
+      for (uint32_t i = 0; i < count; i++) {
+        bool dup = false;
+        for (uint32_t j = 0; j < write_idx; j++) {
+          bool same = true;
+          if (stmt->num_select_cols > 0) {
+            for (uint32_t sc = 0; sc < stmt->num_select_cols; sc++) {
+              int col_idx = -1;
+              for (uint32_t c = 0; c < def->num_cols; c++) {
+                if (strcmp(def->columns[c].name, stmt->select_cols[sc].col_name) == 0) {
+                  col_idx = (int)c;
+                  break;
+                }
+              }
+              if (col_idx >= 0) {
+                if (compare_values(def->columns[col_idx].type, &entries[i].row[col_idx], &entries[j].row[col_idx]) != 0) {
+                  same = false;
+                  break;
+                }
+              }
+            }
+          } else {
+            for (uint32_t c = 0; c < def->num_cols; c++) {
+              if (compare_values(def->columns[c].type, &entries[i].row[c], &entries[j].row[c]) != 0) {
+                same = false;
+                break;
+              }
+            }
+          }
+          if (same) { dup = true; break; }
+        }
+        if (!dup) {
+          if (write_idx != i) entries[write_idx] = entries[i];
+          write_idx++;
+        }
+      }
+      count = write_idx;
     }
 
-    for (uint32_t i = 0; i < limit; i++) {
+    /* LIMIT & OFFSET */
+    uint32_t offset = (stmt->has_offset && stmt->offset_val > 0) ? (uint32_t)stmt->offset_val : 0;
+    uint32_t limit = count;
+    if (stmt->has_limit && stmt->limit_val >= 0) {
+      limit = offset + (uint32_t)stmt->limit_val;
+    }
+    if (limit > count) limit = count;
+
+    for (uint32_t i = offset; i < limit; i++) {
       print_projected_row(stmt, def, entries[i].row);
     }
     free(entries);
@@ -2003,7 +2276,40 @@ bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog*
       continue;
     }
 
-    if (actual->is_null) return false;
+    if (cond->op == OP_BETWEEN) {
+      Value lower_v, upper_v;
+      memset(&lower_v, 0, sizeof(Value));
+      memset(&upper_v, 0, sizeof(Value));
+      if (col->type == COL_INT) {
+        lower_v.int_val = atoi(cond->raw_val);
+        upper_v.int_val = atoi(cond->raw_val2);
+      } else if (col->type == COL_FLOAT) {
+        lower_v.float_val = (float)atof(cond->raw_val);
+        upper_v.float_val = (float)atof(cond->raw_val2);
+      } else if (col->type == COL_DOUBLE || col->type == COL_NUMERIC || col->type == COL_DECIMAL) {
+        lower_v.double_val = atof(cond->raw_val);
+        upper_v.double_val = atof(cond->raw_val2);
+      } else {
+        strncpy(lower_v.text_val, cond->raw_val, sizeof(lower_v.text_val) - 1);
+        strncpy(upper_v.text_val, cond->raw_val2, sizeof(upper_v.text_val) - 1);
+      }
+      int cmp_l = compare_values(col->type, actual, &lower_v);
+      int cmp_u = compare_values(col->type, actual, &upper_v);
+      if (cmp_l < 0 || cmp_u > 0) return false;
+      continue;
+    }
+
+    if (cond->op == OP_LIKE) {
+      char val_str[MAX_TEXT_SIZE];
+      if (col->type == COL_INT) snprintf(val_str, sizeof(val_str), "%d", actual->int_val);
+      else if (col->type == COL_DOUBLE || col->type == COL_FLOAT) snprintf(val_str, sizeof(val_str), "%.8g", actual->double_val);
+      else snprintf(val_str, sizeof(val_str), "%s", actual->text_val);
+
+      if (!sql_like_match(cond->raw_val, val_str, cond->collation)) {
+        return false;
+      }
+      continue;
+    }
 
     /* Parse filter value */
     Value filter_val;
@@ -2054,12 +2360,13 @@ bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog*
     
     bool match = false;
     switch (cond->op) {
-      case OP_EQ:  match = (cmp == 0); break;
-      case OP_LT:  match = (cmp < 0); break;
-      case OP_GT:  match = (cmp > 0); break;
-      case OP_LTE: match = (cmp <= 0); break;
-      case OP_GTE: match = (cmp >= 0); break;
-      default:     match = false; break;
+      case OP_EQ:    match = (cmp == 0); break;
+      case OP_LT:    match = (cmp < 0); break;
+      case OP_GT:    match = (cmp > 0); break;
+      case OP_LTE:   match = (cmp <= 0); break;
+      case OP_GTE:   match = (cmp >= 0); break;
+      case OP_MATCH: match = (strcasestr(actual->text_val, filter_val.text_val) != NULL); break;
+      default:       match = false; break;
     }
     
     if (!match) return false;
@@ -2198,6 +2505,13 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
           for (uint32_t c = 0; c < child_def->num_cols; c++) {
             Column* child_col = &child_def->columns[c];
             if (child_col->has_fk && child_col->fk_on_delete_cascade && strcmp(child_col->fk_target_table, def->name) == 0) {
+              uint32_t target_pcol = 0;
+              for (uint32_t pc = 0; pc < def->num_cols; pc++) {
+                if (strlen(child_col->fk_target_col) > 0 && strcmp(def->columns[pc].name, child_col->fk_target_col) == 0) {
+                  target_pcol = pc;
+                  break;
+                }
+              }
               Statement del_stmt;
               memset(&del_stmt, 0, sizeof(Statement));
               del_stmt.type = STATEMENT_DELETE;
@@ -2206,7 +2520,13 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
               del_stmt.where_clause.num_conds = 1;
               strcpy(del_stmt.where_clause.conds[0].col_name, child_col->name);
               del_stmt.where_clause.conds[0].op = OP_EQ;
-              snprintf(del_stmt.where_clause.conds[0].raw_val, sizeof(del_stmt.where_clause.conds[0].raw_val), "%d", values[0].int_val);
+              if (def->columns[target_pcol].type == COL_INT) {
+                snprintf(del_stmt.where_clause.conds[0].raw_val, sizeof(del_stmt.where_clause.conds[0].raw_val), "%d", values[target_pcol].int_val);
+              } else if (def->columns[target_pcol].type == COL_DOUBLE || def->columns[target_pcol].type == COL_FLOAT) {
+                snprintf(del_stmt.where_clause.conds[0].raw_val, sizeof(del_stmt.where_clause.conds[0].raw_val), "%.8g", values[target_pcol].double_val);
+              } else {
+                snprintf(del_stmt.where_clause.conds[0].raw_val, sizeof(del_stmt.where_clause.conds[0].raw_val), "%s", values[target_pcol].text_val);
+              }
               run_delete_vm(&del_stmt, child_def, catalog, pager);
             }
           }
@@ -2378,18 +2698,37 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
           for (uint32_t c = 0; c < child_def->num_cols; c++) {
             Column* child_col = &child_def->columns[c];
             if (child_col->has_fk && child_col->fk_on_update_cascade && strcmp(child_col->fk_target_table, def->name) == 0) {
+              uint32_t target_pcol = 0;
+              for (uint32_t pc = 0; pc < def->num_cols; pc++) {
+                if (strlen(child_col->fk_target_col) > 0 && strcmp(def->columns[pc].name, child_col->fk_target_col) == 0) {
+                  target_pcol = pc;
+                  break;
+                }
+              }
               Statement upd_stmt;
               memset(&upd_stmt, 0, sizeof(Statement));
               upd_stmt.type = STATEMENT_UPDATE;
               strcpy(upd_stmt.table_name, child_def->name);
               upd_stmt.num_set_pairs = 1;
               strcpy(upd_stmt.set_pairs[0].col_name, child_col->name);
-              snprintf(upd_stmt.set_pairs[0].str_val, sizeof(upd_stmt.set_pairs[0].str_val), "%d", values[0].int_val);
+              if (def->columns[target_pcol].type == COL_INT) {
+                snprintf(upd_stmt.set_pairs[0].str_val, sizeof(upd_stmt.set_pairs[0].str_val), "%d", values[target_pcol].int_val);
+              } else if (def->columns[target_pcol].type == COL_DOUBLE || def->columns[target_pcol].type == COL_FLOAT) {
+                snprintf(upd_stmt.set_pairs[0].str_val, sizeof(upd_stmt.set_pairs[0].str_val), "%.8g", values[target_pcol].double_val);
+              } else {
+                snprintf(upd_stmt.set_pairs[0].str_val, sizeof(upd_stmt.set_pairs[0].str_val), "%s", values[target_pcol].text_val);
+              }
               upd_stmt.where_clause.has_where = true;
               upd_stmt.where_clause.num_conds = 1;
               strcpy(upd_stmt.where_clause.conds[0].col_name, child_col->name);
               upd_stmt.where_clause.conds[0].op = OP_EQ;
-              snprintf(upd_stmt.where_clause.conds[0].raw_val, sizeof(upd_stmt.where_clause.conds[0].raw_val), "%d", target_id.int_val);
+              if (def->columns[target_pcol].type == COL_INT) {
+                snprintf(upd_stmt.where_clause.conds[0].raw_val, sizeof(upd_stmt.where_clause.conds[0].raw_val), "%d", target_id.int_val);
+              } else if (def->columns[target_pcol].type == COL_DOUBLE || def->columns[target_pcol].type == COL_FLOAT) {
+                snprintf(upd_stmt.where_clause.conds[0].raw_val, sizeof(upd_stmt.where_clause.conds[0].raw_val), "%.8g", target_id.double_val);
+              } else {
+                snprintf(upd_stmt.where_clause.conds[0].raw_val, sizeof(upd_stmt.where_clause.conds[0].raw_val), "%s", target_id.text_val);
+              }
               run_update_vm(&upd_stmt, child_def, catalog, pager);
             }
           }
@@ -2450,6 +2789,14 @@ static ExecuteResult execute_drop_table(Statement* stmt, Catalog* catalog, Pager
 
   if (idx == UINT32_MAX) {
     return EXECUTE_TABLE_NOT_FOUND;
+  }
+
+  /* Reclaim root page and index root pages to freelist */
+  pager_free_page(pager, catalog->tables[idx].root_page_num);
+  for (uint32_t c = 0; c < catalog->tables[idx].num_cols; c++) {
+    if (catalog->tables[idx].columns[c].has_index) {
+      pager_free_page(pager, catalog->tables[idx].columns[c].index_root_page);
+    }
   }
 
   /* Shift tables down in catalog */
@@ -2874,6 +3221,21 @@ static ExecuteResult execute_analyze(Statement* stmt, Catalog* catalog, Pager* p
     stat1_def = catalog_find(catalog, "sqlite_stat1");
   }
 
+  uint32_t next_stat_id = 1;
+  if (stat1_def) {
+    Table stat_tbl = { pager, stat1_def };
+    Cursor* scur = btree_start(&stat_tbl);
+    while (!scur->end_of_table) {
+      Value s_row[MAX_COLUMNS];
+      deserialize_row(stat1_def, cursor_value(scur), s_row);
+      if (s_row[0].int_val >= (int32_t)next_stat_id) {
+        next_stat_id = (uint32_t)s_row[0].int_val + 1;
+      }
+      cursor_advance(scur);
+    }
+    free(scur);
+  }
+
   for (uint32_t t = 0; t < catalog->num_tables; t++) {
     TableDef* def = &catalog->tables[t];
     if (strcmp(def->name, "sqlite_stat1") == 0) continue;
@@ -2900,7 +3262,7 @@ static ExecuteResult execute_analyze(Statement* stmt, Catalog* catalog, Pager* p
         ins_stmt.type = STATEMENT_INSERT;
         strcpy(ins_stmt.table_name, "sqlite_stat1");
         ins_stmt.num_values = 4;
-        strcpy(ins_stmt.raw_values[0], "0");
+        snprintf(ins_stmt.raw_values[0], sizeof(ins_stmt.raw_values[0]), "%u", next_stat_id++);
         snprintf(ins_stmt.raw_values[1], sizeof(ins_stmt.raw_values[1]), "%s", def->name);
         strcpy(ins_stmt.raw_values[2], idx_name);
         strcpy(ins_stmt.raw_values[3], stat_str);
@@ -3227,6 +3589,7 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
     return EXECUTE_SUCCESS;
   }
   if (stmt->type == STATEMENT_ATTACH) {
+    if (strlen(stmt->attach_filename) == 0) return EXECUTE_BAD_SCHEMA;
     Pager* att_pager = pager_open(stmt->attach_filename);
     if (!att_pager) return EXECUTE_BAD_SCHEMA;
     printf("Database '%s' attached as '%s'.\n", stmt->attach_filename, stmt->attach_alias);
@@ -3357,12 +3720,46 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
   if (def == NULL) {
     ViewDef* v = catalog_find_view(catalog, stmt->table_name);
     if (v != NULL) {
-      Statement view_stmt;
-      if (prepare_statement(v->select_sql, &view_stmt) == PREPARE_SUCCESS) {
-        if (stmt->where_clause.has_where) {
-          view_stmt.where_clause = stmt->where_clause;
+      Statement* view_stmt = malloc(sizeof(Statement));
+      if (view_stmt) {
+        if (prepare_statement(v->select_sql, view_stmt) == PREPARE_SUCCESS) {
+          if (stmt->where_clause.has_where) {
+            if (!view_stmt->where_clause.has_where) {
+              view_stmt->where_clause = stmt->where_clause;
+            } else {
+              for (uint32_t c = 0; c < stmt->where_clause.num_conds && view_stmt->where_clause.num_conds < MAX_WHERE_CONDS; c++) {
+                view_stmt->where_clause.conds[view_stmt->where_clause.num_conds++] = stmt->where_clause.conds[c];
+              }
+            }
+          }
+          if (stmt->num_select_cols > 0) {
+            view_stmt->num_select_cols = stmt->num_select_cols;
+            memcpy(view_stmt->select_cols, stmt->select_cols, sizeof(stmt->select_cols));
+          }
+          if (stmt->has_order_by) {
+            view_stmt->has_order_by = true;
+            view_stmt->num_order_by = stmt->num_order_by;
+            memcpy(view_stmt->order_by_items, stmt->order_by_items, sizeof(stmt->order_by_items));
+            strcpy(view_stmt->order_by_col, stmt->order_by_col);
+            view_stmt->order_by_desc = stmt->order_by_desc;
+            view_stmt->order_by_collation = stmt->order_by_collation;
+          }
+          if (stmt->has_limit) {
+            view_stmt->has_limit = true;
+            view_stmt->limit_val = stmt->limit_val;
+          }
+          if (stmt->has_offset) {
+            view_stmt->has_offset = true;
+            view_stmt->offset_val = stmt->offset_val;
+          }
+          if (stmt->is_distinct) {
+            view_stmt->is_distinct = true;
+          }
+          ExecuteResult res = execute_statement(view_stmt, catalog, pager);
+          free(view_stmt);
+          return res;
         }
-        return execute_statement(&view_stmt, catalog, pager);
+        free(view_stmt);
       }
     }
     catalog->num_tables -= stmt->num_ctes;
@@ -3372,7 +3769,52 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
   ExecuteResult result = EXECUTE_SUCCESS;
   switch (stmt->type) {
     case STATEMENT_INSERT:
-      result = run_insert_vm(stmt, def, catalog, pager);
+      if (stmt->is_multi_insert) {
+        Statement* single_ins = malloc(sizeof(Statement));
+        if (single_ins) {
+          for (uint32_t r = 0; r < stmt->num_multi_rows; r++) {
+            *single_ins = *stmt;
+            single_ins->is_multi_insert = false;
+            single_ins->num_values = stmt->num_values;
+            for (uint32_t c = 0; c < stmt->num_values; c++) {
+              strncpy(single_ins->raw_values[c], stmt->multi_raw_values[r][c], MAX_RAW_VAL - 1);
+            }
+            result = run_insert_vm(single_ins, def, catalog, pager);
+            if (result != EXECUTE_SUCCESS) break;
+          }
+          free(single_ins);
+        }
+      } else if (stmt->is_insert_select && stmt->insert_select_stmt) {
+        TableDef* src_def = catalog_find(catalog, stmt->insert_select_stmt->table_name);
+        if (!src_def) {
+          result = EXECUTE_TABLE_NOT_FOUND;
+        } else {
+          Table src_tbl = { pager, src_def };
+          Cursor* cur = btree_start(&src_tbl);
+          while (!cur->end_of_table) {
+            Value r_vals[MAX_COLUMNS];
+            deserialize_row(src_def, cursor_value(cur), r_vals);
+            if (eval_where_clause(src_def, r_vals, &stmt->insert_select_stmt->where_clause, catalog, pager)) {
+              Statement single_ins;
+              memset(&single_ins, 0, sizeof(Statement));
+              single_ins.type = STATEMENT_INSERT;
+              snprintf(single_ins.table_name, sizeof(single_ins.table_name), "%s", stmt->table_name);
+              single_ins.num_values = def->num_cols;
+              for (uint32_t c = 0; c < def->num_cols && c < src_def->num_cols; c++) {
+                if (src_def->columns[c].type == COL_INT) snprintf(single_ins.raw_values[c], MAX_RAW_VAL, "%d", r_vals[c].int_val);
+                else if (src_def->columns[c].type == COL_DOUBLE || src_def->columns[c].type == COL_FLOAT) snprintf(single_ins.raw_values[c], MAX_RAW_VAL, "%.8g", r_vals[c].double_val);
+                else snprintf(single_ins.raw_values[c], MAX_RAW_VAL, "%s", r_vals[c].text_val);
+              }
+              result = run_insert_vm(&single_ins, def, catalog, pager);
+              if (result != EXECUTE_SUCCESS) break;
+            }
+            cursor_advance(cur);
+          }
+          free(cur);
+        }
+      } else {
+        result = run_insert_vm(stmt, def, catalog, pager);
+      }
       break;
     case STATEMENT_SELECT:
       if (stmt->has_group_by) {

@@ -5,6 +5,7 @@ src/*.o
 *.a
 *.exe
 db
+db_server
 libdbms.so
 example_crud
 KeepDBMS.apk

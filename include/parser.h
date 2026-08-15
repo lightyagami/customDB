@@ -46,7 +46,9 @@ typedef enum {
   OP_IN,          /* IN */
   OP_IS_NULL,     /* IS NULL */
   OP_IS_NOT_NULL, /* IS NOT NULL */
-  OP_MATCH        /* MATCH */
+  OP_MATCH,       /* MATCH */
+  OP_LIKE,        /* LIKE */
+  OP_BETWEEN      /* BETWEEN */
 } CompOp;
 
 #define MAX_WHERE_CONDS 4
@@ -58,10 +60,17 @@ typedef enum {
   LOGIC_OR
 } LogicOp;
 
+typedef struct {
+  char          col_name[COL_NAME_SIZE];
+  bool          is_desc;
+  CollationType collation;
+} OrderByItem;
+
 struct SingleCond {
   char   col_name[COL_NAME_SIZE];
   CompOp op;
   char   raw_val[MAX_RAW_VAL];
+  char   raw_val2[MAX_RAW_VAL]; /* For BETWEEN upper bound */
   bool   is_subquery;
   char   sub_table[TBL_NAME_SIZE];
   char   sub_col[COL_NAME_SIZE];
@@ -157,6 +166,7 @@ struct Statement {
   CteDef   ctes[4];
 
   /* SELECT columns / Aggregates */
+  bool       is_distinct;
   bool       is_aggregate;
   uint32_t   num_select_cols;
   SelectCol  select_cols[MAX_SELECT_COLS];
@@ -164,6 +174,11 @@ struct Statement {
   /* INSERT */
   char     raw_values[MAX_COLUMNS][MAX_RAW_VAL];
   uint32_t num_values;
+  bool     is_multi_insert;
+  uint32_t num_multi_rows;
+  char     multi_raw_values[16][MAX_COLUMNS][MAX_RAW_VAL];
+  bool     is_insert_select;
+  Statement* insert_select_stmt;
 
   /* SELECT / DELETE WHERE, UPDATE WHERE */
   WhereClause where_clause;
@@ -197,10 +212,14 @@ struct Statement {
   char          order_by_col[COL_NAME_SIZE];
   bool          order_by_desc;
   CollationType order_by_collation;
+  uint32_t      num_order_by;
+  OrderByItem   order_by_items[4];
 
-  /* LIMIT */
+  /* LIMIT & OFFSET */
   bool       has_limit;
   int        limit_val;
+  bool       has_offset;
+  int        offset_val;
 
   /* GROUP BY */
   bool       has_group_by;
