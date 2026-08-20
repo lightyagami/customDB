@@ -1957,7 +1957,7 @@ static ExecuteResult run_aggregate_select(Statement* stmt, TableDef* def, Catalo
     switch (sc->func) {
       case AGG_COUNT_STAR:
       case AGG_COUNT:
-        printf("%ld", counts[i]);
+        printf("%lld", (long long)counts[i]);
         break;
       case AGG_SUM:
         printf("%.2f", sums[i]);
@@ -2120,7 +2120,7 @@ static ExecuteResult run_group_by_select(Statement* stmt, TableDef* def, Catalog
       switch (sc->func) {
         case AGG_COUNT_STAR:
         case AGG_COUNT:
-          printf("%ld", gb->counts[i]);
+          printf("%lld", (long long)gb->counts[i]);
           break;
         case AGG_SUM:
           printf("%.2f", gb->sums[i]);

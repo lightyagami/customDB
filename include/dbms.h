@@ -6,7 +6,9 @@
 #include <stdbool.h>
 
 #ifdef _WIN32
-  #ifdef DBMS_BUILD_DLL
+  #if defined(DBMS_STATIC)
+    #define DBMS_API
+  #elif defined(DBMS_BUILD_DLL)
     #define DBMS_API __declspec(dllexport)
   #else
     #define DBMS_API __declspec(dllimport)

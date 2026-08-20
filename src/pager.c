@@ -208,6 +208,14 @@ bool pager_lock(Pager* pager, PagerLockState lock_type) {
 
   /* Transition to EXCLUSIVE */
   if (pager->lock_state == PENDING_LOCK && lock_type >= EXCLUSIVE_LOCK) {
+#ifdef _WIN32
+    /* Windows byte-range locks are per-handle and NOT reentrant/upgradeable
+     * in place the way POSIX fcntl locks are. On Windows, attempting to lock a region the same handle
+     * already holds fails with a lock-violation error, so the previously
+     * held shared lock must be released first before re-acquiring it in
+     * exclusive mode.*/
+    lock_file_byte(pager->file_descriptor, SHARED_BYTE, F_UNLCK, false);
+#endif
     /* Upgrade SHARED byte to write lock. Only succeeds if there are no other readers. */
     if (lock_file_byte(pager->file_descriptor, SHARED_BYTE, F_WRLCK, false) == -1) {
       return false;

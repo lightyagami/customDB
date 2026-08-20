@@ -2,61 +2,109 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
-#include <unistd.h>
 #include <signal.h>
-#include <pthread.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include "dbms.h"
+
+#ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #include <windows.h>
+  #pragma comment(lib, "ws2_32.lib")
+  typedef SOCKET sock_t;
+  #define SOCK_INVALID INVALID_SOCKET
+  #define sock_close closesocket
+  #define sock_read(fd, buf, len)  recv((fd), (buf), (int)(len), 0)
+  #define sock_write(fd, buf, len) send((fd), (buf), (int)(len), 0)
+  #define strncasecmp _strnicmp
+  typedef long long ssize_t_compat;
+#else
+  #include <unistd.h>
+  #include <pthread.h>
+  #include <sys/socket.h>
+  #include <netinet/in.h>
+  #include <arpa/inet.h>
+  typedef int sock_t;
+  #define SOCK_INVALID (-1)
+  #define sock_close close
+  #define sock_read(fd, buf, len)  read((fd), (buf), (len))
+  #define sock_write(fd, buf, len) write((fd), (buf), (len))
+  typedef ssize_t ssize_t_compat;
+#endif
 
 #define DEFAULT_PORT 8888
 #define BUFFER_SIZE 4096
 
 static volatile bool g_running = true;
-static int g_server_fd = -1;
+static sock_t g_server_fd = SOCK_INVALID;
 static char g_db_path[512] = "server.db";
 
+#ifdef _WIN32
+static BOOL WINAPI handle_ctrl(DWORD ctrl_type) {
+  if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_CLOSE_EVENT) {
+    g_running = false;
+    if (g_server_fd != SOCK_INVALID) {
+      sock_t fd = g_server_fd;
+      g_server_fd = SOCK_INVALID;
+      sock_close(fd);
+    }
+    return TRUE;
+  }
+  return FALSE;
+}
+#else
 static void handle_sigint(int sig) {
   (void)sig;
   g_running = false;
-  if (g_server_fd != -1) {
-    close(g_server_fd);
-    g_server_fd = -1;
+  if (g_server_fd != SOCK_INVALID) {
+    sock_close(g_server_fd);
+    g_server_fd = SOCK_INVALID;
   }
 }
+#endif
 
 typedef struct {
-  int client_fd;
+  sock_t client_fd;
   struct sockaddr_in client_addr;
 } ClientContext;
 
-static void* client_worker(void* arg) {
+static
+#ifdef _WIN32
+DWORD WINAPI
+#else
+void*
+#endif
+client_worker(void* arg) {
   ClientContext* ctx = (ClientContext*)arg;
-  int fd = ctx->client_fd;
+  sock_t fd = ctx->client_fd;
 
   dbms* db = NULL;
   if (dbms_open(g_db_path, &db) != DBMS_OK) {
     const char* err_msg = "Error: Failed to open database.\n";
-    write(fd, err_msg, strlen(err_msg));
-    close(fd);
+    sock_write(fd, err_msg, strlen(err_msg));
+    sock_close(fd);
     free(ctx);
-    return NULL;
+    return
+#ifdef _WIN32
+      0;
+#else
+      NULL;
+#endif
   }
 
   const char* welcome = "DBMS Network Server 1.0 (Type SQL commands or .exit)\n";
-  write(fd, welcome, strlen(welcome));
+  sock_write(fd, welcome, strlen(welcome));
 
   char recv_buf[BUFFER_SIZE];
   char sql_buf[BUFFER_SIZE];
   uint32_t sql_len = 0;
 
   while (g_running) {
-    ssize_t bytes = read(fd, recv_buf, sizeof(recv_buf) - 1);
+    ssize_t_compat bytes = sock_read(fd, recv_buf, sizeof(recv_buf) - 1);
     if (bytes <= 0) break;
     recv_buf[bytes] = '\0';
 
-    for (ssize_t i = 0; i < bytes; i++) {
+    for (ssize_t_compat i = 0; i < bytes; i++) {
       char c = recv_buf[i];
       if (c == '\r') continue;
 
@@ -72,12 +120,17 @@ static void* client_worker(void* arg) {
         if (strlen(query) > 0) {
           if (strncasecmp(query, ".exit", 5) == 0 || strncasecmp(query, "exit", 4) == 0 || strncasecmp(query, "quit", 4) == 0) {
             dbms_close(db);
-            close(fd);
+            sock_close(fd);
             free(ctx);
-            return NULL;
+            return
+#ifdef _WIN32
+              0;
+#else
+              NULL;
+#endif
           }
           if (strncasecmp(query, "ping", 4) == 0) {
-            write(fd, "PONG\n", 5);
+            sock_write(fd, "PONG\n", 5);
             sql_len = 0;
             continue;
           }
@@ -86,7 +139,7 @@ static void* client_worker(void* arg) {
           int prep_res = dbms_prepare_v2(db, query, (int)strlen(query), &stmt, NULL);
           if (prep_res != DBMS_OK) {
             const char* err = "Error: SQL syntax or semantic error.\n";
-            write(fd, err, strlen(err));
+            sock_write(fd, err, strlen(err));
           } else {
             int col_count = dbms_column_count(stmt);
             int step_res;
@@ -108,10 +161,10 @@ static void* client_worker(void* arg) {
               }
               row_out[r_len++] = ')';
               row_out[r_len++] = '\n';
-              write(fd, row_out, r_len);
+              sock_write(fd, row_out, r_len);
             }
             dbms_finalize(stmt);
-            write(fd, "Executed.\n", 10);
+            sock_write(fd, "Executed.\n", 10);
           }
         }
         sql_len = 0;
@@ -120,9 +173,14 @@ static void* client_worker(void* arg) {
   }
 
   dbms_close(db);
-  close(fd);
+  sock_close(fd);
   free(ctx);
-  return NULL;
+  return
+#ifdef _WIN32
+    0;
+#else
+    NULL;
+#endif
 }
 
 int main(int argc, char* argv[]) {
@@ -135,34 +193,52 @@ int main(int argc, char* argv[]) {
     strncpy(g_db_path, argv[2], sizeof(g_db_path) - 1);
   }
 
+#ifdef _WIN32
+  WSADATA wsa;
+  if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+    fprintf(stderr, "WSAStartup failed\n");
+    return 1;
+  }
+  SetConsoleCtrlHandler(handle_ctrl, TRUE);
+#else
   signal(SIGINT, handle_sigint);
   signal(SIGTERM, handle_sigint);
   signal(SIGPIPE, SIG_IGN);
+#endif
 
   g_server_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (g_server_fd < 0) {
+  if (g_server_fd == SOCK_INVALID) {
     perror("socket");
+#ifdef _WIN32
+    WSACleanup();
+#endif
     return 1;
   }
 
   int opt = 1;
-  setsockopt(g_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  setsockopt(g_server_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
 
   struct sockaddr_in serv_addr;
   memset(&serv_addr, 0, sizeof(serv_addr));
   serv_addr.sin_family = AF_INET;
   serv_addr.sin_addr.s_addr = INADDR_ANY;
-  serv_addr.sin_port = htons(port);
+  serv_addr.sin_port = htons((unsigned short)port);
 
   if (bind(g_server_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
     perror("bind");
-    close(g_server_fd);
+    sock_close(g_server_fd);
+#ifdef _WIN32
+    WSACleanup();
+#endif
     return 1;
   }
 
   if (listen(g_server_fd, 128) < 0) {
     perror("listen");
-    close(g_server_fd);
+    sock_close(g_server_fd);
+#ifdef _WIN32
+    WSACleanup();
+#endif
     return 1;
   }
 
@@ -171,8 +247,8 @@ int main(int argc, char* argv[]) {
   while (g_running) {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
-    int client_fd = accept(g_server_fd, (struct sockaddr*)&client_addr, &client_len);
-    if (client_fd < 0) {
+    sock_t client_fd = accept(g_server_fd, (struct sockaddr*)&client_addr, &client_len);
+    if (client_fd == SOCK_INVALID) {
       if (!g_running) break;
       continue;
     }
@@ -181,15 +257,28 @@ int main(int argc, char* argv[]) {
     ctx->client_fd = client_fd;
     ctx->client_addr = client_addr;
 
+#ifdef _WIN32
+    HANDLE th = CreateThread(NULL, 0, client_worker, ctx, 0, NULL);
+    if (th != NULL) {
+      CloseHandle(th);
+    } else {
+      sock_close(client_fd);
+      free(ctx);
+    }
+#else
     pthread_t th;
     if (pthread_create(&th, NULL, client_worker, ctx) == 0) {
       pthread_detach(th);
     } else {
-      close(client_fd);
+      sock_close(client_fd);
       free(ctx);
     }
+#endif
   }
 
   printf("DBMS Server stopped.\n");
+#ifdef _WIN32
+  WSACleanup();
+#endif
   return 0;
 }

@@ -18,11 +18,14 @@
   #include <io.h>
   #include <direct.h>
   #include <process.h>
+  #include <pthread.h>
+  #include <sys/types.h>
   #define strcasecmp _stricmp
   #define strncasecmp _strnicmp
   #define strtok_r strtok_s
   #define ftruncate(fd, sz) _chsize_s(fd, (sz))
   #define fsync(fd) _commit(fd)
+  #define fdatasync(fd) _commit(fd)
   #ifndef O_BINARY
     #define O_BINARY _O_BINARY
   #endif
@@ -31,6 +34,50 @@
     #define F_WRLCK 1
     #define F_UNLCK 2
   #endif
+
+  #ifndef _SSIZE_T_DEFINED
+    typedef long long ssize_t;
+    #define _SSIZE_T_DEFINED
+  #endif
+
+  /* usleep(microseconds) shim using Windows Sleep() (millisecond granularity) */
+  static inline int usleep(unsigned int usec) {
+    Sleep((usec + 999) / 1000);
+    return 0;
+  }
+
+  /* pwrite shim: Windows has no atomic positioned I/O on a plain fd,
+     so we emulate with _lseek + write. Not thread-safe against
+     concurrent seeks on the same fd */
+  static inline ssize_t pwrite(int fd, const void* buf, size_t count, long offset) {
+    long cur = _lseek(fd, 0, SEEK_CUR);
+    if (_lseek(fd, offset, SEEK_SET) == -1) return -1;
+    int written = _write(fd, buf, (unsigned int)count);
+    _lseek(fd, cur, SEEK_SET);
+    return (ssize_t)written;
+  }
+
+  #define close _close
+  #define read _read
+  #define write _write
+  #define lseek _lseeki64
+  #define open _open
+  #define unlink _unlink
+  #define off_t long long
+
+  /* strcasestr is a POSIX/BSD extension not available on MSVCRT */
+  static inline char* strcasestr(const char* haystack, const char* needle) {
+    if (!*needle) return (char*)haystack;
+    for (; *haystack; haystack++) {
+      const char* h = haystack;
+      const char* n = needle;
+      while (*h && *n && tolower((unsigned char)*h) == tolower((unsigned char)*n)) {
+        h++; n++;
+      }
+      if (!*n) return (char*)haystack;
+    }
+    return NULL;
+  }
 #else
   #include <unistd.h>
   #include <pthread.h>
