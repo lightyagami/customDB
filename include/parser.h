@@ -134,7 +134,8 @@ typedef enum {
   WIN_SUM,
   WIN_AVG,
   WIN_MIN,
-  WIN_MAX
+  WIN_MAX,
+  WIN_COUNT
 } WindowFunc;
 
 typedef struct {

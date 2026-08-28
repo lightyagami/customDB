@@ -306,7 +306,7 @@ int dbms_bind_int(dbms_stmt* pStmt, int index, int value) {
 
 int dbms_bind_double(dbms_stmt* pStmt, int index, double value) {
   if (pStmt == NULL || index < 1 || index > MAX_COLUMNS) return DBMS_MISUSE;
-  snprintf(pStmt->stmt.raw_values[index - 1], MAX_RAW_VAL, "%f", value);
+  snprintf(pStmt->stmt.raw_values[index - 1], MAX_RAW_VAL, "%.17g", value);
   return DBMS_OK;
 }
 
@@ -376,6 +376,10 @@ int dbms_step(dbms_stmt* pStmt) {
     }
 
     pStmt->has_current_row = false;
+    if (pStmt->btree_cur) {
+      free(pStmt->btree_cur);
+      pStmt->btree_cur = NULL;
+    }
     pthread_mutex_unlock(&pStmt->db->mutex);
     if (pStmt->db->file_mutex) pthread_mutex_unlock(pStmt->db->file_mutex);
     return DBMS_DONE;
@@ -467,6 +471,14 @@ int dbms_column_int(dbms_stmt* pStmt, int col) {
   if (pStmt == NULL || !pStmt->has_current_row) return 0;
   int actual = get_projected_col_idx(pStmt, col);
   if (actual < 0 || actual >= MAX_COLUMNS) return 0;
+  if (pStmt->current_row_vals[actual].is_null) return 0;
+  if (pStmt->target_def && actual < (int)pStmt->target_def->num_cols) {
+    ColumnType type = pStmt->target_def->columns[actual].type;
+    if (type == COL_FLOAT) return (int)pStmt->current_row_vals[actual].float_val;
+    if (type == COL_DOUBLE || type == COL_NUMERIC || type == COL_DECIMAL) return (int)pStmt->current_row_vals[actual].double_val;
+    if (type == COL_BOOL) return pStmt->current_row_vals[actual].bool_val ? 1 : 0;
+    if (type == COL_TEXT || type == COL_VARCHAR) return atoi(pStmt->current_row_vals[actual].text_val);
+  }
   return pStmt->current_row_vals[actual].int_val;
 }
 
@@ -474,6 +486,14 @@ double dbms_column_double(dbms_stmt* pStmt, int col) {
   if (pStmt == NULL || !pStmt->has_current_row) return 0.0;
   int actual = get_projected_col_idx(pStmt, col);
   if (actual < 0 || actual >= MAX_COLUMNS) return 0.0;
+  if (pStmt->current_row_vals[actual].is_null) return 0.0;
+  if (pStmt->target_def && actual < (int)pStmt->target_def->num_cols) {
+    ColumnType type = pStmt->target_def->columns[actual].type;
+    if (type == COL_INT) return (double)pStmt->current_row_vals[actual].int_val;
+    if (type == COL_FLOAT) return (double)pStmt->current_row_vals[actual].float_val;
+    if (type == COL_BOOL) return pStmt->current_row_vals[actual].bool_val ? 1.0 : 0.0;
+    if (type == COL_TEXT || type == COL_VARCHAR) return atof(pStmt->current_row_vals[actual].text_val);
+  }
   return pStmt->current_row_vals[actual].double_val;
 }
 
@@ -489,15 +509,22 @@ const char* dbms_column_text(dbms_stmt* pStmt, int col) {
     return "";
   }
   if (actual >= MAX_COLUMNS) return "";
+  if (pStmt->current_row_vals[actual].is_null) return "";
   if (pStmt->target_def && actual < (int)pStmt->target_def->num_cols) {
     if (pStmt->target_def->columns[actual].type == COL_INT) {
       static __thread char int_buf[32];
       snprintf(int_buf, sizeof(int_buf), "%d", pStmt->current_row_vals[actual].int_val);
       return int_buf;
-    } else if (pStmt->target_def->columns[actual].type == COL_DOUBLE || pStmt->target_def->columns[actual].type == COL_FLOAT) {
+    } else if (pStmt->target_def->columns[actual].type == COL_FLOAT) {
+      static __thread char flt_buf[64];
+      snprintf(flt_buf, sizeof(flt_buf), "%.8g", (double)pStmt->current_row_vals[actual].float_val);
+      return flt_buf;
+    } else if (pStmt->target_def->columns[actual].type == COL_DOUBLE || pStmt->target_def->columns[actual].type == COL_NUMERIC || pStmt->target_def->columns[actual].type == COL_DECIMAL) {
       static __thread char dbl_buf[64];
       snprintf(dbl_buf, sizeof(dbl_buf), "%.8g", pStmt->current_row_vals[actual].double_val);
       return dbl_buf;
+    } else if (pStmt->target_def->columns[actual].type == COL_BOOL) {
+      return pStmt->current_row_vals[actual].bool_val ? "true" : "false";
     }
   }
   return pStmt->current_row_vals[actual].text_val;

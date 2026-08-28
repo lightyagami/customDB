@@ -331,13 +331,13 @@ void* get_page(Pager* pager, uint32_t page_num) {
     }
     if (pager->in_transaction && pager->page_is_journaled) {
       pager->page_is_journaled = realloc(pager->page_is_journaled, sizeof(bool) * (pager->max_pages + 1024));
-      for (uint32_t i = old_max; i < pager->max_pages + 1024; i++) {
+      for (uint32_t i = old_max + 1024; i < pager->max_pages + 1024; i++) {
         pager->page_is_journaled[i] = false;
       }
     }
     if (pager->is_dirty) {
       pager->is_dirty = realloc(pager->is_dirty, sizeof(bool) * (pager->max_pages + 1024));
-      for (uint32_t i = old_max; i < pager->max_pages + 1024; i++) {
+      for (uint32_t i = old_max + 1024; i < pager->max_pages + 1024; i++) {
         pager->is_dirty[i] = false;
       }
     }
@@ -646,7 +646,22 @@ void pager_rollback_to_savepoint(Pager* pager, const char* name) {
     close(jfd);
   }
 
-  pager->num_pages = pager->savepoints[idx].num_pages_at_savepoint;
+  uint32_t target_pages = pager->savepoints[idx].num_pages_at_savepoint;
+  if (target_pages > 0 && pager->num_pages > target_pages) {
+    for (uint32_t p = target_pages; p < pager->num_pages; p++) {
+      if (p < pager->max_pages && pager->pages[p]) {
+        free(pager->pages[p]);
+        pager->pages[p] = NULL;
+      }
+    }
+    pager->num_pages = target_pages;
+    pager->file_length = pager->num_pages * PAGE_SIZE;
+    if (pager->file_descriptor != -1 && !pager->is_memory) {
+      ftruncate(pager->file_descriptor, (off_t)pager->file_length);
+    }
+  } else {
+    pager->num_pages = target_pages;
+  }
   pager->num_savepoints = idx + 1;
   printf("Rolled back to savepoint '%s'.\n", name);
 }
@@ -673,6 +688,9 @@ void pager_release_savepoint(Pager* pager, const char* name) {
 
 void pager_close(Pager* pager) {
   if (pager->is_memory) {
+    for (int t = 0; t < MAX_TABLES; t++) {
+      pthread_rwlock_destroy(&pager->table_rwlocks[t]);
+    }
     for (uint32_t i = 0; i < pager->max_pages; i++) {
       if (pager->pages[i]) {
         free(pager->pages[i]);
@@ -698,6 +716,9 @@ void pager_close(Pager* pager) {
   }
   fdatasync(pager->file_descriptor);
   pager_unlock(pager);
+  for (int t = 0; t < MAX_TABLES; t++) {
+    pthread_rwlock_destroy(&pager->table_rwlocks[t]);
+  }
   if (pager->page_is_journaled) {
     free(pager->page_is_journaled);
     pager->page_is_journaled = NULL;

@@ -126,9 +126,9 @@ typedef struct {
   uint32_t   num_tables;
   TableDef   tables[MAX_TABLES];
   uint32_t   num_views;
-  ViewDef    views[4];
+  ViewDef    views[MAX_VIEWS];
   uint32_t   num_triggers;
-  TriggerDef triggers[4];
+  TriggerDef triggers[MAX_TRIGGERS];
 } Catalog;
 
 /* ── Catalog I/O ─────────────────────────────────────────────────────────── */

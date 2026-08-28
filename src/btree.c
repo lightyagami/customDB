@@ -304,11 +304,13 @@ static void extract_col0_from_packed_record(TableDef* def, const void* record_by
 
 /* ── Node max key (copied to out_buf) ────────────────────────────────────── */
 static void get_node_max_key(Pager* pager, void* node, TableDef* def, uint8_t* out_key_buf) {
+  memset(out_key_buf, 0, INTERNAL_NODE_KEY_SIZE);
   switch (get_node_type(node)) {
     case NODE_LEAF: {
-      uint32_t last_idx = *leaf_node_num_cells(node) - 1;
+      uint32_t nc = *leaf_node_num_cells(node);
+      if (nc == 0) return;
+      uint32_t last_idx = nc - 1;
       void* row_val = leaf_node_value(node, last_idx);
-      memset(out_key_buf, 0, INTERNAL_NODE_KEY_SIZE);
       
       Value max_val;
       extract_col0_from_packed_record(def, row_val, &max_val);
@@ -316,7 +318,10 @@ static void get_node_max_key(Pager* pager, void* node, TableDef* def, uint8_t* o
       return;
     }
     case NODE_INTERNAL: {
-      void* rc = get_page(pager, *internal_node_right_child(node));
+      uint32_t rc_page = *internal_node_right_child(node);
+      if (rc_page == INVALID_PAGE_NUM || rc_page == 0) return;
+      void* rc = get_page(pager, rc_page);
+      if (!rc) return;
       get_node_max_key(pager, rc, def, out_key_buf);
       return;
     }
@@ -522,22 +527,24 @@ void btree_find_out(Table* table, Value* key_value, Cursor* out_cursor) {
 }
 
 Cursor* btree_start(Table* table) {
-  Value dummy_key;
-  memset(&dummy_key, 0, sizeof(Value));
-  Cursor* c = btree_find(table, &dummy_key);
-  void* node = get_page(table->pager, c->page_num);
-  pager_journal_page(table->pager, c->page_num);
-  c->end_of_table = (*leaf_node_num_cells(node) == 0);
+  Cursor* c = malloc(sizeof(Cursor));
+  btree_start_out(table, c);
   return c;
 }
 
 void btree_start_out(Table* table, Cursor* out_cursor) {
-  Value dummy_key;
-  memset(&dummy_key, 0, sizeof(Value));
-  btree_find_out(table, &dummy_key, out_cursor);
-  void* node = get_page(table->pager, out_cursor->page_num);
-  pager_journal_page(table->pager, out_cursor->page_num);
+  uint32_t page_num = table->def->root_page_num;
+  void* node = get_page(table->pager, page_num);
+  while (get_node_type(node) == NODE_INTERNAL) {
+    page_num = *internal_node_child(node, 0);
+    node = get_page(table->pager, page_num);
+  }
+
+  out_cursor->table = table;
+  out_cursor->page_num = page_num;
+  out_cursor->cell_num = 0;
   out_cursor->end_of_table = (*leaf_node_num_cells(node) == 0);
+  pager_journal_page(table->pager, page_num);
 }
 
 void btree_key_value(Cursor* cursor, Value* out_val) {

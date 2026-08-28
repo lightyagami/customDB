@@ -751,7 +751,7 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
           if (*p == ')') p++;
           p = parse_window_over(p, &sc->win_spec);
           if (strlen(sc->win_spec.partition_col) > 0 || strlen(sc->win_spec.order_col) > 0) {
-            sc->win_spec.win_func = WIN_SUM;
+            sc->win_spec.win_func = WIN_COUNT;
             out->is_aggregate = false;
           }
         } else if (strncasecmp(p, "sum(", 4) == 0) {
@@ -1221,7 +1221,7 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
     if (strncasecmp(p, "view", 4) == 0) {
       p += 4;
       out->type = STATEMENT_CREATE_VIEW;
-      p = parse_identifier(p, out->view_name, IDX_NAME_SIZE);
+      p = parse_identifier(p, out->view_name, TBL_NAME_SIZE);
       if (strlen(out->view_name) == 0) return PREPARE_SYNTAX_ERROR;
       p = skip_whitespace(p);
       if (strncasecmp(p, "as", 2) == 0) p += 2;
@@ -1233,7 +1233,7 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
     if (strncasecmp(p, "trigger", 7) == 0) {
       p += 7;
       out->type = STATEMENT_CREATE_TRIGGER;
-      p = parse_identifier(p, out->trigger_name, IDX_NAME_SIZE);
+      p = parse_identifier(p, out->trigger_name, TBL_NAME_SIZE);
       if (strlen(out->trigger_name) == 0) return PREPARE_SYNTAX_ERROR;
       p = skip_whitespace(p);
 
@@ -1287,13 +1287,13 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
     if (strncasecmp(p, "view", 4) == 0) {
       p += 4;
       out->type = STATEMENT_DROP_VIEW;
-      p = parse_identifier(p, out->view_name, IDX_NAME_SIZE);
+      p = parse_identifier(p, out->view_name, TBL_NAME_SIZE);
       return PREPARE_SUCCESS;
     }
     if (strncasecmp(p, "trigger", 7) == 0) {
       p += 7;
       out->type = STATEMENT_DROP_TRIGGER;
-      p = parse_identifier(p, out->trigger_name, IDX_NAME_SIZE);
+      p = parse_identifier(p, out->trigger_name, TBL_NAME_SIZE);
       return PREPARE_SUCCESS;
     }
     if (strncasecmp(p, "table", 5) == 0) {

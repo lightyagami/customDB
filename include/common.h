@@ -46,6 +46,8 @@
 #define MAX_RAW_VAL    1024   /* max char length of a raw parsed value token */
 
 /* ── Schema limits ───────────────────────────────────────────────────────── */
+#define MAX_VIEWS        4    /* max views per db file                      */
+#define MAX_TRIGGERS     4    /* max triggers per db file                   */
 #define MAX_COLUMNS     16    /* max columns per table                      */
 #define MAX_TABLES    1024    /* max tables per db file (multi-page catalog) */
 #define MAX_TEXT_SIZE 1024    /* max on-disk bytes for a TEXT column        */

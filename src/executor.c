@@ -171,6 +171,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     /* NOT NULL constraint */
     if ((raw == NULL || strlen(raw) == 0 || strcasecmp(raw, "null") == 0) && col->is_not_null) {
       vdbe_free(vm);
+      if (auto_tx && pager->in_transaction) pager_rollback(pager);
       return EXECUTE_CONSTRAINT_NOT_NULL;
     }
 
@@ -215,6 +216,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
       }
       if (!pass) {
         vdbe_free(vm);
+        if (auto_tx && pager->in_transaction) pager_rollback(pager);
         return EXECUTE_CONSTRAINT_CHECK;
       }
     }
@@ -224,6 +226,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
       TableDef* target_def = catalog_find(catalog, col->fk_target_table);
       if (target_def == NULL) {
         vdbe_free(vm);
+        if (auto_tx && pager->in_transaction) pager_rollback(pager);
         return EXECUTE_CONSTRAINT_FOREIGN_KEY;
       }
       Table target_table = { pager, target_def };
@@ -262,6 +265,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
 
       if (!fk_found) {
         vdbe_free(vm);
+        if (auto_tx && pager->in_transaction) pager_rollback(pager);
         return EXECUTE_CONSTRAINT_FOREIGN_KEY;
       }
     }
@@ -293,6 +297,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
         case COL_VARCHAR:
           if (col->type != COL_BLOB && strlen(raw) >= col->size) {
             vdbe_free(vm);
+            if (auto_tx && pager->in_transaction) pager_rollback(pager);
             return EXECUTE_BAD_SCHEMA;
           }
           memcpy(v.text_val, raw, sizeof(v.text_val) - 1);
@@ -333,6 +338,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
         free(u_cur);
         if (u_dup) {
           vdbe_free(vm);
+          if (auto_tx && pager->in_transaction) pager_rollback(pager);
           return EXECUTE_CONSTRAINT_UNIQUE;
         }
       }
@@ -1784,7 +1790,7 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
 
     /* Update combined_def schema */
     for (uint32_t c = 0; c < right_def->num_cols; c++) {
-      if (combined_def.num_cols < MAX_COLUMNS * 8) {
+      if (combined_def.num_cols < MAX_COLUMNS) {
         combined_def.columns[combined_def.num_cols++] = right_def->columns[c];
       }
     }
@@ -1928,17 +1934,17 @@ static ExecuteResult run_aggregate_select(Statement* stmt, TableDef* def, Catalo
               break;
             }
           }
-          if (col_idx != -1) {
+          if (col_idx != -1 && !row_vals[col_idx].is_null) {
             counts[i]++;
             double val = 0.0;
             if (def->columns[col_idx].type == COL_INT) val = (double)row_vals[col_idx].int_val;
             else if (def->columns[col_idx].type == COL_FLOAT) val = (double)row_vals[col_idx].float_val;
-            else if (def->columns[col_idx].type == COL_DOUBLE) val = row_vals[col_idx].double_val;
+            else if (def->columns[col_idx].type == COL_DOUBLE || def->columns[col_idx].type == COL_NUMERIC || def->columns[col_idx].type == COL_DECIMAL) val = row_vals[col_idx].double_val;
             else if (def->columns[col_idx].type == COL_BOOL) val = row_vals[col_idx].bool_val ? 1.0 : 0.0;
 
             sums[i] += val;
-            if (val < mins[i]) mins[i] = val;
-            if (val > maxs[i]) maxs[i] = val;
+            if (!has_values[i] || val < mins[i]) mins[i] = val;
+            if (!has_values[i] || val > maxs[i]) maxs[i] = val;
             has_values[i] = true;
           }
         }
@@ -2014,12 +2020,18 @@ static ExecuteResult run_group_by_select(Statement* stmt, TableDef* def, Catalog
 
       for (uint32_t b = 0; b < num_buckets; b++) {
         bool match = false;
-        ColumnType type = def->columns[group_col_idx].type;
-        if (type == COL_INT) match = (buckets[b].key.int_val == key.int_val);
-        else if (type == COL_FLOAT) match = (buckets[b].key.float_val == key.float_val);
-        else if (type == COL_DOUBLE) match = (buckets[b].key.double_val == key.double_val);
-        else if (type == COL_BOOL) match = (buckets[b].key.bool_val == key.bool_val);
-        else match = (strcmp(buckets[b].key.text_val, key.text_val) == 0);
+        if (buckets[b].key.is_null && key.is_null) {
+          match = true;
+        } else if (buckets[b].key.is_null != key.is_null) {
+          match = false;
+        } else {
+          ColumnType type = def->columns[group_col_idx].type;
+          if (type == COL_INT) match = (buckets[b].key.int_val == key.int_val);
+          else if (type == COL_FLOAT) match = (buckets[b].key.float_val == key.float_val);
+          else if (type == COL_DOUBLE || type == COL_NUMERIC || type == COL_DECIMAL) match = (buckets[b].key.double_val == key.double_val);
+          else if (type == COL_BOOL) match = (buckets[b].key.bool_val == key.bool_val);
+          else match = (strcmp(buckets[b].key.text_val, key.text_val) == 0);
+        }
 
         if (match) {
           bucket_idx = (int)b;
@@ -2057,17 +2069,17 @@ static ExecuteResult run_group_by_select(Statement* stmt, TableDef* def, Catalog
               break;
             }
           }
-          if (col_idx != -1) {
+          if (col_idx != -1 && !row_vals[col_idx].is_null) {
             gb->counts[i]++;
             double val = 0.0;
             if (def->columns[col_idx].type == COL_INT) val = (double)row_vals[col_idx].int_val;
             else if (def->columns[col_idx].type == COL_FLOAT) val = (double)row_vals[col_idx].float_val;
-            else if (def->columns[col_idx].type == COL_DOUBLE) val = row_vals[col_idx].double_val;
+            else if (def->columns[col_idx].type == COL_DOUBLE || def->columns[col_idx].type == COL_NUMERIC || def->columns[col_idx].type == COL_DECIMAL) val = row_vals[col_idx].double_val;
             else if (def->columns[col_idx].type == COL_BOOL) val = row_vals[col_idx].bool_val ? 1.0 : 0.0;
 
             gb->sums[i] += val;
-            if (val < gb->mins[i]) gb->mins[i] = val;
-            if (val > gb->maxs[i]) gb->maxs[i] = val;
+            if (!gb->has_values[i] || val < gb->mins[i]) gb->mins[i] = val;
+            if (!gb->has_values[i] || val > gb->maxs[i]) gb->maxs[i] = val;
             gb->has_values[i] = true;
           }
         }
@@ -2084,12 +2096,33 @@ static ExecuteResult run_group_by_select(Statement* stmt, TableDef* def, Catalog
     /* Evaluate HAVING filter if present */
     if (stmt->has_having) {
       double h_val = 0.0;
-      if (stmt->having_func == AGG_COUNT_STAR || stmt->having_func == AGG_COUNT) {
-        h_val = (double)gb->counts[0];
-      } else if (stmt->having_func == AGG_SUM) {
-        h_val = gb->sums[0];
-      } else if (stmt->having_func == AGG_AVG) {
-        h_val = gb->counts[0] > 0 ? gb->sums[0] / gb->counts[0] : 0.0;
+      int having_idx = -1;
+      for (uint32_t i = 0; i < stmt->num_select_cols; i++) {
+        SelectCol* sc = &stmt->select_cols[i];
+        if (sc->func == stmt->having_func) {
+          if (stmt->having_func == AGG_COUNT_STAR || strcasecmp(sc->col_name, stmt->having_col) == 0) {
+            having_idx = (int)i;
+            break;
+          }
+        }
+      }
+
+      if (having_idx != -1) {
+        if (stmt->having_func == AGG_COUNT_STAR || stmt->having_func == AGG_COUNT) {
+          h_val = (double)gb->counts[having_idx];
+        } else if (stmt->having_func == AGG_SUM) {
+          h_val = gb->sums[having_idx];
+        } else if (stmt->having_func == AGG_AVG) {
+          h_val = gb->counts[having_idx] > 0 ? gb->sums[having_idx] / gb->counts[having_idx] : 0.0;
+        } else if (stmt->having_func == AGG_MIN) {
+          h_val = gb->has_values[having_idx] ? gb->mins[having_idx] : 0.0;
+        } else if (stmt->having_func == AGG_MAX) {
+          h_val = gb->has_values[having_idx] ? gb->maxs[having_idx] : 0.0;
+        }
+      } else {
+        if (stmt->having_func == AGG_COUNT_STAR || stmt->having_func == AGG_COUNT) {
+          h_val = (double)gb->counts[0];
+        }
       }
 
       double target = atof(stmt->having_val);
@@ -2106,12 +2139,16 @@ static ExecuteResult run_group_by_select(Statement* stmt, TableDef* def, Catalog
     }
 
     printf("(");
-    ColumnType ktype = def->columns[group_col_idx].type;
-    if (ktype == COL_INT) printf("%d", gb->key.int_val);
-    else if (ktype == COL_FLOAT) printf("%.2f", gb->key.float_val);
-    else if (ktype == COL_DOUBLE) printf("%.2f", gb->key.double_val);
-    else if (ktype == COL_BOOL) printf("%s", gb->key.bool_val ? "true" : "false");
-    else printf("%s", gb->key.text_val);
+    if (gb->key.is_null) {
+      printf("NULL");
+    } else {
+      ColumnType ktype = def->columns[group_col_idx].type;
+      if (ktype == COL_INT) printf("%d", gb->key.int_val);
+      else if (ktype == COL_FLOAT) printf("%.2f", gb->key.float_val);
+      else if (ktype == COL_DOUBLE || ktype == COL_NUMERIC || ktype == COL_DECIMAL) printf("%.2f", gb->key.double_val);
+      else if (ktype == COL_BOOL) printf("%s", gb->key.bool_val ? "true" : "false");
+      else printf("%s", gb->key.text_val);
+    }
 
     for (uint32_t i = 0; i < stmt->num_select_cols; i++) {
       SelectCol* sc = &stmt->select_cols[i];
@@ -2145,14 +2182,24 @@ static ExecuteResult run_group_by_select(Statement* stmt, TableDef* def, Catalog
   return EXECUTE_SUCCESS;
 }
 
-bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog* catalog, Pager* pager) {
-  if (wc == NULL || !wc->has_where) return true;
+static bool eval_where_clause_cols(const char* tbl_name, uint32_t num_cols, Column* cols, Value* row_vals, WhereClause* wc, Catalog* catalog, Pager* pager) {
+  (void)tbl_name;
+  if (wc == NULL || !wc->has_where || wc->num_conds == 0) return true;
+  bool cond_results[MAX_WHERE_CONDS];
+  memset(cond_results, 0, sizeof(cond_results));
+
   for (uint32_t i = 0; i < wc->num_conds; i++) {
     SingleCond* cond = &wc->conds[i];
     if (cond->is_exists || cond->is_not_exists) {
-      if (catalog == NULL || pager == NULL) return false;
+      if (catalog == NULL || pager == NULL) {
+        cond_results[i] = false;
+        continue;
+      }
       TableDef* sub_def = catalog_find(catalog, cond->sub_table);
-      if (sub_def == NULL) return false;
+      if (sub_def == NULL) {
+        cond_results[i] = false;
+        continue;
+      }
 
       Table sub_table = { pager, sub_def };
       Cursor* sub_cursor = btree_start(&sub_table);
@@ -2179,8 +2226,8 @@ bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog*
 
             if (cond->sub_where_is_correlated) {
               int o_idx = -1;
-              for (uint32_t c = 0; c < def->num_cols; c++) {
-                if (strcmp(def->columns[c].name, cond->sub_correlated_outer_col) == 0) {
+              for (uint32_t c = 0; c < num_cols; c++) {
+                if (strcmp(cols[c].name, cond->sub_correlated_outer_col) == 0) {
                   o_idx = (int)c;
                   break;
                 }
@@ -2222,14 +2269,14 @@ bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog*
       }
       free(sub_cursor);
 
-      if (cond->is_exists && !exists_match) return false;
-      if (cond->is_not_exists && exists_match) return false;
+      if (cond->is_exists) cond_results[i] = exists_match;
+      else if (cond->is_not_exists) cond_results[i] = !exists_match;
       continue;
     }
 
     int col_idx = -1;
-    for (uint32_t c = 0; c < def->num_cols; c++) {
-      if (strcasecmp(def->columns[c].name, cond->col_name) == 0) {
+    for (uint32_t c = 0; c < num_cols; c++) {
+      if (strcasecmp(cols[c].name, cond->col_name) == 0) {
         col_idx = (int)c;
         break;
       }
@@ -2237,23 +2284,32 @@ bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog*
     if (col_idx == -1) {
       const char* dot = strchr(cond->col_name, '.');
       if (dot != NULL) {
-        for (uint32_t c = 0; c < def->num_cols; c++) {
-          if (strcasecmp(def->columns[c].name, dot + 1) == 0) {
+        for (uint32_t c = 0; c < num_cols; c++) {
+          if (strcasecmp(cols[c].name, dot + 1) == 0) {
             col_idx = (int)c;
             break;
           }
         }
       }
     }
-    if (col_idx == -1) return false;
+    if (col_idx == -1) {
+      cond_results[i] = false;
+      continue;
+    }
     
-    Column* col = &def->columns[col_idx];
+    Column* col = &cols[col_idx];
     Value* actual = &row_vals[col_idx];
     
     if (cond->is_subquery) {
-      if (catalog == NULL || pager == NULL) return false;
+      if (catalog == NULL || pager == NULL) {
+        cond_results[i] = false;
+        continue;
+      }
       TableDef* sub_def = catalog_find(catalog, cond->sub_table);
-      if (sub_def == NULL) return false;
+      if (sub_def == NULL) {
+        cond_results[i] = false;
+        continue;
+      }
 
       int sub_col_idx = -1;
       for (uint32_t c = 0; c < sub_def->num_cols; c++) {
@@ -2262,7 +2318,10 @@ bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog*
           break;
         }
       }
-      if (sub_col_idx == -1) return false;
+      if (sub_col_idx == -1) {
+        cond_results[i] = false;
+        continue;
+      }
 
       Table sub_table = { pager, sub_def };
       Cursor* sub_cursor = btree_start(&sub_table);
@@ -2314,7 +2373,9 @@ bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog*
           Value* sub_actual = &sub_row_vals[sub_col_idx];
 
           bool sub_eq = false;
-          if (col->type == COL_INT) sub_eq = (actual->int_val == sub_actual->int_val);
+          if (actual->is_null || sub_actual->is_null) {
+            sub_eq = false;
+          } else if (col->type == COL_INT) sub_eq = (actual->int_val == sub_actual->int_val);
           else if (col->type == COL_FLOAT) sub_eq = (actual->float_val == sub_actual->float_val);
           else if (col->type == COL_DOUBLE) sub_eq = (actual->double_val == sub_actual->double_val);
           else if (col->type == COL_BOOL) sub_eq = (actual->bool_val == sub_actual->bool_val);
@@ -2328,16 +2389,21 @@ bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog*
         cursor_advance(sub_cursor);
       }
       free(sub_cursor);
-      if (!in_match) return false;
+      cond_results[i] = in_match;
       continue;
     }
 
     if (cond->op == OP_IS_NULL) {
-      if (!actual->is_null) return false;
+      cond_results[i] = actual->is_null;
       continue;
     }
     if (cond->op == OP_IS_NOT_NULL) {
-      if (actual->is_null) return false;
+      cond_results[i] = !actual->is_null;
+      continue;
+    }
+
+    if (actual->is_null) {
+      cond_results[i] = false;
       continue;
     }
 
@@ -2360,7 +2426,7 @@ bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog*
       }
       int cmp_l = compare_values(col->type, actual, &lower_v);
       int cmp_u = compare_values(col->type, actual, &upper_v);
-      if (cmp_l < 0 || cmp_u > 0) return false;
+      cond_results[i] = (cmp_l >= 0 && cmp_u <= 0);
       continue;
     }
 
@@ -2370,9 +2436,7 @@ bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog*
       else if (col->type == COL_DOUBLE || col->type == COL_FLOAT) snprintf(val_str, sizeof(val_str), "%.8g", actual->double_val);
       else snprintf(val_str, sizeof(val_str), "%s", actual->text_val);
 
-      if (!sql_like_match(cond->raw_val, val_str, cond->collation)) {
-        return false;
-      }
+      cond_results[i] = sql_like_match(cond->raw_val, val_str, cond->collation);
       continue;
     }
 
@@ -2433,10 +2497,23 @@ bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog*
       case OP_MATCH: match = (strcasestr(actual->text_val, filter_val.text_val) != NULL); break;
       default:       match = false; break;
     }
-    
-    if (!match) return false;
+    cond_results[i] = match;
   }
-  return true;
+
+  bool overall = cond_results[0];
+  for (uint32_t i = 1; i < wc->num_conds; i++) {
+    if (wc->logic_ops[i - 1] == LOGIC_OR) {
+      overall = overall || cond_results[i];
+    } else {
+      overall = overall && cond_results[i];
+    }
+  }
+  return overall;
+}
+
+bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog* catalog, Pager* pager) {
+  if (def == NULL) return eval_where_clause_cols("", 0, NULL, row_vals, wc, catalog, pager);
+  return eval_where_clause_cols(def->name, def->num_cols, def->columns, row_vals, wc, catalog, pager);
 }
 
 /* Compile and run DELETE statement on VDBE */
@@ -2728,13 +2805,27 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
         free(cur);
         
         /* Re-insert updated values to main table */
-        Cursor* ins_cursor = btree_find(&table, &target_id);
+        Cursor* ins_cursor = btree_find(&table, &values[0]);
         btree_insert(ins_cursor, values);
         free(ins_cursor);
 
         /* Re-insert updated values to secondary indexes */
         for (uint32_t c = 1; c < def->num_cols; c++) {
           if (def->columns[c].has_index) {
+            Column* icol = &def->columns[c];
+            if (icol->idx_is_partial) {
+              WhereClause idx_where;
+              memset(&idx_where, 0, sizeof(WhereClause));
+              idx_where.has_where = true;
+              idx_where.num_conds = 1;
+              strcpy(idx_where.conds[0].col_name, icol->idx_where_col);
+              idx_where.conds[0].op = icol->idx_where_op;
+              strcpy(idx_where.conds[0].raw_val, icol->idx_where_val);
+              if (!eval_where_clause(def, values, &idx_where, catalog, pager)) {
+                continue;
+              }
+            }
+
             TableDef idx_def;
             memset(&idx_def, 0, sizeof(TableDef));
             make_idx_name(idx_def.name, def->name, def->columns[c].name);
@@ -2747,10 +2838,18 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
             tabledef_compute(&idx_def);
 
             Table idx_table = { pager, &idx_def };
-            Cursor* idx_cur = btree_find(&idx_table, &values[c]);
             Value idx_values[2];
             idx_values[0] = values[c];
+            if (icol->idx_is_expr) {
+              if (strcasecmp(icol->idx_expr_func, "lower") == 0 && (icol->type == COL_TEXT || icol->type == COL_VARCHAR)) {
+                for (char* p = idx_values[0].text_val; *p; p++) *p = (char)tolower((unsigned char)*p);
+              } else if (strcasecmp(icol->idx_expr_func, "upper") == 0 && (icol->type == COL_TEXT || icol->type == COL_VARCHAR)) {
+                for (char* p = idx_values[0].text_val; *p; p++) *p = (char)toupper((unsigned char)*p);
+              }
+            }
             idx_values[1].int_val = values[0].int_val;
+
+            Cursor* idx_cur = btree_find(&idx_table, &idx_values[0]);
             btree_insert(idx_cur, idx_values);
             free(idx_cur);
           }
@@ -3560,7 +3659,7 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
     return execute_create_index(stmt, catalog, pager);
   }
   if (stmt->type == STATEMENT_CREATE_VIEW) {
-    if (catalog->num_views >= 16) return EXECUTE_BAD_SCHEMA;
+    if (catalog->num_views >= MAX_VIEWS) return EXECUTE_BAD_SCHEMA;
     ViewDef* v = &catalog->views[catalog->num_views++];
     snprintf(v->view_name, sizeof(v->view_name), "%s", stmt->view_name);
     snprintf(v->select_sql, sizeof(v->select_sql), "%s", stmt->view_select_sql);
@@ -3583,7 +3682,7 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
     return EXECUTE_TABLE_NOT_FOUND;
   }
   if (stmt->type == STATEMENT_CREATE_TRIGGER) {
-    if (catalog->num_triggers >= 16) return EXECUTE_BAD_SCHEMA;
+    if (catalog->num_triggers >= MAX_TRIGGERS) return EXECUTE_BAD_SCHEMA;
     TriggerDef* t = &catalog->triggers[catalog->num_triggers++];
     snprintf(t->name, sizeof(t->name), "%s", stmt->trigger_name);
     snprintf(t->target_table, sizeof(t->target_table), "%s", stmt->table_name);
@@ -3827,7 +3926,15 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
         free(view_stmt);
       }
     }
-    catalog->num_tables -= stmt->num_ctes;
+    if (stmt->num_ctes > 0) {
+      for (uint32_t c = 0; c < stmt->num_ctes; c++) {
+        if (catalog->num_tables > 0) {
+          uint32_t cte_idx = catalog->num_tables - 1;
+          pager_free_page(pager, catalog->tables[cte_idx].root_page_num);
+          catalog->num_tables--;
+        }
+      }
+    }
     return EXECUTE_TABLE_NOT_FOUND;
   }
 
@@ -3904,7 +4011,13 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
   }
 
   if (stmt->num_ctes > 0) {
-    catalog->num_tables -= stmt->num_ctes;
+    for (uint32_t c = 0; c < stmt->num_ctes; c++) {
+      if (catalog->num_tables > 0) {
+        uint32_t cte_idx = catalog->num_tables - 1;
+        pager_free_page(pager, catalog->tables[cte_idx].root_page_num);
+        catalog->num_tables--;
+      }
+    }
   }
   return result;
 }
