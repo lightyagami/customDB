@@ -152,16 +152,17 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
   Vdbe* vm = vdbe_create(pager, catalog);
 
   Value tbl_name_val;
-  memset(&tbl_name_val, 0, sizeof(Value));
-  strncpy(tbl_name_val.text_val, def->name, sizeof(tbl_name_val.text_val)-1);
+  value_init(&tbl_name_val);
+  value_set_text(&tbl_name_val, def->name);
   vdbe_add_inst(vm, OP_OpenWrite, 0, def->root_page_num, 0, tbl_name_val);
+  value_free(&tbl_name_val);
   
   /* Load insert values into registers 1 to N */
   for (uint32_t i = 0; i < def->num_cols; i++) {
     Column* col = &def->columns[i];
     char* raw = (i < stmt->num_values) ? stmt->raw_values[i] : NULL;
     Value v;
-    memset(&v, 0, sizeof(Value));
+    value_init(&v);
 
     /* DEFAULT constraint */
     if ((raw == NULL || strlen(raw) == 0 || strcasecmp(raw, "null") == 0) && col->has_default) {
@@ -178,8 +179,8 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     /* CHECK constraint validation */
     if (col->has_check && raw != NULL && strlen(raw) > 0 && strcasecmp(raw, "null") != 0) {
       Value val_check, filter_check;
-      memset(&val_check, 0, sizeof(Value));
-      memset(&filter_check, 0, sizeof(Value));
+      value_init(&val_check);
+      value_init(&filter_check);
 
       if (col->type == COL_INT) {
         val_check.int_val = atoi(raw);
@@ -194,8 +195,8 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
         val_check.bool_val = (strcasecmp(raw, "true") == 0 || strcmp(raw, "1") == 0);
         filter_check.bool_val = (strcasecmp(col->check_val, "true") == 0 || strcmp(col->check_val, "1") == 0);
       } else {
-        strncpy(val_check.text_val, raw, sizeof(val_check.text_val) - 1);
-        strncpy(filter_check.text_val, col->check_val, sizeof(filter_check.text_val) - 1);
+        value_set_text(&val_check, raw);
+        value_set_text(&filter_check, col->check_val);
       }
 
       int cmp = 0;
@@ -204,6 +205,9 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
       else if (col->type == COL_DOUBLE) cmp = (val_check.double_val > filter_check.double_val) - (val_check.double_val < filter_check.double_val);
       else if (col->type == COL_BOOL) cmp = (val_check.bool_val > filter_check.bool_val) - (val_check.bool_val < filter_check.bool_val);
       else cmp = strcmp(val_check.text_val, filter_check.text_val);
+
+      value_free(&val_check);
+      value_free(&filter_check);
 
       bool pass = false;
       switch (col->check_op) {
@@ -270,7 +274,30 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
       }
     }
 
-    if (raw == NULL || strlen(raw) == 0 || strcasecmp(raw, "null") == 0) {
+    if (stmt->has_bound_values) {
+      Value* b = &stmt->bound_values[i];
+      if (b->is_null) {
+        vdbe_add_inst(vm, OP_Null, i + 1, 0, 0, (Value){0});
+      } else {
+        switch (col->type) {
+          case COL_INT:
+            vdbe_add_inst(vm, OP_Integer, b->int_val, 0, i + 1, (Value){0});
+            break;
+          case COL_FLOAT:
+          case COL_DOUBLE:
+          case COL_NUMERIC:
+          case COL_DECIMAL:
+            vdbe_add_inst(vm, OP_Double, 0, 0, i + 1, *b);
+            break;
+          case COL_BOOL:
+            vdbe_add_inst(vm, OP_Integer, b->bool_val ? 1 : 0, 0, i + 1, (Value){0});
+            break;
+          default:
+            vdbe_add_inst(vm, OP_String, 0, 0, i + 1, *b);
+            break;
+        }
+      }
+    } else if (raw == NULL || strlen(raw) == 0 || strcasecmp(raw, "null") == 0) {
       vdbe_add_inst(vm, OP_Null, i + 1, 0, 0, (Value){0});
     } else {
       switch (col->type) {
@@ -295,14 +322,14 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
         case COL_TIMESTAMP:
         case COL_TEXT:
         case COL_VARCHAR:
-          if (col->type != COL_BLOB && strlen(raw) > col->size) {
+          if (col->type != COL_BLOB && col->type != COL_TEXT && strlen(raw) > col->size) {
             vdbe_free(vm);
             if (auto_tx && pager->in_transaction) pager_rollback(pager);
             return EXECUTE_BAD_SCHEMA;
           }
-          memcpy(v.text_val, raw, sizeof(v.text_val) - 1);
-          v.text_val[sizeof(v.text_val) - 1] = '\0';
+          value_set_text(&v, raw);
           vdbe_add_inst(vm, OP_String, 0, 0, i + 1, v);
+          value_free(&v);
           break;
       }
     }
@@ -329,6 +356,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
           else if (utype == COL_BOOL) match = ((strcasecmp(raw_u, "true") == 0 || strcmp(raw_u, "1") == 0) == u_actual->bool_val);
           else match = (strcmp(raw_u, u_actual->text_val) == 0);
 
+          value_free_row(rvals, def->num_cols);
           if (match) {
             u_dup = true;
             break;
@@ -365,18 +393,21 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
         }
         if (pk_col_idx >= 0 && pk_col_idx < (int)stmt->num_values) {
           Value new_val;
-          memset(&new_val, 0, sizeof(Value));
+          value_init(&new_val);
           if (def->columns[pk_col_idx].type == COL_INT) new_val.int_val = atoi(stmt->raw_values[pk_col_idx]);
           else if (def->columns[pk_col_idx].type == COL_FLOAT) new_val.float_val = (float)atof(stmt->raw_values[pk_col_idx]);
           else if (def->columns[pk_col_idx].type == COL_DOUBLE) new_val.double_val = atof(stmt->raw_values[pk_col_idx]);
-          else strncpy(new_val.text_val, stmt->raw_values[pk_col_idx], sizeof(new_val.text_val) - 1);
+          else value_set_text(&new_val, stmt->raw_values[pk_col_idx]);
 
           if (compare_values(def->columns[pk_col_idx].type, &r_vals[pk_col_idx], &new_val) != 0) {
             all_pk_match = false;
+            value_free(&new_val);
             break;
           }
+          value_free(&new_val);
         }
       }
+      value_free_row(r_vals, def->num_cols);
       if (all_pk_match) {
         dup_found = true;
         break;
@@ -392,12 +423,14 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
   } else {
     /* Single Column 0 Primary Key duplicate check */
     Value target_pk;
-    memset(&target_pk, 0, sizeof(Value));
-    if (stmt->num_values > 0 && strlen(stmt->raw_values[0]) > 0) {
+    value_init(&target_pk);
+    if (stmt->has_bound_values) {
+      value_copy(&target_pk, &stmt->bound_values[0]);
+    } else if (stmt->num_values > 0 && strlen(stmt->raw_values[0]) > 0) {
       if (def->columns[0].type == COL_INT) target_pk.int_val = atoi(stmt->raw_values[0]);
       else if (def->columns[0].type == COL_FLOAT) target_pk.float_val = (float)atof(stmt->raw_values[0]);
       else if (def->columns[0].type == COL_DOUBLE) target_pk.double_val = atof(stmt->raw_values[0]);
-      else strncpy(target_pk.text_val, stmt->raw_values[0], sizeof(target_pk.text_val) - 1);
+      else value_set_text(&target_pk, stmt->raw_values[0]);
     }
 
     Table main_tbl = { pager, def };
@@ -410,14 +443,18 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
         Value existing_key;
         btree_key_value(&cur, &existing_key);
         if (compare_values(def->columns[0].type, &existing_key, &target_pk) == 0) {
+          value_free(&existing_key);
+          value_free(&target_pk);
           vdbe_free(vm);
           if (auto_tx && pager->in_transaction) {
             pager_rollback(pager);
           }
           return EXECUTE_DUPLICATE_KEY;
         }
+        value_free(&existing_key);
       }
     }
+    value_free(&target_pk);
   }
 
   vdbe_add_inst(vm, OP_Insert, 0, 1, 0, (Value){0});
@@ -431,25 +468,30 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
   memset(values, 0, sizeof(values));
   for (uint32_t i = 0; i < def->num_cols; i++) {
     Column* col = &def->columns[i];
-    char* raw = stmt->raw_values[i];
-    if (raw == NULL || strlen(raw) == 0 || strcasecmp(raw, "null") == 0) {
-      values[i].is_null = true;
+    value_init(&values[i]);
+    if (stmt->has_bound_values) {
+      value_copy(&values[i], &stmt->bound_values[i]);
     } else {
-      values[i].is_null = false;
-      switch (col->type) {
-        case COL_INT:       values[i].int_val = atoi(raw); break;
-        case COL_FLOAT:     values[i].float_val = (float)atof(raw); values[i].double_val = atof(raw); break;
-        case COL_DOUBLE:
-        case COL_NUMERIC:
-        case COL_DECIMAL:   values[i].double_val = atof(raw); break;
-        case COL_BOOL:      values[i].bool_val = (strcasecmp(raw, "true") == 0 || strcmp(raw, "1") == 0); break;
-        case COL_BLOB:
-        case COL_DATETIME:
-        case COL_DATE:
-        case COL_TIME:
-        case COL_TIMESTAMP:
-        case COL_TEXT:
-        case COL_VARCHAR:   strncpy(values[i].text_val, raw, sizeof(values[i].text_val) - 1); break;
+      char* raw = stmt->raw_values[i];
+      if (raw == NULL || strlen(raw) == 0 || strcasecmp(raw, "null") == 0) {
+        values[i].is_null = true;
+      } else {
+        values[i].is_null = false;
+        switch (col->type) {
+          case COL_INT:       values[i].int_val = atoi(raw); break;
+          case COL_FLOAT:     values[i].float_val = (float)atof(raw); values[i].double_val = atof(raw); break;
+          case COL_DOUBLE:
+          case COL_NUMERIC:
+          case COL_DECIMAL:   values[i].double_val = atof(raw); break;
+          case COL_BOOL:      values[i].bool_val = (strcasecmp(raw, "true") == 0 || strcmp(raw, "1") == 0); break;
+          case COL_BLOB:
+          case COL_DATETIME:
+          case COL_DATE:
+          case COL_TIME:
+          case COL_TIMESTAMP:
+          case COL_TEXT:
+          case COL_VARCHAR:   value_set_text(&values[i], raw); break;
+        }
       }
     }
   }
@@ -483,7 +525,10 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
 
       Table idx_table = { pager, &idx_def };
       Value idx_values[2];
-      idx_values[0] = values[c];
+      value_init(&idx_values[0]);
+      value_init(&idx_values[1]);
+      value_copy(&idx_values[0], &values[c]);
+      idx_values[0].is_null = values[c].is_null;
       if (col->idx_is_expr) {
         if (strcasecmp(col->idx_expr_func, "lower") == 0 && (col->type == COL_TEXT || col->type == COL_VARCHAR)) {
           for (char* p = idx_values[0].text_val; *p; p++) *p = (char)tolower((unsigned char)*p);
@@ -492,12 +537,16 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
         }
       }
       idx_values[1].int_val = values[0].int_val;
+      idx_values[1].is_null = false;
 
       Cursor* idx_cur = btree_find(&idx_table, &idx_values[0]);
       btree_insert(idx_cur, idx_values);
+      value_free_row(idx_values, 2);
       free(idx_cur);
     }
   }
+
+  value_free_row(values, def->num_cols);
 
   if (auto_tx && pager->in_transaction) {
     catalog_save(catalog, pager);
@@ -510,7 +559,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
 /* Helper to generate constant comparison register in VM */
 static void load_const_reg(Vdbe* vm, int const_reg, ColumnType type, const char* raw_val) {
   Value v;
-  memset(&v, 0, sizeof(Value));
+  value_init(&v);
   switch (type) {
     case COL_INT:
       vdbe_add_inst(vm, OP_Integer, atoi(raw_val), 0, const_reg, (Value){0});
@@ -535,8 +584,9 @@ static void load_const_reg(Vdbe* vm, int const_reg, ColumnType type, const char*
     case COL_TIMESTAMP:
     case COL_TEXT:
     case COL_VARCHAR:
-      strncpy(v.text_val, raw_val, sizeof(v.text_val)-1);
+      value_set_text(&v, raw_val);
       vdbe_add_inst(vm, OP_String, 0, 0, const_reg, v);
+      value_free(&v);
       vm->regs[const_reg].type = COL_VARCHAR;
       break;
   }
@@ -942,9 +992,10 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
     }
     printf("\n");
     Value tbl_name_val;
-    memset(&tbl_name_val, 0, sizeof(Value));
-    strncpy(tbl_name_val.text_val, def->name, sizeof(tbl_name_val.text_val)-1);
+    value_init(&tbl_name_val);
+    value_set_text(&tbl_name_val, def->name);
     vdbe_add_inst(vm, OP_OpenRead, 0, def->root_page_num, 0, tbl_name_val);
+    value_free(&tbl_name_val);
     vdbe_add_inst(vm, OP_Rewind, 0, 4, 0, (Value){0});
     vdbe_add_inst(vm, OP_ResultRow, 1, def->num_cols, 0, (Value){0});
     vdbe_add_inst(vm, OP_Next, 0, 2, 0, (Value){0});
@@ -972,12 +1023,13 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
       char* token = strtok_r(line, ",\r\n", &saveptr);
       uint32_t c = 0;
       while (token && c < def->num_cols) {
+        value_init(&row_vals[c]);
         if (def->columns[c].type == COL_INT) {
           row_vals[c].int_val = atoi(token);
         } else if (def->columns[c].type == COL_DOUBLE || def->columns[c].type == COL_FLOAT) {
           row_vals[c].double_val = atof(token);
         } else {
-          strncpy(row_vals[c].text_val, token, sizeof(row_vals[c].text_val) - 1);
+          value_set_text(&row_vals[c], token);
         }
         c++;
         token = strtok_r(NULL, ",\r\n", &saveptr);
@@ -986,6 +1038,7 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
       if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
         print_projected_row(stmt, def, row_vals);
       }
+      value_free_row(row_vals, def->num_cols);
     }
       fclose(fp);
       vdbe_free(vm);
@@ -1018,9 +1071,13 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
           capacity *= 2;
           all_rows = realloc(all_rows, sizeof(Value[MAX_COLUMNS]) * capacity);
         }
-        for (uint32_t c = 0; c < def->num_cols; c++) all_rows[count][c] = row_vals[c];
+        for (uint32_t c = 0; c < def->num_cols; c++) {
+          value_init(&all_rows[count][c]);
+          value_copy(&all_rows[count][c], &row_vals[c]);
+        }
         count++;
       }
+      value_free_row(row_vals, def->num_cols);
       cursor_advance(cursor);
     }
     free(cursor);
@@ -1108,6 +1165,9 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
       printf(")\n");
     }
 
+    for (uint32_t r = 0; r < count; r++) {
+      value_free_row(all_rows[r], def->num_cols);
+    }
     free(all_rows);
     return EXECUTE_SUCCESS;
   }
@@ -1129,7 +1189,10 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
           capacity *= 2;
           entries = realloc(entries, sizeof(RowSortEntry) * capacity);
         }
-        for (uint32_t c = 0; c < def->num_cols; c++) entries[count].row[c] = row_vals[c];
+        memset(&entries[count], 0, sizeof(RowSortEntry));
+        for (uint32_t c = 0; c < def->num_cols; c++) {
+          value_copy(&entries[count].row[c], &row_vals[c]);
+        }
         entries[count].num_sort_keys = 0;
         if (stmt->has_order_by) {
           uint32_t num_items = (stmt->num_order_by > 0) ? stmt->num_order_by : 1;
@@ -1140,7 +1203,7 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
             for (uint32_t c = 0; c < def->num_cols; c++) {
               if (strcmp(def->columns[c].name, target_col) == 0) {
                 uint32_t sk_idx = entries[count].num_sort_keys++;
-                entries[count].sort_keys[sk_idx] = row_vals[c];
+                value_copy(&entries[count].sort_keys[sk_idx], &row_vals[c]);
                 entries[count].sort_types[sk_idx] = def->columns[c].type;
                 entries[count].sort_colls[sk_idx] = target_coll;
                 entries[count].sort_descs[sk_idx] = target_desc;
@@ -1151,6 +1214,7 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
         }
         count++;
       }
+      value_free_row(row_vals, def->num_cols);
       cursor_advance(cursor);
     }
     free(cursor);
@@ -1193,8 +1257,17 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
           if (same) { dup = true; break; }
         }
         if (!dup) {
-          if (write_idx != i) entries[write_idx] = entries[i];
+          if (write_idx != i) {
+            value_free_row(entries[write_idx].row, def->num_cols);
+            value_free_row(entries[write_idx].sort_keys, entries[write_idx].num_sort_keys);
+            entries[write_idx] = entries[i];
+            memset(&entries[i], 0, sizeof(RowSortEntry));
+          }
           write_idx++;
+        } else {
+          value_free_row(entries[i].row, def->num_cols);
+          value_free_row(entries[i].sort_keys, entries[i].num_sort_keys);
+          memset(&entries[i], 0, sizeof(RowSortEntry));
         }
       }
       count = write_idx;
@@ -1211,13 +1284,17 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
     for (uint32_t i = offset; i < limit; i++) {
       print_projected_row(stmt, def, entries[i].row);
     }
+    for (uint32_t i = 0; i < count; i++) {
+      value_free_row(entries[i].row, def->num_cols);
+      value_free_row(entries[i].sort_keys, entries[i].num_sort_keys);
+    }
     free(entries);
     return EXECUTE_SUCCESS;
   }
 
   Value tbl_name_val;
-  memset(&tbl_name_val, 0, sizeof(Value));
-  strncpy(tbl_name_val.text_val, def->name, sizeof(tbl_name_val.text_val)-1);
+  value_init(&tbl_name_val);
+  value_set_text(&tbl_name_val, def->name);
 
   /* Query Planner: check if condition 0 matches a secondary index */
   bool use_index = false;
@@ -1273,13 +1350,15 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
     memset(&idx_def, 0, sizeof(TableDef));
     make_idx_name(idx_def.name, def->name, def->columns[idx_col_idx].name);
     Value idx_tbl_val;
-    memset(&idx_tbl_val, 0, sizeof(Value));
-    strncpy(idx_tbl_val.text_val, idx_def.name, sizeof(idx_tbl_val.text_val)-1);
+    value_init(&idx_tbl_val);
+    value_set_text(&idx_tbl_val, idx_def.name);
 
     vdbe_add_inst(vm, OP_OpenRead, 0, def->columns[idx_col_idx].index_root_page, 0, idx_tbl_val);
+    value_free(&idx_tbl_val);
     
     /* Open cursor 1 on Main Table */
     vdbe_add_inst(vm, OP_OpenRead, 1, def->root_page_num, 0, tbl_name_val);
+    value_free(&tbl_name_val);
 
     /* Position index cursor 0 */
     SingleCond* primary_cond = &wc->conds[0];
@@ -1613,8 +1692,10 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
     deserialize_row(left_def, cursor_value(l_cur), row_vals);
     stream[stream_count].num_vals = left_def->num_cols;
     for (uint32_t c = 0; c < left_def->num_cols; c++) {
-      stream[stream_count].vals[c] = row_vals[c];
+      value_init(&stream[stream_count].vals[c]);
+      value_copy(&stream[stream_count].vals[c], &row_vals[c]);
     }
+    value_free_row(row_vals, left_def->num_cols);
     stream_count++;
     cursor_advance(l_cur);
   }
@@ -1625,6 +1706,9 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
     JoinItem* ji = &joins_copy[j];
     TableDef* right_def = catalog_find(catalog, ji->right_table);
     if (right_def == NULL) {
+      for (uint32_t i = 0; i < stream_count; i++) {
+        value_free_row(stream[i].vals, combined_def.num_cols);
+      }
       free(stream);
       return EXECUTE_TABLE_NOT_FOUND;
     }
@@ -1670,6 +1754,9 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
     }
 
     if (left_col_idx == -1 || right_col_idx == -1) {
+      for (uint32_t i = 0; i < stream_count; i++) {
+        value_free_row(stream[i].vals, combined_def.num_cols);
+      }
       free(stream);
       return EXECUTE_BAD_SCHEMA;
     }
@@ -1687,14 +1774,16 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
 
       HashJoinNode* node = malloc(sizeof(HashJoinNode));
       if (node) {
-        node->key = *key;
+        memset(node, 0, sizeof(HashJoinNode));
+        value_copy(&node->key, key);
         for (uint32_t c = 0; c < right_def->num_cols; c++) {
-          node->vals[c] = r_vals[c];
+          value_copy(&node->vals[c], &r_vals[c]);
         }
         uint32_t bucket = compute_hash_join_key(key);
         node->next = buckets[bucket];
         buckets[bucket] = node;
       }
+      value_free_row(r_vals, right_def->num_cols);
       cursor_advance(r_cur);
     }
     free(r_cur);
@@ -1706,7 +1795,16 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
     if (!next_stream) {
       for (int b = 0; b < HASH_JOIN_BUCKETS; b++) {
         HashJoinNode* cur = buckets[b];
-        while (cur) { HashJoinNode* nx = cur->next; free(cur); cur = nx; }
+        while (cur) {
+          HashJoinNode* nx = cur->next;
+          value_free(&cur->key);
+          value_free_row(cur->vals, right_def->num_cols);
+          free(cur);
+          cur = nx;
+        }
+      }
+      for (uint32_t i = 0; i < stream_count; i++) {
+        value_free_row(stream[i].vals, combined_def.num_cols);
       }
       free(stream);
       return EXECUTE_CATALOG_FULL;
@@ -1732,10 +1830,12 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
             JoinedStreamRow* nr = &next_stream[next_count++];
             nr->num_vals = combined_def.num_cols + right_def->num_cols;
             for (uint32_t c = 0; c < combined_def.num_cols; c++) {
-              nr->vals[c] = stream[i].vals[c];
+              value_init(&nr->vals[c]);
+              value_copy(&nr->vals[c], &stream[i].vals[c]);
             }
             for (uint32_t c = 0; c < right_def->num_cols; c++) {
-              nr->vals[combined_def.num_cols + c] = cur->vals[c];
+              value_init(&nr->vals[combined_def.num_cols + c]);
+              value_copy(&nr->vals[combined_def.num_cols + c], &cur->vals[c]);
             }
           }
           cur = cur->next;
@@ -1750,10 +1850,11 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
         JoinedStreamRow* nr = &next_stream[next_count++];
         nr->num_vals = combined_def.num_cols + right_def->num_cols;
         for (uint32_t c = 0; c < combined_def.num_cols; c++) {
-          nr->vals[c] = stream[i].vals[c];
+          value_init(&nr->vals[c]);
+          value_copy(&nr->vals[c], &stream[i].vals[c]);
         }
         for (uint32_t c = 0; c < right_def->num_cols; c++) {
-          memset(&nr->vals[combined_def.num_cols + c], 0, sizeof(Value));
+          value_init(&nr->vals[combined_def.num_cols + c]);
           nr->vals[combined_def.num_cols + c].is_null = true;
         }
       }
@@ -1771,11 +1872,12 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
             JoinedStreamRow* nr = &next_stream[next_count++];
             nr->num_vals = combined_def.num_cols + right_def->num_cols;
             for (uint32_t c = 0; c < combined_def.num_cols; c++) {
-              memset(&nr->vals[c], 0, sizeof(Value));
+              value_init(&nr->vals[c]);
               nr->vals[c].is_null = true;
             }
             for (uint32_t c = 0; c < right_def->num_cols; c++) {
-              nr->vals[combined_def.num_cols + c] = cur->vals[c];
+              value_init(&nr->vals[combined_def.num_cols + c]);
+              value_copy(&nr->vals[combined_def.num_cols + c], &cur->vals[c]);
             }
           }
           cur = cur->next;
@@ -1785,7 +1887,13 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
 
     for (int b = 0; b < HASH_JOIN_BUCKETS; b++) {
       HashJoinNode* cur = buckets[b];
-      while (cur) { HashJoinNode* nx = cur->next; free(cur); cur = nx; }
+      while (cur) {
+        HashJoinNode* nx = cur->next;
+        value_free(&cur->key);
+        value_free_row(cur->vals, right_def->num_cols);
+        free(cur);
+        cur = nx;
+      }
     }
 
     /* Update combined_def schema */
@@ -1795,6 +1903,9 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
       }
     }
 
+    for (uint32_t i = 0; i < stream_count; i++) {
+      value_free_row(stream[i].vals, combined_def.num_cols - right_def->num_cols);
+    }
     free(stream);
     stream = next_stream;
     stream_count = next_count;
@@ -1834,7 +1945,9 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
       }
       RowSortEntry* e = &sort_entries[sort_count++];
       memset(e, 0, sizeof(RowSortEntry));
-      for (uint32_t c = 0; c < combined_def.num_cols; c++) e->row[c] = stream[i].vals[c];
+      for (uint32_t c = 0; c < combined_def.num_cols; c++) {
+        value_copy(&e->row[c], &stream[i].vals[c]);
+      }
       if (stmt->num_order_by > 0) {
         e->num_sort_keys = stmt->num_order_by;
         for (uint32_t k = 0; k < stmt->num_order_by; k++) {
@@ -1846,7 +1959,7 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
             }
           }
           if (k_idx != -1) {
-            e->sort_keys[k] = stream[i].vals[k_idx];
+            value_copy(&e->sort_keys[k], &stream[i].vals[k_idx]);
             e->sort_types[k] = combined_def.columns[k_idx].type;
           }
           e->sort_descs[k] = stmt->order_by_items[k].is_desc;
@@ -1854,7 +1967,9 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
         }
       } else {
         e->num_sort_keys = 1;
-        e->sort_keys[0] = (order_by_idx != -1) ? stream[i].vals[order_by_idx] : (Value){0};
+        if (order_by_idx != -1) {
+          value_copy(&e->sort_keys[0], &stream[i].vals[order_by_idx]);
+        }
         e->sort_types[0] = (order_by_idx != -1) ? combined_def.columns[order_by_idx].type : COL_INT;
         e->sort_descs[0] = stmt->order_by_desc;
         e->sort_colls[0] = stmt->order_by_collation;
@@ -1888,9 +2003,16 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
       print_projected_row(stmt, &combined_def, sort_entries[i].row);
       rows_emitted++;
     }
+    for (uint32_t i = 0; i < sort_count; i++) {
+      value_free_row(sort_entries[i].row, combined_def.num_cols);
+      value_free_row(sort_entries[i].sort_keys, sort_entries[i].num_sort_keys);
+    }
     free(sort_entries);
   }
 
+  for (uint32_t i = 0; i < stream_count; i++) {
+    value_free_row(stream[i].vals, combined_def.num_cols);
+  }
   free(stream);
   return EXECUTE_SUCCESS;
 }
@@ -2222,7 +2344,7 @@ static bool eval_where_clause_cols(const char* tbl_name, uint32_t num_cols, Colu
             Column* scol = &sub_def->columns[s_idx];
             Value* sval = &sub_row_vals[s_idx];
             Value sfilter;
-            memset(&sfilter, 0, sizeof(Value));
+            value_init(&sfilter);
 
             if (cond->sub_where_is_correlated) {
               int o_idx = -1;
@@ -2233,14 +2355,14 @@ static bool eval_where_clause_cols(const char* tbl_name, uint32_t num_cols, Colu
                 }
               }
               if (o_idx != -1) {
-                sfilter = row_vals[o_idx];
+                value_copy(&sfilter, &row_vals[o_idx]);
               }
             } else {
               if (scol->type == COL_INT) sfilter.int_val = atoi(cond->sub_where_val);
               else if (scol->type == COL_FLOAT) sfilter.float_val = (float)atof(cond->sub_where_val);
               else if (scol->type == COL_DOUBLE) sfilter.double_val = atof(cond->sub_where_val);
               else if (scol->type == COL_BOOL) sfilter.bool_val = (strcasecmp(cond->sub_where_val, "true") == 0 || strcmp(cond->sub_where_val, "1") == 0);
-              else strncpy(sfilter.text_val, cond->sub_where_val, sizeof(sfilter.text_val) - 1);
+              else value_set_text(&sfilter, cond->sub_where_val);
             }
 
             int scmp = 0;
@@ -2249,6 +2371,8 @@ static bool eval_where_clause_cols(const char* tbl_name, uint32_t num_cols, Colu
             else if (scol->type == COL_DOUBLE) scmp = (sval->double_val > sfilter.double_val) - (sval->double_val < sfilter.double_val);
             else if (scol->type == COL_BOOL) scmp = (sval->bool_val > sfilter.bool_val) - (sval->bool_val < sfilter.bool_val);
             else scmp = strcmp(sval->text_val, sfilter.text_val);
+
+            value_free(&sfilter);
 
             switch (cond->sub_where_op) {
               case OP_EQ:  sub_pass = (scmp == 0); break;
@@ -2263,8 +2387,10 @@ static bool eval_where_clause_cols(const char* tbl_name, uint32_t num_cols, Colu
 
         if (sub_pass) {
           exists_match = true;
+          value_free_row(sub_row_vals, sub_def->num_cols);
           break;
         }
+        value_free_row(sub_row_vals, sub_def->num_cols);
         cursor_advance(sub_cursor);
       }
       free(sub_cursor);
@@ -2344,12 +2470,12 @@ static bool eval_where_clause_cols(const char* tbl_name, uint32_t num_cols, Colu
             Column* scol = &sub_def->columns[s_idx];
             Value* sval = &sub_row_vals[s_idx];
             Value sfilter;
-            memset(&sfilter, 0, sizeof(Value));
+            value_init(&sfilter);
             if (scol->type == COL_INT) sfilter.int_val = atoi(cond->sub_where_val);
             else if (scol->type == COL_FLOAT) sfilter.float_val = (float)atof(cond->sub_where_val);
             else if (scol->type == COL_DOUBLE) sfilter.double_val = atof(cond->sub_where_val);
             else if (scol->type == COL_BOOL) sfilter.bool_val = (strcasecmp(cond->sub_where_val, "true") == 0 || strcmp(cond->sub_where_val, "1") == 0);
-            else strncpy(sfilter.text_val, cond->sub_where_val, sizeof(sfilter.text_val) - 1);
+            else value_set_text(&sfilter, cond->sub_where_val);
 
             int scmp = 0;
             if (scol->type == COL_INT) scmp = (sval->int_val > sfilter.int_val) - (sval->int_val < sfilter.int_val);
@@ -2357,6 +2483,8 @@ static bool eval_where_clause_cols(const char* tbl_name, uint32_t num_cols, Colu
             else if (scol->type == COL_DOUBLE) scmp = (sval->double_val > sfilter.double_val) - (sval->double_val < sfilter.double_val);
             else if (scol->type == COL_BOOL) scmp = (sval->bool_val > sfilter.bool_val) - (sval->bool_val < sfilter.bool_val);
             else scmp = strcmp(sval->text_val, sfilter.text_val);
+
+            value_free(&sfilter);
 
             switch (cond->sub_where_op) {
               case OP_EQ:  sub_pass = (scmp == 0); break;
@@ -2383,9 +2511,11 @@ static bool eval_where_clause_cols(const char* tbl_name, uint32_t num_cols, Colu
 
           if (sub_eq) {
             in_match = true;
+            value_free_row(sub_row_vals, sub_def->num_cols);
             break;
           }
         }
+        value_free_row(sub_row_vals, sub_def->num_cols);
         cursor_advance(sub_cursor);
       }
       free(sub_cursor);
@@ -2409,8 +2539,8 @@ static bool eval_where_clause_cols(const char* tbl_name, uint32_t num_cols, Colu
 
     if (cond->op == OP_BETWEEN) {
       Value lower_v, upper_v;
-      memset(&lower_v, 0, sizeof(Value));
-      memset(&upper_v, 0, sizeof(Value));
+      value_init(&lower_v);
+      value_init(&upper_v);
       if (col->type == COL_INT) {
         lower_v.int_val = atoi(cond->raw_val);
         upper_v.int_val = atoi(cond->raw_val2);
@@ -2421,17 +2551,19 @@ static bool eval_where_clause_cols(const char* tbl_name, uint32_t num_cols, Colu
         lower_v.double_val = atof(cond->raw_val);
         upper_v.double_val = atof(cond->raw_val2);
       } else {
-        strncpy(lower_v.text_val, cond->raw_val, sizeof(lower_v.text_val) - 1);
-        strncpy(upper_v.text_val, cond->raw_val2, sizeof(upper_v.text_val) - 1);
+        value_set_text(&lower_v, cond->raw_val);
+        value_set_text(&upper_v, cond->raw_val2);
       }
       int cmp_l = compare_values(col->type, actual, &lower_v);
       int cmp_u = compare_values(col->type, actual, &upper_v);
+      value_free(&lower_v);
+      value_free(&upper_v);
       cond_results[i] = (cmp_l >= 0 && cmp_u <= 0);
       continue;
     }
 
     if (cond->op == OP_LIKE) {
-      char val_str[MAX_TEXT_SIZE];
+      static __thread char val_str[65536];
       if (col->type == COL_INT) snprintf(val_str, sizeof(val_str), "%d", actual->int_val);
       else if (col->type == COL_DOUBLE || col->type == COL_FLOAT) snprintf(val_str, sizeof(val_str), "%.8g", actual->double_val);
       else snprintf(val_str, sizeof(val_str), "%s", actual->text_val);
@@ -2442,7 +2574,7 @@ static bool eval_where_clause_cols(const char* tbl_name, uint32_t num_cols, Colu
 
     /* Parse filter value */
     Value filter_val;
-    memset(&filter_val, 0, sizeof(Value));
+    value_init(&filter_val);
     switch (col->type) {
       case COL_INT:       filter_val.int_val = atoi(cond->raw_val); break;
       case COL_FLOAT:     filter_val.float_val = (float)atof(cond->raw_val); break;
@@ -2456,7 +2588,7 @@ static bool eval_where_clause_cols(const char* tbl_name, uint32_t num_cols, Colu
       case COL_TIME:
       case COL_TIMESTAMP:
       case COL_TEXT:
-      case COL_VARCHAR:   strncpy(filter_val.text_val, cond->raw_val, sizeof(filter_val.text_val) - 1); break;
+      case COL_VARCHAR:   value_set_text(&filter_val, cond->raw_val); break;
     }
     
     /* Compare */
@@ -2486,6 +2618,7 @@ static bool eval_where_clause_cols(const char* tbl_name, uint32_t num_cols, Colu
         break;
       }
     }
+    value_free(&filter_val);
     
     bool match = false;
     switch (cond->op) {
@@ -2632,8 +2765,10 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
               deserialize_row(&idx_def, cursor_value(idx_cur), cur_idx_vals);
               if (cur_idx_vals[1].int_val == values[0].int_val) {
                 btree_delete(idx_cur);
+                value_free_row(cur_idx_vals, 2);
                 break;
               }
+              value_free_row(cur_idx_vals, 2);
               cursor_advance(idx_cur);
             }
             free(idx_cur);
@@ -2676,7 +2811,9 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
 
         /* Delete from main table */
         btree_delete(cur);
+        value_free_row(values, def->num_cols);
       }
+      value_free(&existing_key);
     }
     free(cur);
   }
@@ -2752,8 +2889,10 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
               deserialize_row(&idx_def, cursor_value(idx_cur), cur_idx_vals);
               if (cur_idx_vals[1].int_val == values[0].int_val) {
                 btree_delete(idx_cur);
+                value_free_row(cur_idx_vals, 2);
                 break;
               }
+              value_free_row(cur_idx_vals, 2);
               cursor_advance(idx_cur);
             }
             free(idx_cur);
@@ -2795,7 +2934,7 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
               case COL_TIME:
               case COL_TIMESTAMP:
               case COL_TEXT:
-              case COL_VARCHAR:   strncpy(values[col_idx].text_val, pair->str_val, sizeof(values[col_idx].text_val) - 1); break;
+              case COL_VARCHAR:   value_set_text(&values[col_idx], pair->str_val); break;
             }
           }
         }
@@ -2839,7 +2978,10 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
 
             Table idx_table = { pager, &idx_def };
             Value idx_values[2];
-            idx_values[0] = values[c];
+            value_init(&idx_values[0]);
+            value_init(&idx_values[1]);
+            value_copy(&idx_values[0], &values[c]);
+            idx_values[0].is_null = values[c].is_null;
             if (icol->idx_is_expr) {
               if (strcasecmp(icol->idx_expr_func, "lower") == 0 && (icol->type == COL_TEXT || icol->type == COL_VARCHAR)) {
                 for (char* p = idx_values[0].text_val; *p; p++) *p = (char)tolower((unsigned char)*p);
@@ -2848,9 +2990,11 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
               }
             }
             idx_values[1].int_val = values[0].int_val;
+            idx_values[1].is_null = false;
 
             Cursor* idx_cur = btree_find(&idx_table, &idx_values[0]);
             btree_insert(idx_cur, idx_values);
+            value_free_row(idx_values, 2);
             free(idx_cur);
           }
         }
@@ -2897,9 +3041,9 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
             }
           }
         }
-      } else {
-        free(cur);
+        value_free_row(values, def->num_cols);
       }
+      value_free(&existing_key);
     } else {
       free(cur);
     }

@@ -1,4 +1,83 @@
 #include "catalog.h"
+#include <stdlib.h>
+#include <string.h>
+
+/* ── Value Lifecycle Functions ───────────────────────────────────────────── */
+static char s_empty_str[] = "";
+
+void value_init(Value* v) {
+  if (!v) return;
+  memset(v, 0, sizeof(Value));
+  v->text_val = s_empty_str;
+}
+
+void value_free(Value* v) {
+  if (!v) return;
+  if (v->text_val && v->text_val != s_empty_str) {
+    free(v->text_val);
+  }
+  v->text_val = s_empty_str;
+  v->text_len = 0;
+  v->text_cap = 0;
+}
+
+void value_free_row(Value* values, uint32_t count) {
+  if (!values) return;
+  for (uint32_t i = 0; i < count; i++) {
+    value_free(&values[i]);
+  }
+}
+
+void value_set_text_len(Value* v, const char* str, uint32_t len) {
+  if (!v) return;
+  if (str == NULL) {
+    value_free(v);
+    v->is_null = true;
+    return;
+  }
+  if (v->text_cap < len + 1 || v->text_val == NULL || v->text_val == s_empty_str) {
+    char* new_buf = malloc(len + 1);
+    if (!new_buf) return;
+    if (v->text_val && v->text_val != s_empty_str) free(v->text_val);
+    v->text_val = new_buf;
+    v->text_cap = len + 1;
+  }
+  if (str && len > 0) memcpy(v->text_val, str, len);
+  v->text_val[len] = '\0';
+  v->text_len = len;
+  v->is_null = false;
+}
+
+void value_set_text(Value* v, const char* str) {
+  if (!v) return;
+  if (str == NULL) {
+    value_free(v);
+    v->is_null = true;
+    return;
+  }
+  value_set_text_len(v, str, (uint32_t)strlen(str));
+}
+
+void value_copy(Value* dst, const Value* src) {
+  if (!dst || !src) return;
+  if (dst == src) return;
+  value_free(dst);
+  *dst = *src;
+  dst->text_val = s_empty_str;
+  dst->text_cap = 0;
+  dst->text_len = 0;
+  if (src->text_val && src->text_val != s_empty_str && !src->is_null) {
+    value_set_text_len(dst, src->text_val, src->text_len);
+  }
+}
+
+void value_move(Value* dst, Value* src) {
+  if (!dst || !src) return;
+  if (dst == src) return;
+  value_free(dst);
+  *dst = *src;
+  value_init(src);
+}
 
 /* ── On-disk catalog entry layout ────────────────────────────────────────── */
 #define DISK_COL_SIZE    200u
@@ -228,13 +307,27 @@ static uint32_t get_varint(const uint8_t* p, uint64_t* v) {
 }
 
 /* ── Row serialization ───────────────────────────────────────────────────── */
+static __thread uint8_t* s_ser_body = NULL;
+static __thread uint32_t s_ser_body_cap = 0;
+
+__attribute__((destructor)) static void catalog_thread_cleanup(void) {
+  if (s_ser_body) {
+    free(s_ser_body);
+    s_ser_body = NULL;
+    s_ser_body_cap = 0;
+  }
+}
+
 uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
   uint8_t* out = (uint8_t*)dest;
   
   uint8_t hdr_buf[PAGE_SIZE];
   uint32_t hdr_len = 0;
   
-  uint8_t body_buf[MAX_TEXT_SIZE * 4];
+  if (!s_ser_body) {
+    s_ser_body_cap = 65536;
+    s_ser_body = malloc(s_ser_body_cap);
+  }
   uint32_t body_len = 0;
 
   for (uint32_t i = 0; i < def->num_cols; i++) {
@@ -253,20 +346,28 @@ uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
             serial_type = 9;
           } else if (val >= -128 && val <= 127) {
             serial_type = 1;
-            if (body_len < sizeof(body_buf)) body_buf[body_len++] = (uint8_t)val;
+            if (body_len + 1 > s_ser_body_cap) {
+              s_ser_body_cap = (body_len + 1 + 4096) * 2;
+              s_ser_body = realloc(s_ser_body, s_ser_body_cap);
+            }
+            s_ser_body[body_len++] = (uint8_t)val;
           } else if (val >= -32768 && val <= 32767) {
             serial_type = 2;
             int16_t short_val = (int16_t)val;
-            if (body_len + 2 <= sizeof(body_buf)) {
-              memcpy(body_buf + body_len, &short_val, 2);
-              body_len += 2;
+            if (body_len + 2 > s_ser_body_cap) {
+              s_ser_body_cap = (body_len + 2 + 4096) * 2;
+              s_ser_body = realloc(s_ser_body, s_ser_body_cap);
             }
+            memcpy(s_ser_body + body_len, &short_val, 2);
+            body_len += 2;
           } else {
             serial_type = 4;
-            if (body_len + 4 <= sizeof(body_buf)) {
-              memcpy(body_buf + body_len, &val, 4);
-              body_len += 4;
+            if (body_len + 4 > s_ser_body_cap) {
+              s_ser_body_cap = (body_len + 4 + 4096) * 2;
+              s_ser_body = realloc(s_ser_body, s_ser_body_cap);
             }
+            memcpy(s_ser_body + body_len, &val, 4);
+            body_len += 4;
           }
           break;
         }
@@ -278,10 +379,12 @@ uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
         case COL_FLOAT: {
           serial_type = 7;
           double val = (values[i].double_val != 0.0) ? values[i].double_val : (double)values[i].float_val;
-          if (body_len + 8 <= sizeof(body_buf)) {
-            memcpy(body_buf + body_len, &val, 8);
-            body_len += 8;
+          if (body_len + 8 > s_ser_body_cap) {
+            s_ser_body_cap = (body_len + 8 + 4096) * 2;
+            s_ser_body = realloc(s_ser_body, s_ser_body_cap);
           }
+          memcpy(s_ser_body + body_len, &val, 8);
+          body_len += 8;
           break;
         }
         case COL_DOUBLE:
@@ -289,33 +392,30 @@ uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
         case COL_DECIMAL: {
           serial_type = 7;
           double val = values[i].double_val;
-          if (body_len + 8 <= sizeof(body_buf)) {
-            memcpy(body_buf + body_len, &val, 8);
-            body_len += 8;
+          if (body_len + 8 > s_ser_body_cap) {
+            s_ser_body_cap = (body_len + 8 + 4096) * 2;
+            s_ser_body = realloc(s_ser_body, s_ser_body_cap);
           }
+          memcpy(s_ser_body + body_len, &val, 8);
+          body_len += 8;
           break;
         }
-        case COL_BLOB: {
-          uint32_t len = (uint32_t)strlen(values[i].text_val);
-          serial_type = 12 + 2 * len;
-          if (body_len + len <= sizeof(body_buf)) {
-            memcpy(body_buf + body_len, values[i].text_val, len);
-            body_len += len;
-          }
-          break;
-        }
+        case COL_BLOB:
         case COL_DATETIME:
         case COL_DATE:
         case COL_TIME:
         case COL_TIMESTAMP:
         case COL_TEXT:
         case COL_VARCHAR: {
-          uint32_t len = (uint32_t)strlen(values[i].text_val);
-          serial_type = 13 + 2 * len;
-          if (body_len + len <= sizeof(body_buf)) {
-            memcpy(body_buf + body_len, values[i].text_val, len);
-            body_len += len;
+          const char* str = values[i].text_val ? values[i].text_val : "";
+          uint32_t len = values[i].text_len > 0 ? values[i].text_len : (uint32_t)strlen(str);
+          serial_type = (col->type == COL_BLOB) ? (12 + 2 * (uint64_t)len) : (13 + 2 * (uint64_t)len);
+          if (body_len + len > s_ser_body_cap) {
+            s_ser_body_cap = (body_len + len + 4096) * 2;
+            s_ser_body = realloc(s_ser_body, s_ser_body_cap);
           }
+          if (len > 0) memcpy(s_ser_body + body_len, str, len);
+          body_len += len;
           break;
         }
       }
@@ -339,8 +439,10 @@ uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
   memcpy(out + p, hdr_buf, hdr_len);
   p += hdr_len;
   
-  memcpy(out + p, body_buf, body_len);
-  p += body_len;
+  if (body_len > 0) {
+    memcpy(out + p, s_ser_body, body_len);
+    p += body_len;
+  }
 
   return p;
 }
@@ -362,7 +464,7 @@ uint32_t deserialize_row(TableDef* def, void* src, Value* values) {
     uint64_t serial_type = 0;
     cur_hdr += get_varint(in + cur_hdr, &serial_type);
     
-    memset(&values[i], 0, sizeof(Value));
+    value_init(&values[i]);
 
     if (serial_type == 0) {
       /* NULL value */
@@ -410,17 +512,14 @@ uint32_t deserialize_row(TableDef* def, void* src, Value* values) {
       else if (col->type == COL_FLOAT) values[i].float_val = 1.0f;
       else values[i].int_val = 1;
     } else if (serial_type >= 12) {
-      /* String/Blob */
+      /* String/Blob of arbitrary length */
       uint32_t len = 0;
       if (serial_type % 2 == 0) {
         len = (uint32_t)((serial_type - 12) / 2);
       } else {
         len = (uint32_t)((serial_type - 13) / 2);
       }
-      
-      uint32_t safe_len = (len >= sizeof(values[i].text_val)) ? sizeof(values[i].text_val) - 1 : len;
-      memcpy(values[i].text_val, in + cur_body, safe_len);
-      values[i].text_val[safe_len] = '\0';
+      value_set_text_len(&values[i], (const char*)(in + cur_body), len);
       cur_body += len;
     }
   }

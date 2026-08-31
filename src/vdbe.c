@@ -39,6 +39,7 @@ static int compare_sorter_entries(const void* a, const void* b) {
 }
 
 void vdbe_free(Vdbe* vm) {
+  if (!vm) return;
   for (uint32_t c = 0; c < MAX_CURSORS; c++) {
     if (vm->cursors[c].is_open) {
       if (vm->cursors[c].btree_cursor) {
@@ -47,10 +48,22 @@ void vdbe_free(Vdbe* vm) {
       }
     }
   }
+  for (uint32_t r = 0; r < MAX_REGISTERS; r++) {
+    value_free(&vm->regs[r].val);
+  }
   if (vm->sorter.entries) {
+    for (uint32_t s = 0; s < vm->sorter.count; s++) {
+      value_free(&vm->sorter.entries[s].sort_key);
+      value_free_row(vm->sorter.entries[s].row_values, MAX_COLUMNS);
+    }
     free(vm->sorter.entries);
   }
-  free(vm->insts);
+  if (vm->insts) {
+    for (uint32_t i = 0; i < vm->num_insts; i++) {
+      value_free(&vm->insts[i].p4);
+    }
+    free(vm->insts);
+  }
   free(vm);
 }
 
@@ -60,11 +73,12 @@ void vdbe_add_inst(Vdbe* vm, Opcode op, int p1, int p2, int p3, Value p4) {
     vm->insts = realloc(vm->insts, sizeof(Instruction) * vm->max_insts);
   }
   Instruction* i = &vm->insts[vm->num_insts++];
+  memset(i, 0, sizeof(Instruction));
   i->op = op;
   i->p1 = p1;
   i->p2 = p2;
   i->p3 = p3;
-  i->p4 = p4;
+  value_copy(&i->p4, &p4);
 }
 
 void vdbe_run(Vdbe* vm) {
@@ -88,19 +102,20 @@ void vdbe_run(Vdbe* vm) {
         break;
       }
       case OP_Integer: {
+        value_free(&vm->regs[i->p3].val);
         vm->regs[i->p3].val.int_val = i->p1;
         vm->regs[i->p3].type = COL_INT;
         vm->regs[i->p3].is_null = false;
         break;
       }
       case OP_String: {
-        vm->regs[i->p3].val = i->p4;
+        value_copy(&vm->regs[i->p3].val, &i->p4);
         vm->regs[i->p3].type = COL_TEXT;
         vm->regs[i->p3].is_null = false;
         break;
       }
       case OP_Double: {
-        vm->regs[i->p3].val = i->p4;
+        value_copy(&vm->regs[i->p3].val, &i->p4);
         vm->regs[i->p3].type = COL_DOUBLE;
         vm->regs[i->p3].is_null = false;
         break;
@@ -228,13 +243,15 @@ void vdbe_run(Vdbe* vm) {
         VmCursor* vc = &vm->cursors[cursor_idx];
         Value row_vals[MAX_COLUMNS];
         deserialize_row(&vc->def, cursor_value(vc->btree_cursor), row_vals);
-        vm->regs[dest_reg].val = row_vals[col_idx];
+        value_copy(&vm->regs[dest_reg].val, &row_vals[col_idx]);
         vm->regs[dest_reg].type = vc->def.columns[col_idx].type;
         vm->regs[dest_reg].is_null = row_vals[col_idx].is_null;
+        value_free_row(row_vals, vc->def.num_cols);
         break;
       }
       case OP_Null: {
         uint32_t dest_reg = i->p1;
+        value_free(&vm->regs[dest_reg].val);
         vm->regs[dest_reg].is_null = true;
         vm->regs[dest_reg].val.is_null = true;
         break;
@@ -341,7 +358,7 @@ void vdbe_run(Vdbe* vm) {
         Value values[MAX_COLUMNS];
         memset(values, 0, sizeof(values));
         for (uint32_t c = 0; c < vc->def.num_cols; c++) {
-          values[c] = vm->regs[start_reg + c].val;
+          value_copy(&values[c], &vm->regs[start_reg + c].val);
           values[c].is_null = vm->regs[start_reg + c].is_null;
         }
 
@@ -349,6 +366,7 @@ void vdbe_run(Vdbe* vm) {
         Cursor bcur;
         btree_find_out(&vc->table_handle, &values[0], &bcur);
         btree_insert(&bcur, values);
+        value_free_row(values, vc->def.num_cols);
         break;
       }
       case OP_Delete: {
@@ -367,10 +385,11 @@ void vdbe_run(Vdbe* vm) {
           vm->sorter.entries = realloc(vm->sorter.entries, sizeof(SorterEntry) * vm->sorter.capacity);
         }
         SorterEntry* entry = &vm->sorter.entries[vm->sorter.count++];
+        memset(entry, 0, sizeof(SorterEntry));
         for (int c = 0; c < num_cols; c++) {
-          entry->row_values[c] = vm->regs[start_reg + c].val;
+          value_copy(&entry->row_values[c], &vm->regs[start_reg + c].val);
         }
-        entry->sort_key = vm->regs[sort_key_reg].val;
+        value_copy(&entry->sort_key, &vm->regs[sort_key_reg].val);
         entry->sort_type = vm->regs[sort_key_reg].type;
         entry->sort_collation = (CollationType)i->p4.int_val;
         break;
@@ -396,8 +415,7 @@ void vdbe_run(Vdbe* vm) {
         } else {
           SorterEntry* entry = &vm->sorter.entries[0];
           for (int c = 0; c < num_cols; c++) {
-            vm->regs[start_reg + c].val = entry->row_values[c];
-            /* We can assume type matches the column index on select */
+            value_copy(&vm->regs[start_reg + c].val, &entry->row_values[c]);
           }
         }
         break;
@@ -411,7 +429,7 @@ void vdbe_run(Vdbe* vm) {
         if (vm->sorter.cursor_idx < vm->sorter.count) {
           SorterEntry* entry = &vm->sorter.entries[vm->sorter.cursor_idx];
           for (int c = 0; c < num_cols; c++) {
-            vm->regs[start_reg + c].val = entry->row_values[c];
+            value_copy(&vm->regs[start_reg + c].val, &entry->row_values[c]);
           }
           vm->pc = jump_pc;
         }

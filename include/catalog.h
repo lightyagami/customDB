@@ -76,15 +76,26 @@ typedef struct {
   char       idx_expr_func[32];
 } Column;
 
-/* In-memory representation of a row value */
+/* In-memory representation of a row value with Small String Optimization (SSO) */
 typedef struct {
-  int32_t int_val;
-  float   float_val;
-  double  double_val;
-  bool    bool_val;
-  char    text_val[MAX_TEXT_SIZE];
-  bool    is_null;
+  int32_t  int_val;
+  float    float_val;
+  double   double_val;
+  bool     bool_val;
+  bool     is_null;
+  char*    text_val;       /* Points to heap buffer or constant empty string; never NULL */
+  uint32_t text_len;       /* String length in bytes */
+  uint32_t text_cap;       /* Allocated heap capacity */
 } Value;
+
+/* Value Lifecycle Helpers */
+void value_init(Value* v);
+void value_free(Value* v);
+void value_free_row(Value* values, uint32_t count);
+void value_set_text(Value* v, const char* str);
+void value_set_text_len(Value* v, const char* str, uint32_t len);
+void value_copy(Value* dst, const Value* src);
+void value_move(Value* dst, Value* src);
 
 /* Full table definition (schema + B+ Tree root pointer).
  * col_offsets and row_size are computed, not stored on disk. */

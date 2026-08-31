@@ -239,6 +239,135 @@ void initialize_root_leaf(void* node) {
   set_node_root(node, true);
 }
 
+/* ── Overflow Pages Architecture ─────────────────────────────────────────── */
+#define OVERFLOW_HEADER_SIZE    4u
+#define OVERFLOW_PAYLOAD_SIZE   (PAGE_SIZE - OVERFLOW_HEADER_SIZE)
+#define BTREE_MAX_LOCAL_PAYLOAD 1024u
+
+static uint32_t btree_write_overflow_chain(Pager* pager, const uint8_t* data, uint32_t len) {
+  if (len == 0) return 0;
+  uint32_t first_page = 0;
+  uint32_t prev_page = 0;
+  uint32_t bytes_written = 0;
+
+  while (bytes_written < len) {
+    uint32_t new_page = get_unused_page_num(pager);
+    pager_journal_page(pager, new_page);
+    uint8_t* pbuf = (uint8_t*)get_page(pager, new_page);
+    memset(pbuf, 0, PAGE_SIZE);
+
+    if (first_page == 0) {
+      first_page = new_page;
+    }
+    if (prev_page != 0) {
+      uint8_t* prev_buf = (uint8_t*)get_page(pager, prev_page);
+      memcpy(prev_buf, &new_page, sizeof(uint32_t));
+    }
+
+    uint32_t chunk_size = len - bytes_written;
+    if (chunk_size > OVERFLOW_PAYLOAD_SIZE) chunk_size = OVERFLOW_PAYLOAD_SIZE;
+
+    memcpy(pbuf + OVERFLOW_HEADER_SIZE, data + bytes_written, chunk_size);
+    bytes_written += chunk_size;
+    prev_page = new_page;
+  }
+
+  if (prev_page != 0) {
+    uint8_t* prev_buf = (uint8_t*)get_page(pager, prev_page);
+    uint32_t zero = 0;
+    memcpy(prev_buf, &zero, sizeof(uint32_t));
+  }
+
+  return first_page;
+}
+
+static void btree_free_overflow_chain(Pager* pager, uint32_t first_page) {
+  uint32_t cur = first_page;
+  while (cur != 0 && cur != INVALID_PAGE_NUM && cur >= pager->reserved_catalog_pages) {
+    pager_journal_page(pager, cur);
+    uint8_t* pbuf = (uint8_t*)get_page(pager, cur);
+    uint32_t next = 0;
+    memcpy(&next, pbuf, sizeof(uint32_t));
+    pager_free_page(pager, cur);
+    cur = next;
+  }
+}
+
+static void btree_read_overflow_chain(Pager* pager, uint32_t first_page, uint8_t* dst, uint32_t len) {
+  uint32_t cur = first_page;
+  uint32_t bytes_read = 0;
+  while (cur != 0 && cur != INVALID_PAGE_NUM && bytes_read < len) {
+    uint8_t* pbuf = (uint8_t*)get_page(pager, cur);
+    uint32_t next = 0;
+    memcpy(&next, pbuf, sizeof(uint32_t));
+
+    uint32_t chunk_size = len - bytes_read;
+    if (chunk_size > OVERFLOW_PAYLOAD_SIZE) chunk_size = OVERFLOW_PAYLOAD_SIZE;
+
+    memcpy(dst + bytes_read, pbuf + OVERFLOW_HEADER_SIZE, chunk_size);
+    bytes_read += chunk_size;
+    cur = next;
+  }
+}
+
+static __thread uint8_t* s_ser_buf = NULL;
+static __thread uint32_t s_ser_cap = 0;
+static __thread uint8_t* s_overflow_buf = NULL;
+static __thread uint32_t s_overflow_cap = 0;
+
+__attribute__((destructor)) static void btree_thread_cleanup(void) {
+  if (s_ser_buf) {
+    free(s_ser_buf);
+    s_ser_buf = NULL;
+    s_ser_cap = 0;
+  }
+  if (s_overflow_buf) {
+    free(s_overflow_buf);
+    s_overflow_buf = NULL;
+    s_overflow_cap = 0;
+  }
+}
+
+static void serialize_cell_for_leaf(TableDef* def, Value* values, Pager* pager, uint8_t* out_cell, uint32_t* out_cell_size) {
+
+  uint32_t estimated_len = 256;
+  for (uint32_t i = 0; i < def->num_cols; i++) {
+    if (!values[i].is_null) {
+      if (values[i].text_val) {
+        estimated_len += values[i].text_len > 0 ? values[i].text_len : (uint32_t)strlen(values[i].text_val);
+      }
+      estimated_len += 32;
+    }
+  }
+
+  if (s_ser_cap < estimated_len + 1024) {
+    s_ser_cap = estimated_len + 65536;
+    s_ser_buf = realloc(s_ser_buf, s_ser_cap);
+  }
+
+  uint32_t total_size = serialize_row(def, values, s_ser_buf);
+  while (total_size > s_ser_cap) {
+    s_ser_cap = total_size + 65536;
+    s_ser_buf = realloc(s_ser_buf, s_ser_cap);
+    total_size = serialize_row(def, values, s_ser_buf);
+  }
+
+  if (total_size <= BTREE_MAX_LOCAL_PAYLOAD) {
+    memcpy(out_cell, s_ser_buf, total_size);
+    *out_cell_size = total_size;
+  } else {
+    uint32_t local_chunk = BTREE_MAX_LOCAL_PAYLOAD - 8;
+    uint32_t overflow_len = total_size - local_chunk;
+    uint32_t first_overflow = btree_write_overflow_chain(pager, s_ser_buf + local_chunk, overflow_len);
+
+    memcpy(out_cell, &total_size, 4);
+    memcpy(out_cell + 4, &first_overflow, 4);
+    memcpy(out_cell + 8, s_ser_buf, local_chunk);
+
+    *out_cell_size = BTREE_MAX_LOCAL_PAYLOAD;
+  }
+}
+
 static uint32_t btree_get_varint(const uint8_t* p, uint64_t* v) {
   uint64_t result = 0;
   uint32_t i = 0;
@@ -251,8 +380,18 @@ static uint32_t btree_get_varint(const uint8_t* p, uint64_t* v) {
   return i;
 }
 
-static void extract_col0_from_packed_record(TableDef* def, const void* record_bytes, Value* out_val) {
+static void extract_col0_from_packed_record(TableDef* def, const void* record_bytes, uint32_t cell_size, Value* out_val) {
   const uint8_t* in = (const uint8_t*)record_bytes;
+  if (cell_size >= BTREE_MAX_LOCAL_PAYLOAD) {
+    uint32_t total_size = 0;
+    uint32_t first_overflow_page = 0;
+    memcpy(&total_size, in, 4);
+    memcpy(&first_overflow_page, in + 4, 4);
+    if (total_size > cell_size && first_overflow_page != 0) {
+      in += 8;
+    }
+  }
+
   uint64_t total_hdr_size = 0;
   uint32_t p = btree_get_varint(in, &total_hdr_size);
   
@@ -262,7 +401,7 @@ static void extract_col0_from_packed_record(TableDef* def, const void* record_by
   uint32_t body_offset = (uint32_t)total_hdr_size;
   Column* col = &def->columns[0];
   
-  memset(out_val, 0, sizeof(Value));
+  value_init(out_val);
   if (serial_type == 1) {
     out_val->int_val = (int8_t)in[body_offset];
   } else if (serial_type == 2) {
@@ -296,9 +435,7 @@ static void extract_col0_from_packed_record(TableDef* def, const void* record_by
     } else {
       len = (uint32_t)((serial_type - 13) / 2);
     }
-    uint32_t safe_len = (len >= sizeof(out_val->text_val)) ? sizeof(out_val->text_val) - 1 : len;
-    memcpy(out_val->text_val, in + body_offset, safe_len);
-    out_val->text_val[safe_len] = '\0';
+    value_set_text_len(out_val, (const char*)(in + body_offset), len);
   }
 }
 
@@ -311,10 +448,12 @@ static void get_node_max_key(Pager* pager, void* node, TableDef* def, uint8_t* o
       if (nc == 0) return;
       uint32_t last_idx = nc - 1;
       void* row_val = leaf_node_value(node, last_idx);
+      uint32_t cell_size = leaf_node_slot(node, last_idx)->size;
       
       Value max_val;
-      extract_col0_from_packed_record(def, row_val, &max_val);
+      extract_col0_from_packed_record(def, row_val, cell_size, &max_val);
       serialize_col0_key(def, &max_val, out_key_buf);
+      value_free(&max_val);
       return;
     }
     case NODE_INTERNAL: {
@@ -399,10 +538,13 @@ static uint32_t leaf_node_find(void* node, const uint8_t* raw_key, TableDef* def
     while (lo < hi) {
       uint32_t mid = (lo + hi) / 2;
       void* mid_cell = leaf_node_value(node, mid);
+      uint32_t cell_size = leaf_node_slot(node, mid)->size;
       Value mid_val;
-      extract_col0_from_packed_record(def, mid_cell, &mid_val);
-      if (mid_val.int_val < target_key) lo = mid + 1;
-      else                              hi = mid;
+      extract_col0_from_packed_record(def, mid_cell, cell_size, &mid_val);
+      int32_t m_int = mid_val.int_val;
+      value_free(&mid_val);
+      if (m_int < target_key) lo = mid + 1;
+      else                    hi = mid;
     }
     return lo;
   }
@@ -410,12 +552,14 @@ static uint32_t leaf_node_find(void* node, const uint8_t* raw_key, TableDef* def
   while (lo < hi) {
     uint32_t mid = (lo + hi) / 2;
     void* mid_cell = leaf_node_value(node, mid);
+    uint32_t cell_size = leaf_node_slot(node, mid)->size;
     
     Value mid_val;
-    extract_col0_from_packed_record(def, mid_cell, &mid_val);
+    extract_col0_from_packed_record(def, mid_cell, cell_size, &mid_val);
     
     uint8_t mid_raw_key[INTERNAL_NODE_KEY_SIZE];
     serialize_col0_key(def, &mid_val, mid_raw_key);
+    value_free(&mid_val);
 
     if (compare_keys(key_type, mid_raw_key, raw_key) < 0) lo = mid + 1;
     else                                                   hi = mid;
@@ -550,13 +694,43 @@ void btree_start_out(Table* table, Cursor* out_cursor) {
 void btree_key_value(Cursor* cursor, Value* out_val) {
   Value values[MAX_COLUMNS];
   deserialize_row(cursor->table->def, cursor_value(cursor), values);
-  *out_val = values[0];
+  value_init(out_val);
+  value_copy(out_val, &values[0]);
+  value_free_row(values, cursor->table->def->num_cols);
 }
 
 /* ── Cursor value & navigation ───────────────────────────────────────────── */
 void* cursor_value(Cursor* cursor) {
   void* node = get_page(cursor->table->pager, cursor->page_num);
-  return leaf_node_value(node, cursor->cell_num);
+  PageSlot* slot = leaf_node_slot(node, cursor->cell_num);
+  uint8_t* cell_data = (uint8_t*)node + slot->offset;
+
+  if (slot->size < BTREE_MAX_LOCAL_PAYLOAD) {
+    return cell_data;
+  }
+
+  uint32_t total_size = 0;
+  uint32_t first_overflow_page = 0;
+  memcpy(&total_size, cell_data, 4);
+  memcpy(&first_overflow_page, cell_data + 4, 4);
+
+  if (total_size <= slot->size || first_overflow_page == 0) {
+    return cell_data;
+  }
+
+  if (s_overflow_cap < total_size + 64) {
+    s_overflow_cap = total_size + 65536;
+    s_overflow_buf = realloc(s_overflow_buf, s_overflow_cap);
+  }
+
+  uint32_t local_chunk = slot->size - 8;
+  memcpy(s_overflow_buf, cell_data + 8, local_chunk);
+
+  if (total_size > local_chunk && first_overflow_page != 0) {
+    btree_read_overflow_chain(cursor->table->pager, first_overflow_page, s_overflow_buf + local_chunk, total_size - local_chunk);
+  }
+
+  return s_overflow_buf;
 }
 
 void cursor_advance(Cursor* cursor) {
@@ -726,9 +900,10 @@ static void leaf_node_insert(Cursor* cursor, Value* values) {
   pager_journal_page(cursor->table->pager, cursor->page_num);
   uint32_t nc = *leaf_node_num_cells(node);
 
-  /* Serialize the row to get the size needed */
-  uint8_t temp_buf[PAGE_SIZE];
-  uint32_t size = serialize_row(cursor->table->def, values, temp_buf);
+  /* Serialize the row into a cell (with overflow chain if oversized) */
+  uint8_t temp_buf[BTREE_MAX_LOCAL_PAYLOAD];
+  uint32_t size = 0;
+  serialize_cell_for_leaf(cursor->table->def, values, cursor->table->pager, temp_buf, &size);
 
   uint16_t free_space = *leaf_node_free_space(node);
   uint32_t slots_end = LEAF_NODE_HEADER_SIZE + nc * sizeof(PageSlot);
@@ -782,8 +957,9 @@ static void leaf_node_split_and_insert(Cursor* cursor, Value* values) {
   uint32_t total_cells = num_cells + 1;
   TempCell* temp_cells = malloc(sizeof(TempCell) * total_cells);
 
-  uint8_t new_val_buf[PAGE_SIZE];
-  uint32_t new_val_size = serialize_row(cursor->table->def, values, new_val_buf);
+  uint8_t new_val_buf[BTREE_MAX_LOCAL_PAYLOAD];
+  uint32_t new_val_size = 0;
+  serialize_cell_for_leaf(cursor->table->def, values, cursor->table->pager, new_val_buf, &new_val_size);
 
   /* Build list of all cells (existing + new) */
   for (uint32_t i = 0; i < total_cells; i++) {
@@ -796,7 +972,7 @@ static void leaf_node_split_and_insert(Cursor* cursor, Value* values) {
       PageSlot* src_slot = leaf_node_slot(old_node, src_idx);
       temp_cells[i].size = src_slot->size;
       temp_cells[i].data = malloc(src_slot->size);
-      memcpy(temp_cells[i].data, leaf_node_value(old_node, src_idx), src_slot->size);
+      memcpy(temp_cells[i].data, (uint8_t*)old_node + src_slot->offset, src_slot->size);
     }
   }
 
@@ -1172,6 +1348,18 @@ void btree_delete(Cursor* cursor) {
   void* node  = get_page(cursor->table->pager, cursor->page_num);
   uint32_t nc = *leaf_node_num_cells(node);
   uint32_t ci = cursor->cell_num;
+
+  PageSlot* slot = leaf_node_slot(node, ci);
+  if (slot->size >= BTREE_MAX_LOCAL_PAYLOAD) {
+    uint8_t* cell_data = (uint8_t*)node + slot->offset;
+    uint32_t total_size = 0;
+    uint32_t first_overflow_page = 0;
+    memcpy(&total_size, cell_data, 4);
+    memcpy(&first_overflow_page, cell_data + 4, 4);
+    if (total_size > slot->size && first_overflow_page != 0) {
+      btree_free_overflow_chain(cursor->table->pager, first_overflow_page);
+    }
+  }
 
   uint8_t old_max[INTERNAL_NODE_KEY_SIZE];
   get_node_max_key(cursor->table->pager, node, cursor->table->def, old_max);

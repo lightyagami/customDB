@@ -104,5 +104,65 @@ class TestLargeText(unittest.TestCase):
         lib.dbms_finalize(stmt_sel)
         lib.dbms_close(db)
 
+    def test_multi_overflow_pages_100kb(self):
+        lib = ctypes.CDLL(self.LIB_FILE)
+        lib.dbms_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+        lib.dbms_open.restype = ctypes.c_int
+        lib.dbms_close.argtypes = [ctypes.c_void_p]
+        lib.dbms_close.restype = ctypes.c_int
+        lib.dbms_prepare_v2.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_char_p)]
+        lib.dbms_prepare_v2.restype = ctypes.c_int
+        lib.dbms_bind_int.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        lib.dbms_bind_int.restype = ctypes.c_int
+        lib.dbms_bind_text.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        lib.dbms_bind_text.restype = ctypes.c_int
+        lib.dbms_step.argtypes = [ctypes.c_void_p]
+        lib.dbms_step.restype = ctypes.c_int
+        lib.dbms_column_int.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.dbms_column_int.restype = ctypes.c_int
+        lib.dbms_column_text.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.dbms_column_text.restype = ctypes.c_char_p
+        lib.dbms_finalize.argtypes = [ctypes.c_void_p]
+        lib.dbms_finalize.restype = ctypes.c_int
+
+        db = ctypes.c_void_p()
+        self.assertEqual(lib.dbms_open(self.DB_FILE.encode('utf-8'), ctypes.byref(db)), 0)
+
+        # Create table
+        stmt = ctypes.c_void_p()
+        sql_create = b"CREATE TABLE big_payload (id INT, data TEXT);"
+        self.assertEqual(lib.dbms_prepare_v2(db, sql_create, len(sql_create), ctypes.byref(stmt), None), 0)
+        self.assertEqual(lib.dbms_step(stmt), 101)
+        lib.dbms_finalize(stmt)
+
+        sizes = [10000, 50000, 100000]
+        test_strings = {}
+        for i, sz in enumerate(sizes, start=1):
+            pattern = (f"Chunk_{i}_" * (sz // 8 + 1))[:sz]
+            test_strings[i] = pattern
+            stmt_ins = ctypes.c_void_p()
+            sql_ins = b"INSERT INTO big_payload VALUES (?, ?);"
+            self.assertEqual(lib.dbms_prepare_v2(db, sql_ins, len(sql_ins), ctypes.byref(stmt_ins), None), 0)
+            self.assertEqual(lib.dbms_bind_int(stmt_ins, 1, i), 0)
+            p_bytes = pattern.encode('utf-8')
+            self.assertEqual(lib.dbms_bind_text(stmt_ins, 2, p_bytes, len(p_bytes)), 0)
+            self.assertEqual(lib.dbms_step(stmt_ins), 101)
+            lib.dbms_finalize(stmt_ins)
+
+        # Verify all retrieved strings match exactly
+        for i, expected in test_strings.items():
+            stmt_sel = ctypes.c_void_p()
+            sql_sel = f"SELECT id, data FROM big_payload WHERE id = {i};".encode('utf-8')
+            self.assertEqual(lib.dbms_prepare_v2(db, sql_sel, len(sql_sel), ctypes.byref(stmt_sel), None), 0)
+            self.assertEqual(lib.dbms_step(stmt_sel), 100) # DBMS_ROW
+            val_id = lib.dbms_column_int(stmt_sel, 0)
+            val_text = lib.dbms_column_text(stmt_sel, 1).decode('utf-8')
+            self.assertEqual(val_id, i)
+            self.assertEqual(len(val_text), len(expected))
+            self.assertEqual(val_text, expected)
+            lib.dbms_finalize(stmt_sel)
+
+        lib.dbms_close(db)
+
 if __name__ == "__main__":
     unittest.main()

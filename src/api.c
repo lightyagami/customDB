@@ -241,12 +241,16 @@ int dbms_prepare_v2(dbms* pDb, const char* zSql, int nByte, dbms_stmt** ppStmt, 
   dbms_stmt* stmt = malloc(sizeof(dbms_stmt));
   memset(stmt, 0, sizeof(dbms_stmt));
   stmt->db = pDb;
+  for (int k = 0; k < MAX_COLUMNS; k++) {
+    value_init(&stmt->stmt.bound_values[k]);
+  }
   memcpy(stmt->sql, sql_buf, sizeof(stmt->sql) - 1);
   stmt->sql[sizeof(stmt->sql) - 1] = '\0';
 
   PrepareResult prep = prepare_statement(sql_buf, &stmt->stmt);
   if (prep != PREPARE_SUCCESS) {
     snprintf(pDb->last_error, sizeof(pDb->last_error), "Prepare error");
+    value_free_row(stmt->stmt.bound_values, MAX_COLUMNS);
     free(stmt);
     *ppStmt = NULL;
     pthread_mutex_unlock(&pDb->mutex);
@@ -260,9 +264,10 @@ int dbms_prepare_v2(dbms* pDb, const char* zSql, int nByte, dbms_stmt** ppStmt, 
     if (def != NULL) {
       Vdbe* vm = vdbe_create(pDb->pager, &pDb->catalog);
       Value tbl_name_val;
-      memset(&tbl_name_val, 0, sizeof(Value));
-      strncpy(tbl_name_val.text_val, def->name, sizeof(tbl_name_val.text_val)-1);
+      value_init(&tbl_name_val);
+      value_set_text(&tbl_name_val, def->name);
       vdbe_add_inst(vm, OP_OpenWrite, 0, def->root_page_num, 0, tbl_name_val);
+      value_free(&tbl_name_val);
 
       for (uint32_t i = 0; i < def->num_cols; i++) {
         Column* col = &def->columns[i];
@@ -300,40 +305,62 @@ int dbms_prepare_v2(dbms* pDb, const char* zSql, int nByte, dbms_stmt** ppStmt, 
 
 int dbms_bind_int(dbms_stmt* pStmt, int index, int value) {
   if (pStmt == NULL || index < 1 || index > MAX_COLUMNS) return DBMS_MISUSE;
+  pStmt->stmt.has_bound_values = true;
+  pStmt->stmt.bound_values[index - 1].is_null = false;
+  pStmt->stmt.bound_values[index - 1].int_val = value;
   snprintf(pStmt->stmt.raw_values[index - 1], MAX_RAW_VAL, "%d", value);
   return DBMS_OK;
 }
 
 int dbms_bind_double(dbms_stmt* pStmt, int index, double value) {
   if (pStmt == NULL || index < 1 || index > MAX_COLUMNS) return DBMS_MISUSE;
+  pStmt->stmt.has_bound_values = true;
+  pStmt->stmt.bound_values[index - 1].is_null = false;
+  pStmt->stmt.bound_values[index - 1].double_val = value;
   snprintf(pStmt->stmt.raw_values[index - 1], MAX_RAW_VAL, "%.17g", value);
   return DBMS_OK;
 }
 
 int dbms_bind_text(dbms_stmt* pStmt, int index, const char* text, int len) {
-  (void)len;
   if (pStmt == NULL || index < 1 || index > MAX_COLUMNS) return DBMS_MISUSE;
+  pStmt->stmt.has_bound_values = true;
   if (text == NULL) {
+    pStmt->stmt.bound_values[index - 1].is_null = true;
     strcpy(pStmt->stmt.raw_values[index - 1], "NULL");
   } else {
-    snprintf(pStmt->stmt.raw_values[index - 1], MAX_RAW_VAL, "%s", text);
+    pStmt->stmt.bound_values[index - 1].is_null = false;
+    if (len >= 0) {
+      value_set_text_len(&pStmt->stmt.bound_values[index - 1], text, (uint32_t)len);
+    } else {
+      value_set_text(&pStmt->stmt.bound_values[index - 1], text);
+    }
+    snprintf(pStmt->stmt.raw_values[index - 1], MAX_RAW_VAL, "%.*s", MAX_RAW_VAL - 1, text);
   }
   return DBMS_OK;
 }
 
 int dbms_bind_blob(dbms_stmt* pStmt, int index, const void* blob, int len) {
-  (void)len;
   if (pStmt == NULL || index < 1 || index > MAX_COLUMNS) return DBMS_MISUSE;
+  pStmt->stmt.has_bound_values = true;
   if (blob == NULL) {
+    pStmt->stmt.bound_values[index - 1].is_null = true;
     strcpy(pStmt->stmt.raw_values[index - 1], "NULL");
   } else {
-    snprintf(pStmt->stmt.raw_values[index - 1], MAX_RAW_VAL, "%s", (const char*)blob);
+    pStmt->stmt.bound_values[index - 1].is_null = false;
+    if (len >= 0) {
+      value_set_text_len(&pStmt->stmt.bound_values[index - 1], (const char*)blob, (uint32_t)len);
+    } else {
+      value_set_text(&pStmt->stmt.bound_values[index - 1], (const char*)blob);
+    }
+    snprintf(pStmt->stmt.raw_values[index - 1], MAX_RAW_VAL, "%.*s", MAX_RAW_VAL - 1, (const char*)blob);
   }
   return DBMS_OK;
 }
 
 int dbms_bind_null(dbms_stmt* pStmt, int index) {
   if (pStmt == NULL || index < 1 || index > MAX_COLUMNS) return DBMS_MISUSE;
+  pStmt->stmt.has_bound_values = true;
+  pStmt->stmt.bound_values[index - 1].is_null = true;
   strcpy(pStmt->stmt.raw_values[index - 1], "NULL");
   return DBMS_OK;
 }
@@ -412,6 +439,7 @@ int dbms_reset(dbms_stmt* pStmt) {
     free(pStmt->btree_cur);
     pStmt->btree_cur = NULL;
   }
+  value_free_row(pStmt->current_row_vals, MAX_COLUMNS);
   pStmt->executed = false;
   pStmt->has_current_row = false;
   if (pStmt->db) pthread_mutex_unlock(&pStmt->db->mutex);
@@ -426,6 +454,8 @@ int dbms_finalize(dbms_stmt* pStmt) {
     vdbe_free(pStmt->compiled_vm);
     pStmt->compiled_vm = NULL;
   }
+  value_free_row(pStmt->current_row_vals, MAX_COLUMNS);
+  value_free_row(pStmt->stmt.bound_values, MAX_COLUMNS);
   free(pStmt);
   return DBMS_OK;
 }
