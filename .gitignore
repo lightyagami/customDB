@@ -55,3 +55,9 @@ apps/web/libdbms.wasm
 # Operating System Files
 .DS_Store
 Thumbs.db
+
+# Python Bytecode & Pytest Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/

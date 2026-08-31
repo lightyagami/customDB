@@ -11,7 +11,7 @@
 #include "dbms.h"
 
 #define DEFAULT_PORT 8888
-#define BUFFER_SIZE 4096
+#define BUFFER_SIZE 16384
 
 static volatile bool g_running = true;
 static int g_server_fd = -1;

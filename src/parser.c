@@ -335,7 +335,7 @@ static PrepareResult parse_create_cols(const char* p, TableDef* def) {
     } else if (strcasecmp(type_name, "BLOB") == 0 || strcasecmp(type_name, "VARBINARY") == 0 ||
                strcasecmp(type_name, "BINARY") == 0 || strcasecmp(type_name, "BYTEA") == 0) {
       col->type = COL_BLOB;
-      col->size = 256;
+      col->size = MAX_TEXT_SIZE;
       p = skip_whitespace(p);
       if (*p == '(') {
         while (*p && *p != ')') p++;
@@ -369,7 +369,7 @@ static PrepareResult parse_create_cols(const char* p, TableDef* def) {
         p = skip_whitespace(p);
         if (*p == ')') p++;
       } else {
-        col->size = 64; /* default fallback size */
+        col->size = MAX_TEXT_SIZE; /* default size for TEXT / unsized VARCHAR */
       }
     } else {
       return PREPARE_BAD_SCHEMA;
@@ -668,6 +668,7 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
     out->num_multi_rows = 0;
 
     while (*p) {
+      if (out->num_multi_rows >= MAX_MULTI_ROWS) return PREPARE_SYNTAX_ERROR;
       p = skip_whitespace(p);
       if (*p != '(') break;
       p++;

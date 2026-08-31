@@ -185,7 +185,7 @@ struct Statement {
   uint32_t num_values;
   bool     is_multi_insert;
   uint32_t num_multi_rows;
-  char     multi_raw_values[16][MAX_COLUMNS][MAX_RAW_VAL];
+  char     multi_raw_values[MAX_MULTI_ROWS][MAX_COLUMNS][MAX_RAW_VAL];
   bool     is_insert_select;
   Statement* insert_select_stmt;
 

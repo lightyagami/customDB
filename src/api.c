@@ -101,7 +101,7 @@ struct dbms {
 struct dbms_stmt {
   dbms* db;
   Statement stmt;
-  char sql[512];
+  char sql[16384];
   bool executed;
   Vdbe* compiled_vm;
   
@@ -229,7 +229,7 @@ int dbms_prepare_v2(dbms* pDb, const char* zSql, int nByte, dbms_stmt** ppStmt, 
   pthread_mutex_lock(&pDb->mutex);
   catalog_load(&pDb->catalog, pDb->pager);
 
-  char sql_buf[512];
+  char sql_buf[16384];
   if (nByte > 0 && nByte < (int)sizeof(sql_buf)) {
     memcpy(sql_buf, zSql, nByte);
     sql_buf[nByte] = '\0';

@@ -234,7 +234,7 @@ uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
   uint8_t hdr_buf[PAGE_SIZE];
   uint32_t hdr_len = 0;
   
-  uint8_t body_buf[PAGE_SIZE];
+  uint8_t body_buf[MAX_TEXT_SIZE * 4];
   uint32_t body_len = 0;
 
   for (uint32_t i = 0; i < def->num_cols; i++) {

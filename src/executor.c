@@ -49,7 +49,7 @@ static void fire_triggers(Catalog* catalog, Pager* pager, const char* table_name
 }
 
 typedef struct {
-  Value row[MAX_COLUMNS * 8];
+  Value row[MAX_COLUMNS];
   Value sort_keys[4];
   ColumnType sort_types[4];
   CollationType sort_colls[4];
@@ -295,7 +295,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
         case COL_TIMESTAMP:
         case COL_TEXT:
         case COL_VARCHAR:
-          if (col->type != COL_BLOB && strlen(raw) >= col->size) {
+          if (col->type != COL_BLOB && strlen(raw) > col->size) {
             vdbe_free(vm);
             if (auto_tx && pager->in_transaction) pager_rollback(pager);
             return EXECUTE_BAD_SCHEMA;
@@ -1568,7 +1568,7 @@ static inline uint32_t compute_hash_join_key(const Value* v) {
 
 typedef struct {
   uint32_t num_vals;
-  Value vals[MAX_COLUMNS * 8];
+  Value vals[MAX_COLUMNS];
 } JoinedStreamRow;
 
 /* Compile and run multi-table chained Hash Join engine */
@@ -3967,18 +3967,21 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
             Value r_vals[MAX_COLUMNS];
             deserialize_row(src_def, cursor_value(cur), r_vals);
             if (eval_where_clause(src_def, r_vals, &stmt->insert_select_stmt->where_clause, catalog, pager)) {
-              Statement single_ins;
-              memset(&single_ins, 0, sizeof(Statement));
-              single_ins.type = STATEMENT_INSERT;
-              snprintf(single_ins.table_name, sizeof(single_ins.table_name), "%s", stmt->table_name);
-              single_ins.num_values = def->num_cols;
-              for (uint32_t c = 0; c < def->num_cols && c < src_def->num_cols; c++) {
-                if (src_def->columns[c].type == COL_INT) snprintf(single_ins.raw_values[c], MAX_RAW_VAL, "%d", r_vals[c].int_val);
-                else if (src_def->columns[c].type == COL_DOUBLE || src_def->columns[c].type == COL_FLOAT) snprintf(single_ins.raw_values[c], MAX_RAW_VAL, "%.8g", r_vals[c].double_val);
-                else snprintf(single_ins.raw_values[c], MAX_RAW_VAL, "%s", r_vals[c].text_val);
+              Statement* single_ins = malloc(sizeof(Statement));
+              if (single_ins) {
+                memset(single_ins, 0, sizeof(Statement));
+                single_ins->type = STATEMENT_INSERT;
+                snprintf(single_ins->table_name, sizeof(single_ins->table_name), "%s", stmt->table_name);
+                single_ins->num_values = def->num_cols;
+                for (uint32_t c = 0; c < def->num_cols && c < src_def->num_cols; c++) {
+                  if (src_def->columns[c].type == COL_INT) snprintf(single_ins->raw_values[c], MAX_RAW_VAL, "%d", r_vals[c].int_val);
+                  else if (src_def->columns[c].type == COL_DOUBLE || src_def->columns[c].type == COL_FLOAT) snprintf(single_ins->raw_values[c], MAX_RAW_VAL, "%.8g", r_vals[c].double_val);
+                  else snprintf(single_ins->raw_values[c], MAX_RAW_VAL, "%s", r_vals[c].text_val);
+                }
+                result = run_insert_vm(single_ins, def, catalog, pager);
+                free(single_ins);
+                if (result != EXECUTE_SUCCESS) break;
               }
-              result = run_insert_vm(&single_ins, def, catalog, pager);
-              if (result != EXECUTE_SUCCESS) break;
             }
             cursor_advance(cur);
           }
