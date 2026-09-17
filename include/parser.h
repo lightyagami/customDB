@@ -76,7 +76,7 @@ struct SingleCond {
   char   sub_col[COL_NAME_SIZE];
   char   sub_where_col[COL_NAME_SIZE];
   CompOp sub_where_op;
-  char   sub_where_val[MAX_RAW_VAL];
+  char   sub_where_val[64];
   bool   has_sub_where;
   
   /* Correlated EXISTS / NOT EXISTS */
@@ -150,7 +150,7 @@ typedef struct {
   AggFunc    func;
   char       col_name[256];
   bool       is_coalesce;
-  char       coalesce_default[MAX_RAW_VAL];
+  char       coalesce_default[64];
   WindowSpec win_spec;
 } SelectCol;
 
@@ -158,7 +158,9 @@ typedef struct Statement Statement;
 
 typedef struct {
   char       cte_name[TBL_NAME_SIZE];
+  char       col_name[COL_NAME_SIZE];
   Statement* cte_stmt;
+  Statement* rec_stmt;
   bool       is_recursive;
   int        rec_start;
   int        rec_end;
@@ -243,7 +245,7 @@ struct Statement {
   AggFunc    having_func;
   char       having_col[COL_NAME_SIZE];
   CompOp     having_op;
-  char       having_val[MAX_RAW_VAL];
+  char       having_val[64];
 
   /* PRAGMA */
   char pragma_name[64];

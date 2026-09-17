@@ -52,11 +52,11 @@ typedef struct {
   bool       is_not_null;
   bool       is_unique;
   bool       has_default;
-  char       default_val[MAX_RAW_VAL];
+  char       default_val[64];
 
   bool       has_check;
   uint32_t   check_op;
-  char       check_val[MAX_RAW_VAL];
+  char       check_val[64];
 
   bool       has_fk;
   char       fk_target_table[TBL_NAME_SIZE];
@@ -71,7 +71,7 @@ typedef struct {
   bool       idx_is_partial;
   char       idx_where_col[COL_NAME_SIZE];
   uint32_t   idx_where_op;
-  char       idx_where_val[MAX_RAW_VAL];
+  char       idx_where_val[64];
   bool       idx_is_expr;
   char       idx_expr_func[32];
 } Column;

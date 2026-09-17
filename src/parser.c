@@ -55,7 +55,7 @@ static const char* parse_value_token(const char* p, char* dest, uint32_t max_len
       p++;
     }
   } else {
-    while (*p && !isspace((unsigned char)*p) && *p != ',' && *p != ')' && *p != '=') {
+    while (*p && !isspace((unsigned char)*p) && *p != ',' && *p != ')' && *p != '=' && *p != ';') {
       if (len < max_len - 1) {
         dest[len++] = *p;
       }
@@ -79,7 +79,7 @@ static const char* parse_where_clause(const char* p, WhereClause* wc) {
 
   while (*p) {
     p = skip_whitespace(p);
-    if (!*p) break;
+    if (!*p || *p == ';') break;
     if (wc->num_conds >= MAX_WHERE_CONDS) break;
     SingleCond* cond = &wc->conds[wc->num_conds];
     cond->is_subquery = false;
@@ -219,7 +219,7 @@ static const char* parse_where_clause(const char* p, WhereClause* wc) {
             else if (*p == '<') { cond->sub_where_op = OP_LT; p++; }
             else if (*p == '=') { cond->sub_where_op = OP_EQ; p++; }
 
-            p = parse_value_token(p, cond->sub_where_val, MAX_RAW_VAL);
+            p = parse_value_token(p, cond->sub_where_val, sizeof(cond->sub_where_val));
           }
           p = skip_whitespace(p);
           if (*p == ')') p++;
@@ -402,7 +402,7 @@ static PrepareResult parse_create_cols(const char* p, TableDef* def) {
       } else if (strncasecmp(p, "default", 7) == 0) {
         p += 7;
         col->has_default = true;
-        p = parse_value_token(p, col->default_val, MAX_RAW_VAL);
+        p = parse_value_token(p, col->default_val, sizeof(col->default_val));
       } else if (strncasecmp(p, "check", 5) == 0) {
         p += 5;
         col->has_check = true;
@@ -420,7 +420,7 @@ static PrepareResult parse_create_cols(const char* p, TableDef* def) {
         else if (*p == '<') { col->check_op = OP_LT; p++; }
         else if (*p == '=') { col->check_op = OP_EQ; p++; }
 
-        p = parse_value_token(p, col->check_val, MAX_RAW_VAL);
+        p = parse_value_token(p, col->check_val, sizeof(col->check_val));
         p = skip_whitespace(p);
         if (*p == ')') p++;
       } else if (strncasecmp(p, "references", 10) == 0) {
@@ -549,8 +549,10 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       cte->is_recursive = is_rec;
       p = parse_identifier(p, cte->cte_name, TBL_NAME_SIZE);
       p = skip_whitespace(p);
+      cte->col_name[0] = '\0';
       if (*p == '(') {
         p++;
+        p = parse_identifier(p, cte->col_name, COL_NAME_SIZE);
         while (*p && *p != ')') p++;
         if (*p == ')') p++;
         p = skip_whitespace(p);
@@ -573,7 +575,42 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       sub_buf[b_idx] = '\0';
       
       cte->cte_stmt = malloc(sizeof(Statement));
-      prepare_statement(sub_buf, cte->cte_stmt);
+      memset(cte->cte_stmt, 0, sizeof(Statement));
+      cte->rec_stmt = NULL;
+
+      if (cte->is_recursive) {
+        /* Search for UNION [ALL] */
+        const char* u_ptr = NULL;
+        for (const char* s = sub_buf; *s; s++) {
+          if (strncasecmp(s, "union", 5) == 0 && (s == sub_buf || isspace((unsigned char)s[-1])) && isspace((unsigned char)s[5])) {
+            u_ptr = s;
+            break;
+          }
+        }
+        if (u_ptr != NULL) {
+          char anchor_buf[512] = {0};
+          size_t a_len = u_ptr - sub_buf;
+          if (a_len < sizeof(anchor_buf)) {
+            memcpy(anchor_buf, sub_buf, a_len);
+            anchor_buf[a_len] = '\0';
+          }
+          prepare_statement(anchor_buf, cte->cte_stmt);
+
+          const char* rec_start = u_ptr + 5;
+          rec_start = skip_whitespace(rec_start);
+          if (strncasecmp(rec_start, "all", 3) == 0 && isspace((unsigned char)rec_start[3])) {
+            rec_start += 3;
+            rec_start = skip_whitespace(rec_start);
+          }
+          cte->rec_stmt = malloc(sizeof(Statement));
+          memset(cte->rec_stmt, 0, sizeof(Statement));
+          prepare_statement(rec_start, cte->rec_stmt);
+        } else {
+          prepare_statement(sub_buf, cte->cte_stmt);
+        }
+      } else {
+        prepare_statement(sub_buf, cte->cte_stmt);
+      }
       out->num_ctes++;
 
       p = skip_whitespace(p);
@@ -812,7 +849,7 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
           p = skip_whitespace(p);
           if (*p == ',') p++;
           p = skip_whitespace(p);
-          p = parse_value_token(p, sc->coalesce_default, MAX_RAW_VAL);
+          p = parse_value_token(p, sc->coalesce_default, sizeof(sc->coalesce_default));
           p = skip_whitespace(p);
           if (*p == ')') p++;
         } else {
@@ -983,7 +1020,7 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       else if (*p == '=') { out->having_op = OP_EQ; p++; }
       else { return PREPARE_SYNTAX_ERROR; }
 
-      p = parse_value_token(p, out->having_val, MAX_RAW_VAL);
+      p = parse_value_token(p, out->having_val, sizeof(out->having_val));
     }
 
     /* Parse ORDER BY */
@@ -1096,20 +1133,40 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       p = skip_whitespace(p);
       if (*p != '=') return PREPARE_SYNTAX_ERROR;
       p++;
+      p = skip_whitespace(p);
 
-      p = parse_value_token(p, pair->str_val, MAX_RAW_VAL);
+      if (*p == '\'' || *p == '"') {
+        p = parse_value_token(p, pair->str_val, MAX_RAW_VAL);
+      } else {
+        uint32_t s_idx = 0;
+        int depth = 0;
+        while (*p && s_idx < MAX_RAW_VAL - 1) {
+          if (*p == '(') depth++;
+          else if (*p == ')') depth--;
+          if (depth == 0) {
+            if (*p == ',' || *p == ';' || strncasecmp(p, "where", 5) == 0) break;
+          }
+          pair->str_val[s_idx++] = *p++;
+        }
+        pair->str_val[s_idx] = '\0';
+        while (s_idx > 0 && isspace((unsigned char)pair->str_val[s_idx - 1])) {
+          pair->str_val[--s_idx] = '\0';
+        }
+      }
       out->num_set_pairs++;
 
       p = skip_whitespace(p);
       if (*p == ',') {
         p++;
-      } else if (strncasecmp(p, "where", 5) != 0 && *p != '\0') {
+      } else if (strncasecmp(p, "where", 5) != 0 && *p != '\0' && *p != ';') {
         return PREPARE_SYNTAX_ERROR;
       }
     }
 
     p = parse_where_clause(p, &out->where_clause);
     if (p == NULL) return PREPARE_SYNTAX_ERROR;
+    p = skip_whitespace(p);
+    if (*p == ';') p++;
     return PREPARE_SUCCESS;
   }
 

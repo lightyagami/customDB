@@ -189,18 +189,34 @@ int dbms_exec(dbms* pDb, const char* sql, int (*callback)(void*, int, char**, ch
   if (pDb->file_mutex) pthread_mutex_lock(pDb->file_mutex);
   pthread_mutex_lock(&pDb->mutex);
 
-  Statement stmt;
-  memset(&stmt, 0, sizeof(Statement));
-  PrepareResult prep = prepare_statement(sql, &stmt);
-  if (prep != PREPARE_SUCCESS) {
-    snprintf(pDb->last_error, sizeof(pDb->last_error), "SQL parse error");
+  Statement* stmt = calloc(1, sizeof(Statement));
+  if (!stmt) {
+    snprintf(pDb->last_error, sizeof(pDb->last_error), "Out of memory");
     if (errmsg) *errmsg = strdup(pDb->last_error);
     pthread_mutex_unlock(&pDb->mutex);
     if (pDb->file_mutex) pthread_mutex_unlock(pDb->file_mutex);
     return DBMS_ERROR;
   }
+  PrepareResult prep = prepare_statement(sql, stmt);
+  if (prep != PREPARE_SUCCESS) {
+    snprintf(pDb->last_error, sizeof(pDb->last_error), "SQL parse error");
+    if (errmsg) *errmsg = strdup(pDb->last_error);
+    for (uint32_t c = 0; c < stmt->num_ctes; c++) {
+      if (stmt->ctes[c].cte_stmt) free(stmt->ctes[c].cte_stmt);
+      if (stmt->ctes[c].rec_stmt) free(stmt->ctes[c].rec_stmt);
+    }
+    free(stmt);
+    pthread_mutex_unlock(&pDb->mutex);
+    if (pDb->file_mutex) pthread_mutex_unlock(pDb->file_mutex);
+    return DBMS_ERROR;
+  }
 
-  ExecuteResult res = execute_statement(&stmt, &pDb->catalog, pDb->pager);
+  ExecuteResult res = execute_statement(stmt, &pDb->catalog, pDb->pager);
+  for (uint32_t c = 0; c < stmt->num_ctes; c++) {
+    if (stmt->ctes[c].cte_stmt) free(stmt->ctes[c].cte_stmt);
+    if (stmt->ctes[c].rec_stmt) free(stmt->ctes[c].rec_stmt);
+  }
+  free(stmt);
   if (pDb->pager->lock_error) {
     snprintf(pDb->last_error, sizeof(pDb->last_error), "Database is locked by another process");
     if (errmsg) *errmsg = strdup(pDb->last_error);
@@ -387,6 +403,7 @@ int dbms_step(dbms_stmt* pStmt) {
     }
 
     while (pStmt->btree_cur && !pStmt->btree_cur->end_of_table) {
+      value_free_row(pStmt->current_row_vals, MAX_COLUMNS);
       deserialize_row(pStmt->target_def, cursor_value(pStmt->btree_cur), pStmt->current_row_vals);
       cursor_advance(pStmt->btree_cur);
 
@@ -403,6 +420,7 @@ int dbms_step(dbms_stmt* pStmt) {
     }
 
     pStmt->has_current_row = false;
+    value_free_row(pStmt->current_row_vals, MAX_COLUMNS);
     if (pStmt->btree_cur) {
       free(pStmt->btree_cur);
       pStmt->btree_cur = NULL;
@@ -456,6 +474,16 @@ int dbms_finalize(dbms_stmt* pStmt) {
   }
   value_free_row(pStmt->current_row_vals, MAX_COLUMNS);
   value_free_row(pStmt->stmt.bound_values, MAX_COLUMNS);
+  for (uint32_t c = 0; c < pStmt->stmt.num_ctes; c++) {
+    if (pStmt->stmt.ctes[c].cte_stmt) {
+      free(pStmt->stmt.ctes[c].cte_stmt);
+      pStmt->stmt.ctes[c].cte_stmt = NULL;
+    }
+    if (pStmt->stmt.ctes[c].rec_stmt) {
+      free(pStmt->stmt.ctes[c].rec_stmt);
+      pStmt->stmt.ctes[c].rec_stmt = NULL;
+    }
+  }
   free(pStmt);
   return DBMS_OK;
 }

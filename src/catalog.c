@@ -307,27 +307,15 @@ static uint32_t get_varint(const uint8_t* p, uint64_t* v) {
 }
 
 /* ── Row serialization ───────────────────────────────────────────────────── */
-static __thread uint8_t* s_ser_body = NULL;
-static __thread uint32_t s_ser_body_cap = 0;
-
-__attribute__((destructor)) static void catalog_thread_cleanup(void) {
-  if (s_ser_body) {
-    free(s_ser_body);
-    s_ser_body = NULL;
-    s_ser_body_cap = 0;
-  }
-}
-
 uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
   uint8_t* out = (uint8_t*)dest;
   
   uint8_t hdr_buf[PAGE_SIZE];
   uint32_t hdr_len = 0;
   
-  if (!s_ser_body) {
-    s_ser_body_cap = 65536;
-    s_ser_body = malloc(s_ser_body_cap);
-  }
+  uint8_t stack_body[16384];
+  uint8_t* ser_body = stack_body;
+  uint32_t ser_body_cap = sizeof(stack_body);
   uint32_t body_len = 0;
 
   for (uint32_t i = 0; i < def->num_cols; i++) {
@@ -346,27 +334,42 @@ uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
             serial_type = 9;
           } else if (val >= -128 && val <= 127) {
             serial_type = 1;
-            if (body_len + 1 > s_ser_body_cap) {
-              s_ser_body_cap = (body_len + 1 + 4096) * 2;
-              s_ser_body = realloc(s_ser_body, s_ser_body_cap);
+            if (body_len + 1 > ser_body_cap) {
+              uint32_t new_cap = (body_len + 1 + 4096) * 2;
+              uint8_t* new_buf = (ser_body == stack_body) ? malloc(new_cap) : realloc(ser_body, new_cap);
+              if (new_buf) {
+                if (ser_body == stack_body) memcpy(new_buf, stack_body, body_len);
+                ser_body = new_buf;
+                ser_body_cap = new_cap;
+              }
             }
-            s_ser_body[body_len++] = (uint8_t)val;
+            ser_body[body_len++] = (uint8_t)val;
           } else if (val >= -32768 && val <= 32767) {
             serial_type = 2;
             int16_t short_val = (int16_t)val;
-            if (body_len + 2 > s_ser_body_cap) {
-              s_ser_body_cap = (body_len + 2 + 4096) * 2;
-              s_ser_body = realloc(s_ser_body, s_ser_body_cap);
+            if (body_len + 2 > ser_body_cap) {
+              uint32_t new_cap = (body_len + 2 + 4096) * 2;
+              uint8_t* new_buf = (ser_body == stack_body) ? malloc(new_cap) : realloc(ser_body, new_cap);
+              if (new_buf) {
+                if (ser_body == stack_body) memcpy(new_buf, stack_body, body_len);
+                ser_body = new_buf;
+                ser_body_cap = new_cap;
+              }
             }
-            memcpy(s_ser_body + body_len, &short_val, 2);
+            memcpy(ser_body + body_len, &short_val, 2);
             body_len += 2;
           } else {
             serial_type = 4;
-            if (body_len + 4 > s_ser_body_cap) {
-              s_ser_body_cap = (body_len + 4 + 4096) * 2;
-              s_ser_body = realloc(s_ser_body, s_ser_body_cap);
+            if (body_len + 4 > ser_body_cap) {
+              uint32_t new_cap = (body_len + 4 + 4096) * 2;
+              uint8_t* new_buf = (ser_body == stack_body) ? malloc(new_cap) : realloc(ser_body, new_cap);
+              if (new_buf) {
+                if (ser_body == stack_body) memcpy(new_buf, stack_body, body_len);
+                ser_body = new_buf;
+                ser_body_cap = new_cap;
+              }
             }
-            memcpy(s_ser_body + body_len, &val, 4);
+            memcpy(ser_body + body_len, &val, 4);
             body_len += 4;
           }
           break;
@@ -379,11 +382,16 @@ uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
         case COL_FLOAT: {
           serial_type = 7;
           double val = (values[i].double_val != 0.0) ? values[i].double_val : (double)values[i].float_val;
-          if (body_len + 8 > s_ser_body_cap) {
-            s_ser_body_cap = (body_len + 8 + 4096) * 2;
-            s_ser_body = realloc(s_ser_body, s_ser_body_cap);
+          if (body_len + 8 > ser_body_cap) {
+            uint32_t new_cap = (body_len + 8 + 4096) * 2;
+            uint8_t* new_buf = (ser_body == stack_body) ? malloc(new_cap) : realloc(ser_body, new_cap);
+            if (new_buf) {
+              if (ser_body == stack_body) memcpy(new_buf, stack_body, body_len);
+              ser_body = new_buf;
+              ser_body_cap = new_cap;
+            }
           }
-          memcpy(s_ser_body + body_len, &val, 8);
+          memcpy(ser_body + body_len, &val, 8);
           body_len += 8;
           break;
         }
@@ -392,11 +400,16 @@ uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
         case COL_DECIMAL: {
           serial_type = 7;
           double val = values[i].double_val;
-          if (body_len + 8 > s_ser_body_cap) {
-            s_ser_body_cap = (body_len + 8 + 4096) * 2;
-            s_ser_body = realloc(s_ser_body, s_ser_body_cap);
+          if (body_len + 8 > ser_body_cap) {
+            uint32_t new_cap = (body_len + 8 + 4096) * 2;
+            uint8_t* new_buf = (ser_body == stack_body) ? malloc(new_cap) : realloc(ser_body, new_cap);
+            if (new_buf) {
+              if (ser_body == stack_body) memcpy(new_buf, stack_body, body_len);
+              ser_body = new_buf;
+              ser_body_cap = new_cap;
+            }
           }
-          memcpy(s_ser_body + body_len, &val, 8);
+          memcpy(ser_body + body_len, &val, 8);
           body_len += 8;
           break;
         }
@@ -410,11 +423,16 @@ uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
           const char* str = values[i].text_val ? values[i].text_val : "";
           uint32_t len = values[i].text_len > 0 ? values[i].text_len : (uint32_t)strlen(str);
           serial_type = (col->type == COL_BLOB) ? (12 + 2 * (uint64_t)len) : (13 + 2 * (uint64_t)len);
-          if (body_len + len > s_ser_body_cap) {
-            s_ser_body_cap = (body_len + len + 4096) * 2;
-            s_ser_body = realloc(s_ser_body, s_ser_body_cap);
+          if (body_len + len > ser_body_cap) {
+            uint32_t new_cap = (body_len + len + 4096) * 2;
+            uint8_t* new_buf = (ser_body == stack_body) ? malloc(new_cap) : realloc(ser_body, new_cap);
+            if (new_buf) {
+              if (ser_body == stack_body) memcpy(new_buf, stack_body, body_len);
+              ser_body = new_buf;
+              ser_body_cap = new_cap;
+            }
           }
-          if (len > 0) memcpy(s_ser_body + body_len, str, len);
+          if (len > 0) memcpy(ser_body + body_len, str, len);
           body_len += len;
           break;
         }
@@ -440,8 +458,12 @@ uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
   p += hdr_len;
   
   if (body_len > 0) {
-    memcpy(out + p, s_ser_body, body_len);
+    memcpy(out + p, ser_body, body_len);
     p += body_len;
+  }
+
+  if (ser_body != stack_body) {
+    free(ser_body);
   }
 
   return p;

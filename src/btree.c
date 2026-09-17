@@ -310,17 +310,21 @@ static void btree_read_overflow_chain(Pager* pager, uint32_t first_page, uint8_t
   }
 }
 
-static __thread uint8_t* s_ser_buf = NULL;
-static __thread uint32_t s_ser_cap = 0;
+static pthread_key_t s_btree_overflow_key;
+static pthread_once_t s_btree_overflow_once = PTHREAD_ONCE_INIT;
+
+static void btree_overflow_destructor(void* ptr) {
+  if (ptr) free(ptr);
+}
+
+static void btree_make_overflow_key(void) {
+  pthread_key_create(&s_btree_overflow_key, btree_overflow_destructor);
+}
+
 static __thread uint8_t* s_overflow_buf = NULL;
 static __thread uint32_t s_overflow_cap = 0;
 
 __attribute__((destructor)) static void btree_thread_cleanup(void) {
-  if (s_ser_buf) {
-    free(s_ser_buf);
-    s_ser_buf = NULL;
-    s_ser_cap = 0;
-  }
   if (s_overflow_buf) {
     free(s_overflow_buf);
     s_overflow_buf = NULL;
@@ -329,7 +333,6 @@ __attribute__((destructor)) static void btree_thread_cleanup(void) {
 }
 
 static void serialize_cell_for_leaf(TableDef* def, Value* values, Pager* pager, uint8_t* out_cell, uint32_t* out_cell_size) {
-
   uint32_t estimated_len = 256;
   for (uint32_t i = 0; i < def->num_cols; i++) {
     if (!values[i].is_null) {
@@ -340,31 +343,44 @@ static void serialize_cell_for_leaf(TableDef* def, Value* values, Pager* pager, 
     }
   }
 
-  if (s_ser_cap < estimated_len + 1024) {
-    s_ser_cap = estimated_len + 65536;
-    s_ser_buf = realloc(s_ser_buf, s_ser_cap);
+  uint8_t stack_buf[16384];
+  uint8_t* ser_buf = stack_buf;
+  uint32_t ser_cap = sizeof(stack_buf);
+
+  if (ser_cap < estimated_len + 1024) {
+    ser_cap = estimated_len + 65536;
+    ser_buf = malloc(ser_cap);
   }
 
-  uint32_t total_size = serialize_row(def, values, s_ser_buf);
-  while (total_size > s_ser_cap) {
-    s_ser_cap = total_size + 65536;
-    s_ser_buf = realloc(s_ser_buf, s_ser_cap);
-    total_size = serialize_row(def, values, s_ser_buf);
+  uint32_t total_size = serialize_row(def, values, ser_buf);
+  while (total_size > ser_cap) {
+    ser_cap = total_size + 65536;
+    uint8_t* new_buf = (ser_buf == stack_buf) ? malloc(ser_cap) : realloc(ser_buf, ser_cap);
+    if (new_buf) {
+      ser_buf = new_buf;
+      total_size = serialize_row(def, values, ser_buf);
+    } else {
+      break;
+    }
   }
 
   if (total_size <= BTREE_MAX_LOCAL_PAYLOAD) {
-    memcpy(out_cell, s_ser_buf, total_size);
+    memcpy(out_cell, ser_buf, total_size);
     *out_cell_size = total_size;
   } else {
     uint32_t local_chunk = BTREE_MAX_LOCAL_PAYLOAD - 8;
     uint32_t overflow_len = total_size - local_chunk;
-    uint32_t first_overflow = btree_write_overflow_chain(pager, s_ser_buf + local_chunk, overflow_len);
+    uint32_t first_overflow = btree_write_overflow_chain(pager, ser_buf + local_chunk, overflow_len);
 
     memcpy(out_cell, &total_size, 4);
     memcpy(out_cell + 4, &first_overflow, 4);
-    memcpy(out_cell + 8, s_ser_buf, local_chunk);
+    memcpy(out_cell + 8, ser_buf, local_chunk);
 
     *out_cell_size = BTREE_MAX_LOCAL_PAYLOAD;
+  }
+
+  if (ser_buf != stack_buf) {
+    free(ser_buf);
   }
 }
 
@@ -721,6 +737,8 @@ void* cursor_value(Cursor* cursor) {
   if (s_overflow_cap < total_size + 64) {
     s_overflow_cap = total_size + 65536;
     s_overflow_buf = realloc(s_overflow_buf, s_overflow_cap);
+    pthread_once(&s_btree_overflow_once, btree_make_overflow_key);
+    pthread_setspecific(s_btree_overflow_key, s_overflow_buf);
   }
 
   uint32_t local_chunk = slot->size - 8;

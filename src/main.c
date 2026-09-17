@@ -108,28 +108,41 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    Statement statement;
-    switch (prepare_statement(input_buffer, &statement)) {
-      case PREPARE_SUCCESS:
-        break;
-      case PREPARE_NEGATIVE_ID:
-        printf("ID must be positive.\n");
-        continue;
-      case PREPARE_VALUE_TOO_LONG:
-        printf("String is too long.\n");
-        continue;
-      case PREPARE_SYNTAX_ERROR:
-        printf("Syntax error.\n");
-        continue;
-      case PREPARE_UNRECOGNIZED_STATEMENT:
-        printf("Unrecognized keyword at start of '%s'.\n", input_buffer);
-        continue;
-      case PREPARE_BAD_SCHEMA:
-        printf("Error: Invalid table/column schema or constraints.\n");
-        continue;
+    Statement* statement = calloc(1, sizeof(Statement));
+    if (!statement) {
+      printf("Error: Out of memory.\n");
+      continue;
+    }
+    PrepareResult prep_res = prepare_statement(input_buffer, statement);
+    if (prep_res != PREPARE_SUCCESS) {
+      switch (prep_res) {
+        case PREPARE_NEGATIVE_ID:
+          printf("ID must be positive.\n");
+          break;
+        case PREPARE_VALUE_TOO_LONG:
+          printf("String is too long.\n");
+          break;
+        case PREPARE_SYNTAX_ERROR:
+          printf("Syntax error.\n");
+          break;
+        case PREPARE_UNRECOGNIZED_STATEMENT:
+          printf("Unrecognized keyword at start of '%s'.\n", input_buffer);
+          break;
+        case PREPARE_BAD_SCHEMA:
+          printf("Error: Invalid table/column schema or constraints.\n");
+          break;
+        default:
+          break;
+      }
+      for (uint32_t c = 0; c < statement->num_ctes; c++) {
+        if (statement->ctes[c].cte_stmt) free(statement->ctes[c].cte_stmt);
+        if (statement->ctes[c].rec_stmt) free(statement->ctes[c].rec_stmt);
+      }
+      free(statement);
+      continue;
     }
 
-    switch (execute_statement(&statement, catalog, pager)) {
+    switch (execute_statement(statement, catalog, pager)) {
       case EXECUTE_SUCCESS:
         printf("Executed.\n");
         break;
@@ -170,6 +183,12 @@ int main(int argc, char* argv[]) {
         printf("Error: Database is locked.\n");
         break;
     }
+
+    for (uint32_t c = 0; c < statement->num_ctes; c++) {
+      if (statement->ctes[c].cte_stmt) free(statement->ctes[c].cte_stmt);
+      if (statement->ctes[c].rec_stmt) free(statement->ctes[c].rec_stmt);
+    }
+    free(statement);
   }
 
   return 0;

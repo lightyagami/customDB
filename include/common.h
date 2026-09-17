@@ -43,7 +43,7 @@
 #define PAGE_SIZE        4096
 #define INVALID_PAGE_NUM UINT32_MAX
 
-#define MAX_RAW_VAL    4096   /* max char length of a raw parsed value token */
+#define MAX_RAW_VAL     4096  /* max char length of a raw parsed value token */
 
 /* ── Schema limits ───────────────────────────────────────────────────────── */
 #define MAX_VIEWS        4    /* max views per db file                      */

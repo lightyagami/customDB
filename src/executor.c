@@ -27,17 +27,113 @@ static ExecuteResult run_transaction_vm(Statement* stmt, Catalog* catalog, Pager
   return EXECUTE_SUCCESS;
 }
 
-static void fire_triggers(Catalog* catalog, Pager* pager, const char* table_name, TriggerTiming timing, TriggerEvent event) {
+static void expand_trigger_sql(const char* action_sql, TableDef* def,
+                               Value* old_vals, Value* new_vals,
+                               char* out_sql, size_t out_size) {
+  size_t o = 0;
+  const char* p = action_sql;
+
+  while (*p && o < out_size - 1) {
+    if (*p == '\'' || *p == '"') {
+      char q = *p++;
+      if (o < out_size - 1) out_sql[o++] = q;
+      while (*p && *p != q && o < out_size - 1) {
+        out_sql[o++] = *p++;
+      }
+      if (*p == q && o < out_size - 1) {
+        out_sql[o++] = *p++;
+      }
+      continue;
+    }
+
+    bool is_new = (strncasecmp(p, "new.", 4) == 0 && (p == action_sql || (!isalnum((unsigned char)p[-1]) && p[-1] != '_')));
+    bool is_old = (strncasecmp(p, "old.", 4) == 0 && (p == action_sql || (!isalnum((unsigned char)p[-1]) && p[-1] != '_')));
+
+    if (is_new || is_old) {
+      const char* col_start = p + 4;
+      char col_name[COL_NAME_SIZE] = {0};
+      size_t clen = 0;
+      while (col_start[clen] && (isalnum((unsigned char)col_start[clen]) || col_start[clen] == '_') && clen < sizeof(col_name) - 1) {
+        col_name[clen] = col_start[clen];
+        clen++;
+      }
+      col_name[clen] = '\0';
+
+      int col_idx = -1;
+      if (def) {
+        for (uint32_t c = 0; c < def->num_cols; c++) {
+          if (strcasecmp(def->columns[c].name, col_name) == 0) {
+            col_idx = (int)c;
+            break;
+          }
+        }
+      }
+
+      if (col_idx >= 0) {
+        Value* v = is_new ? (new_vals ? &new_vals[col_idx] : NULL) : (old_vals ? &old_vals[col_idx] : NULL);
+        char val_str[256] = "NULL";
+        if (v != NULL && !v->is_null) {
+          switch (def->columns[col_idx].type) {
+            case COL_INT:
+              snprintf(val_str, sizeof(val_str), "%d", v->int_val);
+              break;
+            case COL_FLOAT:
+              snprintf(val_str, sizeof(val_str), "%.8g", (double)v->float_val);
+              break;
+            case COL_DOUBLE:
+            case COL_NUMERIC:
+            case COL_DECIMAL:
+              snprintf(val_str, sizeof(val_str), "%.8g", v->double_val);
+              break;
+            case COL_BOOL:
+              snprintf(val_str, sizeof(val_str), "%d", v->bool_val ? 1 : 0);
+              break;
+            case COL_TEXT:
+            case COL_VARCHAR:
+            case COL_BLOB:
+            case COL_DATE:
+            case COL_TIME:
+            case COL_DATETIME:
+            case COL_TIMESTAMP:
+              snprintf(val_str, sizeof(val_str), "'%s'", v->text_val ? v->text_val : "");
+              break;
+            default:
+              snprintf(val_str, sizeof(val_str), "NULL");
+              break;
+          }
+        }
+        size_t vlen = strlen(val_str);
+        if (o + vlen < out_size) {
+          memcpy(out_sql + o, val_str, vlen);
+          o += vlen;
+        }
+        p = col_start + clen;
+        continue;
+      }
+    }
+
+    out_sql[o++] = *p++;
+  }
+  out_sql[o] = '\0';
+}
+
+static void fire_triggers(Catalog* catalog, Pager* pager, TableDef* def,
+                          Value* old_vals, Value* new_vals,
+                          TriggerTiming timing, TriggerEvent event) {
+  if (def == NULL) return;
   static __thread int s_trigger_depth = 0;
   if (s_trigger_depth >= 4) return;
   s_trigger_depth++;
 
   for (uint32_t i = 0; i < catalog->num_triggers; i++) {
     TriggerDef* t = &catalog->triggers[i];
-    if (strcmp(t->target_table, table_name) == 0 && t->timing == timing && t->event == event) {
+    if (strcmp(t->target_table, def->name) == 0 && t->timing == timing && t->event == event) {
+      char expanded_sql[1024];
+      expand_trigger_sql(t->action_sql, def, old_vals, new_vals, expanded_sql, sizeof(expanded_sql));
       Statement* tr_stmt = malloc(sizeof(Statement));
       if (tr_stmt) {
-        if (prepare_statement(t->action_sql, tr_stmt) == PREPARE_SUCCESS) {
+        memset(tr_stmt, 0, sizeof(Statement));
+        if (prepare_statement(expanded_sql, tr_stmt) == PREPARE_SUCCESS) {
           execute_statement(tr_stmt, catalog, pager);
         }
         free(tr_stmt);
@@ -126,7 +222,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     auto_tx = true;
   }
 
-  fire_triggers(catalog, pager, def->name, TRIGGER_BEFORE, TRIGGER_INSERT);
+  fire_triggers(catalog, pager, def, NULL, NULL, TRIGGER_BEFORE, TRIGGER_INSERT);
 
   /* AUTOINCREMENT auto-assignment */
   if (def->num_cols > 0 && def->columns[0].is_autoincrement) {
@@ -546,13 +642,12 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     }
   }
 
-  value_free_row(values, def->num_cols);
-
   if (auto_tx && pager->in_transaction) {
     catalog_save(catalog, pager);
     pager_commit(pager);
   }
-  fire_triggers(catalog, pager, def->name, TRIGGER_AFTER, TRIGGER_INSERT);
+  fire_triggers(catalog, pager, def, NULL, values, TRIGGER_AFTER, TRIGGER_INSERT);
+  value_free_row(values, def->num_cols);
   return EXECUTE_SUCCESS;
 }
 
@@ -2651,7 +2746,6 @@ bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog*
 
 /* Compile and run DELETE statement on VDBE */
 static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* catalog, Pager* pager) {
-  fire_triggers(catalog, pager, def->name, TRIGGER_BEFORE, TRIGGER_DELETE);
   /* 1. Scan table and collect IDs of matching rows */
   Table table = { pager, def };
   Cursor* cursor = btree_start(&table);
@@ -2745,6 +2839,8 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
         Value values[MAX_COLUMNS];
         deserialize_row(def, cursor_value(cur), values);
         
+        fire_triggers(catalog, pager, def, values, NULL, TRIGGER_BEFORE, TRIGGER_DELETE);
+
         /* Delete secondary index entries */
         for (uint32_t c = 1; c < def->num_cols; c++) {
           if (def->columns[c].has_index) {
@@ -2790,28 +2886,31 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
                   break;
                 }
               }
-              Statement del_stmt;
-              memset(&del_stmt, 0, sizeof(Statement));
-              del_stmt.type = STATEMENT_DELETE;
-              strcpy(del_stmt.table_name, child_def->name);
-              del_stmt.where_clause.has_where = true;
-              del_stmt.where_clause.num_conds = 1;
-              strcpy(del_stmt.where_clause.conds[0].col_name, child_col->name);
-              del_stmt.where_clause.conds[0].op = OP_EQ;
-              if (def->columns[target_pcol].type == COL_INT) {
-                snprintf(del_stmt.where_clause.conds[0].raw_val, sizeof(del_stmt.where_clause.conds[0].raw_val), "%d", values[target_pcol].int_val);
-              } else if (def->columns[target_pcol].type == COL_DOUBLE || def->columns[target_pcol].type == COL_FLOAT) {
-                snprintf(del_stmt.where_clause.conds[0].raw_val, sizeof(del_stmt.where_clause.conds[0].raw_val), "%.8g", values[target_pcol].double_val);
-              } else {
-                snprintf(del_stmt.where_clause.conds[0].raw_val, sizeof(del_stmt.where_clause.conds[0].raw_val), "%s", values[target_pcol].text_val);
+              Statement* del_stmt = calloc(1, sizeof(Statement));
+              if (del_stmt) {
+                del_stmt->type = STATEMENT_DELETE;
+                strcpy(del_stmt->table_name, child_def->name);
+                del_stmt->where_clause.has_where = true;
+                del_stmt->where_clause.num_conds = 1;
+                strcpy(del_stmt->where_clause.conds[0].col_name, child_col->name);
+                del_stmt->where_clause.conds[0].op = OP_EQ;
+                if (def->columns[target_pcol].type == COL_INT) {
+                  snprintf(del_stmt->where_clause.conds[0].raw_val, sizeof(del_stmt->where_clause.conds[0].raw_val), "%d", values[target_pcol].int_val);
+                } else if (def->columns[target_pcol].type == COL_DOUBLE || def->columns[target_pcol].type == COL_FLOAT) {
+                  snprintf(del_stmt->where_clause.conds[0].raw_val, sizeof(del_stmt->where_clause.conds[0].raw_val), "%.8g", values[target_pcol].double_val);
+                } else {
+                  snprintf(del_stmt->where_clause.conds[0].raw_val, sizeof(del_stmt->where_clause.conds[0].raw_val), "%s", values[target_pcol].text_val);
+                }
+                run_delete_vm(del_stmt, child_def, catalog, pager);
+                free(del_stmt);
               }
-              run_delete_vm(&del_stmt, child_def, catalog, pager);
             }
           }
         }
 
         /* Delete from main table */
         btree_delete(cur);
+        fire_triggers(catalog, pager, def, values, NULL, TRIGGER_AFTER, TRIGGER_DELETE);
         value_free_row(values, def->num_cols);
       }
       value_free(&existing_key);
@@ -2820,7 +2919,6 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
   }
   
   free(matching_ids);
-  fire_triggers(catalog, pager, def->name, TRIGGER_AFTER, TRIGGER_DELETE);
   if (pager->auto_vacuum) {
     execute_vacuum(catalog, pager);
   }
@@ -2829,7 +2927,6 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
 
 /* Compile and run UPDATE statement on VDBE */
 static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* catalog, Pager* pager) {
-  fire_triggers(catalog, pager, def->name, TRIGGER_BEFORE, TRIGGER_UPDATE);
   /* 1. Scan table and collect IDs of matching rows */
   Table table = { pager, def };
   Cursor* cursor = btree_start(&table);
@@ -2867,8 +2964,13 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
       Value existing_key;
       btree_key_value(cur, &existing_key);
       if (existing_key.int_val == target_id.int_val) {
+        Value old_values[MAX_COLUMNS];
+        deserialize_row(def, cursor_value(cur), old_values);
         Value values[MAX_COLUMNS];
-        deserialize_row(def, cursor_value(cur), values);
+        for (uint32_t c = 0; c < def->num_cols; c++) {
+          value_init(&values[c]);
+          value_copy(&values[c], &old_values[c]);
+        }
         
         /* Delete from secondary indexes first */
         for (uint32_t c = 1; c < def->num_cols; c++) {
@@ -2885,11 +2987,11 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
             tabledef_compute(&idx_def);
 
             Table idx_table = { pager, &idx_def };
-            Cursor* idx_cur = btree_find(&idx_table, &values[c]);
+            Cursor* idx_cur = btree_find(&idx_table, &old_values[c]);
             while (!idx_cur->end_of_table) {
               Value cur_idx_vals[2];
               deserialize_row(&idx_def, cursor_value(idx_cur), cur_idx_vals);
-              if (cur_idx_vals[1].int_val == values[0].int_val) {
+              if (cur_idx_vals[1].int_val == old_values[0].int_val) {
                 btree_delete(idx_cur);
                 value_free_row(cur_idx_vals, 2);
                 break;
@@ -2922,25 +3024,32 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
           if (strcasecmp(pair->str_val, "null") == 0) {
             values[col_idx].is_null = true;
           } else {
+            char expr_res[256] = {0};
+            eval_expr_string(pair->str_val, def, old_values, expr_res, sizeof(expr_res));
+            const char* final_val = (strlen(expr_res) > 0) ? expr_res : pair->str_val;
+
             values[col_idx].is_null = false;
             switch (col->type) {
-              case COL_INT:       values[col_idx].int_val = atoi(pair->str_val); break;
-              case COL_FLOAT:     values[col_idx].float_val = (float)atof(pair->str_val); break;
+              case COL_INT:       values[col_idx].int_val = atoi(final_val); break;
+              case COL_FLOAT:     values[col_idx].float_val = (float)atof(final_val); break;
               case COL_DOUBLE:
               case COL_NUMERIC:
-              case COL_DECIMAL:   values[col_idx].double_val = atof(pair->str_val); break;
-              case COL_BOOL:      values[col_idx].bool_val = (strcasecmp(pair->str_val, "true") == 0 || strcmp(pair->str_val, "1") == 0); break;
+              case COL_DECIMAL:   values[col_idx].double_val = atof(final_val); break;
+              case COL_BOOL:      values[col_idx].bool_val = (strcasecmp(final_val, "true") == 0 || strcmp(final_val, "1") == 0); break;
               case COL_BLOB:
               case COL_DATETIME:
               case COL_DATE:
               case COL_TIME:
               case COL_TIMESTAMP:
               case COL_TEXT:
-              case COL_VARCHAR:   value_set_text(&values[col_idx], pair->str_val); break;
+              case COL_VARCHAR:   value_set_text(&values[col_idx], final_val); break;
             }
           }
         }
         
+        /* Fire BEFORE UPDATE trigger with old and new values */
+        fire_triggers(catalog, pager, def, old_values, values, TRIGGER_BEFORE, TRIGGER_UPDATE);
+
         /* Delete current main table entry */
         btree_delete(cur);
         free(cur);
@@ -3015,34 +3124,38 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
                   break;
                 }
               }
-              Statement upd_stmt;
-              memset(&upd_stmt, 0, sizeof(Statement));
-              upd_stmt.type = STATEMENT_UPDATE;
-              strcpy(upd_stmt.table_name, child_def->name);
-              upd_stmt.num_set_pairs = 1;
-              strcpy(upd_stmt.set_pairs[0].col_name, child_col->name);
-              if (def->columns[target_pcol].type == COL_INT) {
-                snprintf(upd_stmt.set_pairs[0].str_val, sizeof(upd_stmt.set_pairs[0].str_val), "%d", values[target_pcol].int_val);
-              } else if (def->columns[target_pcol].type == COL_DOUBLE || def->columns[target_pcol].type == COL_FLOAT) {
-                snprintf(upd_stmt.set_pairs[0].str_val, sizeof(upd_stmt.set_pairs[0].str_val), "%.8g", values[target_pcol].double_val);
-              } else {
-                snprintf(upd_stmt.set_pairs[0].str_val, sizeof(upd_stmt.set_pairs[0].str_val), "%s", values[target_pcol].text_val);
+              Statement* upd_stmt = calloc(1, sizeof(Statement));
+              if (upd_stmt) {
+                upd_stmt->type = STATEMENT_UPDATE;
+                strcpy(upd_stmt->table_name, child_def->name);
+                upd_stmt->num_set_pairs = 1;
+                strcpy(upd_stmt->set_pairs[0].col_name, child_col->name);
+                if (def->columns[target_pcol].type == COL_INT) {
+                  snprintf(upd_stmt->set_pairs[0].str_val, sizeof(upd_stmt->set_pairs[0].str_val), "%d", values[target_pcol].int_val);
+                } else if (def->columns[target_pcol].type == COL_DOUBLE || def->columns[target_pcol].type == COL_FLOAT) {
+                  snprintf(upd_stmt->set_pairs[0].str_val, sizeof(upd_stmt->set_pairs[0].str_val), "%.8g", values[target_pcol].double_val);
+                } else {
+                  snprintf(upd_stmt->set_pairs[0].str_val, sizeof(upd_stmt->set_pairs[0].str_val), "%s", values[target_pcol].text_val);
+                }
+                upd_stmt->where_clause.has_where = true;
+                upd_stmt->where_clause.num_conds = 1;
+                strcpy(upd_stmt->where_clause.conds[0].col_name, child_col->name);
+                upd_stmt->where_clause.conds[0].op = OP_EQ;
+                if (def->columns[target_pcol].type == COL_INT) {
+                  snprintf(upd_stmt->where_clause.conds[0].raw_val, sizeof(upd_stmt->where_clause.conds[0].raw_val), "%d", target_id.int_val);
+                } else if (def->columns[target_pcol].type == COL_DOUBLE || def->columns[target_pcol].type == COL_FLOAT) {
+                  snprintf(upd_stmt->where_clause.conds[0].raw_val, sizeof(upd_stmt->where_clause.conds[0].raw_val), "%.8g", target_id.double_val);
+                } else {
+                  snprintf(upd_stmt->where_clause.conds[0].raw_val, sizeof(upd_stmt->where_clause.conds[0].raw_val), "%s", target_id.text_val);
+                }
+                run_update_vm(upd_stmt, child_def, catalog, pager);
+                free(upd_stmt);
               }
-              upd_stmt.where_clause.has_where = true;
-              upd_stmt.where_clause.num_conds = 1;
-              strcpy(upd_stmt.where_clause.conds[0].col_name, child_col->name);
-              upd_stmt.where_clause.conds[0].op = OP_EQ;
-              if (def->columns[target_pcol].type == COL_INT) {
-                snprintf(upd_stmt.where_clause.conds[0].raw_val, sizeof(upd_stmt.where_clause.conds[0].raw_val), "%d", target_id.int_val);
-              } else if (def->columns[target_pcol].type == COL_DOUBLE || def->columns[target_pcol].type == COL_FLOAT) {
-                snprintf(upd_stmt.where_clause.conds[0].raw_val, sizeof(upd_stmt.where_clause.conds[0].raw_val), "%.8g", target_id.double_val);
-              } else {
-                snprintf(upd_stmt.where_clause.conds[0].raw_val, sizeof(upd_stmt.where_clause.conds[0].raw_val), "%s", target_id.text_val);
-              }
-              run_update_vm(&upd_stmt, child_def, catalog, pager);
             }
           }
         }
+        fire_triggers(catalog, pager, def, old_values, values, TRIGGER_AFTER, TRIGGER_UPDATE);
+        value_free_row(old_values, def->num_cols);
         value_free_row(values, def->num_cols);
       }
       value_free(&existing_key);
@@ -3052,7 +3165,6 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
   }
   
   free(matching_ids);
-  fire_triggers(catalog, pager, def->name, TRIGGER_AFTER, TRIGGER_UPDATE);
   return EXECUTE_SUCCESS;
 }
 
@@ -3514,30 +3626,32 @@ static ExecuteResult execute_analyze(Statement* stmt, Catalog* catalog, Pager* p
   (void)stmt;
   TableDef* stat1_def = catalog_find(catalog, "sqlite_stat1");
   if (!stat1_def) {
-    Statement create_stat1;
-    memset(&create_stat1, 0, sizeof(Statement));
-    create_stat1.type = STATEMENT_CREATE_TABLE;
-    strcpy(create_stat1.new_table.name, "sqlite_stat1");
-    create_stat1.new_table.num_cols = 4;
+    Statement* create_stat1 = calloc(1, sizeof(Statement));
+    if (create_stat1) {
+      create_stat1->type = STATEMENT_CREATE_TABLE;
+      strcpy(create_stat1->new_table.name, "sqlite_stat1");
+      create_stat1->new_table.num_cols = 4;
 
-    strcpy(create_stat1.new_table.columns[0].name, "id");
-    create_stat1.new_table.columns[0].type = COL_INT;
-    create_stat1.new_table.columns[0].size = 4;
+      strcpy(create_stat1->new_table.columns[0].name, "id");
+      create_stat1->new_table.columns[0].type = COL_INT;
+      create_stat1->new_table.columns[0].size = 4;
 
-    strcpy(create_stat1.new_table.columns[1].name, "tbl");
-    create_stat1.new_table.columns[1].type = COL_VARCHAR;
-    create_stat1.new_table.columns[1].size = 64;
+      strcpy(create_stat1->new_table.columns[1].name, "tbl");
+      create_stat1->new_table.columns[1].type = COL_VARCHAR;
+      create_stat1->new_table.columns[1].size = 64;
 
-    strcpy(create_stat1.new_table.columns[2].name, "idx");
-    create_stat1.new_table.columns[2].type = COL_VARCHAR;
-    create_stat1.new_table.columns[2].size = 64;
+      strcpy(create_stat1->new_table.columns[2].name, "idx");
+      create_stat1->new_table.columns[2].type = COL_VARCHAR;
+      create_stat1->new_table.columns[2].size = 64;
 
-    strcpy(create_stat1.new_table.columns[3].name, "stat");
-    create_stat1.new_table.columns[3].type = COL_VARCHAR;
-    create_stat1.new_table.columns[3].size = 128;
+      strcpy(create_stat1->new_table.columns[3].name, "stat");
+      create_stat1->new_table.columns[3].type = COL_VARCHAR;
+      create_stat1->new_table.columns[3].size = 128;
 
-    execute_create_table(&create_stat1, catalog, pager);
-    stat1_def = catalog_find(catalog, "sqlite_stat1");
+      execute_create_table(create_stat1, catalog, pager);
+      free(create_stat1);
+      stat1_def = catalog_find(catalog, "sqlite_stat1");
+    }
   }
 
   uint32_t next_stat_id = 1;
@@ -3576,16 +3690,18 @@ static ExecuteResult execute_analyze(Statement* stmt, Catalog* catalog, Pager* p
         char stat_str[128];
         snprintf(stat_str, sizeof(stat_str), "%u %u", row_count, (row_count > 0) ? 1 : 0);
 
-        Statement ins_stmt;
-        memset(&ins_stmt, 0, sizeof(Statement));
-        ins_stmt.type = STATEMENT_INSERT;
-        strcpy(ins_stmt.table_name, "sqlite_stat1");
-        ins_stmt.num_values = 4;
-        snprintf(ins_stmt.raw_values[0], sizeof(ins_stmt.raw_values[0]), "%u", next_stat_id++);
-        snprintf(ins_stmt.raw_values[1], sizeof(ins_stmt.raw_values[1]), "%s", def->name);
-        strcpy(ins_stmt.raw_values[2], idx_name);
-        strcpy(ins_stmt.raw_values[3], stat_str);
-        run_insert_vm(&ins_stmt, stat1_def, catalog, pager);
+        Statement* ins_stmt = calloc(1, sizeof(Statement));
+        if (ins_stmt) {
+          ins_stmt->type = STATEMENT_INSERT;
+          strcpy(ins_stmt->table_name, "sqlite_stat1");
+          ins_stmt->num_values = 4;
+          snprintf(ins_stmt->raw_values[0], sizeof(ins_stmt->raw_values[0]), "%u", next_stat_id++);
+          snprintf(ins_stmt->raw_values[1], sizeof(ins_stmt->raw_values[1]), "%s", def->name);
+          strcpy(ins_stmt->raw_values[2], idx_name);
+          strcpy(ins_stmt->raw_values[3], stat_str);
+          run_insert_vm(ins_stmt, stat1_def, catalog, pager);
+          free(ins_stmt);
+        }
       }
     }
   }
@@ -3967,7 +4083,8 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
         memset(cte_tbl_def, 0, sizeof(TableDef));
         snprintf(cte_tbl_def->name, sizeof(cte_tbl_def->name), "%s", cte->cte_name);
         cte_tbl_def->num_cols = 1;
-        strcpy(cte_tbl_def->columns[0].name, "x");
+        const char* cname = (strlen(cte->col_name) > 0) ? cte->col_name : "x";
+        strncpy(cte_tbl_def->columns[0].name, cname, sizeof(cte_tbl_def->columns[0].name) - 1);
         cte_tbl_def->columns[0].type = COL_INT;
         cte_tbl_def->columns[0].size = 4;
         tabledef_compute(cte_tbl_def);
@@ -3980,22 +4097,60 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
 
         Table dst_table = { pager, cte_tbl_def };
         int curr_val = 1;
-        int max_val = 10;
 
-        if (cte->cte_stmt && cte->cte_stmt->where_clause.has_where && cte->cte_stmt->where_clause.num_conds > 0) {
-          int limit_cond = atoi(cte->cte_stmt->where_clause.conds[0].raw_val);
-          if (limit_cond > 0) max_val = limit_cond;
+        if (cte->cte_stmt && cte->cte_stmt->num_select_cols > 0) {
+          char anchor_out[256] = {0};
+          eval_expr_string(cte->cte_stmt->select_cols[0].col_name, NULL, NULL, anchor_out, sizeof(anchor_out));
+          if (strlen(anchor_out) > 0) {
+            curr_val = atoi(anchor_out);
+          } else {
+            curr_val = atoi(cte->cte_stmt->select_cols[0].col_name);
+          }
         }
 
-        while (curr_val <= max_val) {
-          Value vals[MAX_COLUMNS];
-          memset(vals, 0, sizeof(vals));
-          vals[0].int_val = curr_val;
-          Cursor* dst_cur = btree_find(&dst_table, &vals[0]);
-          btree_insert(dst_cur, vals);
+        Value current_vals[MAX_COLUMNS];
+        for (int i = 0; i < MAX_COLUMNS; i++) value_init(&current_vals[i]);
+        current_vals[0].int_val = curr_val;
+        current_vals[0].is_null = false;
+
+        Cursor* dst_cur = btree_find(&dst_table, &current_vals[0]);
+        btree_insert(dst_cur, current_vals);
+        free(dst_cur);
+
+        uint32_t iterations = 0;
+        const uint32_t MAX_RECURSIVE_ITERATIONS = 10000;
+
+        while (iterations < MAX_RECURSIVE_ITERATIONS) {
+          if (cte->rec_stmt && cte->rec_stmt->where_clause.has_where) {
+            if (!eval_where_clause(cte_tbl_def, current_vals, &cte->rec_stmt->where_clause, catalog, pager)) {
+              break;
+            }
+          } else {
+            break;
+          }
+
+          char step_out[256] = {0};
+          const char* step_expr = (cte->rec_stmt && cte->rec_stmt->num_select_cols > 0)
+                                    ? cte->rec_stmt->select_cols[0].col_name
+                                    : "x+1";
+          eval_expr_string(step_expr, cte_tbl_def, current_vals, step_out, sizeof(step_out));
+
+          int next_val;
+          if (strlen(step_out) > 0) {
+            next_val = atoi(step_out);
+          } else {
+            next_val = current_vals[0].int_val + 1;
+          }
+
+          current_vals[0].int_val = next_val;
+
+          dst_cur = btree_find(&dst_table, &current_vals[0]);
+          btree_insert(dst_cur, current_vals);
           free(dst_cur);
-          curr_val++;
+
+          iterations++;
         }
+        value_free_row(current_vals, MAX_COLUMNS);
       } else {
         TableDef* src_def = catalog_find(catalog, cte->cte_stmt->table_name);
         if (src_def != NULL && catalog->num_tables < MAX_TABLES) {
@@ -4170,6 +4325,14 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
 
   if (stmt->num_ctes > 0) {
     for (uint32_t c = 0; c < stmt->num_ctes; c++) {
+      if (stmt->ctes[c].cte_stmt) {
+        free(stmt->ctes[c].cte_stmt);
+        stmt->ctes[c].cte_stmt = NULL;
+      }
+      if (stmt->ctes[c].rec_stmt) {
+        free(stmt->ctes[c].rec_stmt);
+        stmt->ctes[c].rec_stmt = NULL;
+      }
       if (catalog->num_tables > 0) {
         uint32_t cte_idx = catalog->num_tables - 1;
         pager_free_page(pager, catalog->tables[cte_idx].root_page_num);
