@@ -188,6 +188,7 @@ typedef struct {
 struct Statement {
   StatementType type;
   bool          is_explain;
+  bool          is_explain_analyze;
   char          table_name[TBL_NAME_SIZE];
 
   /* CTEs */

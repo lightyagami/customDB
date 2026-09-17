@@ -60,9 +60,14 @@ typedef struct {
    * Callers should check this and propagate the error rather than
    * proceeding with potentially unsafe writes. */
   bool     lock_error;
+
+  /* Performance & I/O Metrics */
+  uint64_t disk_reads;
+  uint64_t cache_hits;
 } Pager;
 
 Pager*   pager_open(const char* filename);
+void     pager_reset_stats(Pager* pager);
 void*    get_page(Pager* pager, uint32_t page_num);
 void     pager_flush(Pager* pager, uint32_t page_num);
 uint32_t get_unused_page_num(Pager* pager);

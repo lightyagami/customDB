@@ -29,4 +29,5 @@ int      compare_keys(ColumnType type, const void* k1, const void* k2);
 int      compare_values(ColumnType type, const Value* v1, const Value* v2);
 void     print_tree(Pager* pager, uint32_t page_num, uint32_t indent,
                     TableDef* def);
+uint32_t btree_depth(Pager* pager, uint32_t root_page_num);
 uint32_t get_unused_page_num(Pager* pager);

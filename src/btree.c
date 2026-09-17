@@ -515,6 +515,19 @@ void print_tree(Pager* pager, uint32_t page_num, uint32_t level, TableDef* def) 
   }
 }
 
+uint32_t btree_depth(Pager* pager, uint32_t root_page_num) {
+  if (!pager || root_page_num == INVALID_PAGE_NUM) return 0;
+  uint32_t depth = 1;
+  uint32_t page_num = root_page_num;
+  void* node = get_page(pager, page_num);
+  while (node && get_node_type(node) == NODE_INTERNAL) {
+    depth++;
+    page_num = *internal_node_child(node, 0);
+    node = get_page(pager, page_num);
+  }
+  return depth;
+}
+
 /* ── Slotted Page Defragmentation ────────────────────────────────────────── */
 void leaf_node_defragment(void* node) {
   uint32_t num_cells = *leaf_node_num_cells(node);

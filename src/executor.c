@@ -1842,6 +1842,12 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
 
   if (true) {
     vdbe_free(vm);
+    struct timespec start_time, end_time;
+    if (stmt->is_explain_analyze) {
+      pager_reset_stats(pager);
+      clock_gettime(CLOCK_MONOTONIC, &start_time);
+    }
+    uint64_t rows_scanned = 0;
     Table table = { pager, def };
     Cursor* cursor = btree_start(&table);
 
@@ -1850,6 +1856,7 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
     RowSortEntry* entries = malloc(sizeof(RowSortEntry) * capacity);
 
     while (!cursor->end_of_table) {
+      rows_scanned++;
       Value row_vals[MAX_COLUMNS];
       deserialize_row(def, cursor_value(cursor), row_vals);
       if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
@@ -1949,8 +1956,58 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
     }
     if (limit > count) limit = count;
 
-    for (uint32_t i = offset; i < limit; i++) {
-      print_projected_row(stmt, def, entries[i].row);
+    uint32_t yielded_count = 0;
+    if (limit > offset) {
+      yielded_count = limit - offset;
+    }
+
+    if (!stmt->is_explain_analyze) {
+      for (uint32_t i = offset; i < limit; i++) {
+        print_projected_row(stmt, def, entries[i].row);
+      }
+    } else {
+      clock_gettime(CLOCK_MONOTONIC, &end_time);
+      double elapsed_ms = (end_time.tv_sec - start_time.tv_sec) * 1000.0 +
+                          (end_time.tv_nsec - start_time.tv_nsec) / 1000000.0;
+      bool use_index = false;
+      uint32_t idx_col_idx = 0;
+      if (wc->has_where && wc->num_conds > 0) {
+        for (uint32_t c = 1; c < def->num_cols; c++) {
+          if (strcmp(def->columns[c].name, wc->conds[0].col_name) == 0 && def->columns[c].has_index) {
+            use_index = true;
+            idx_col_idx = c;
+            break;
+          }
+        }
+      }
+      bool pk_seek = (!use_index && wc->has_where && wc->num_conds > 0 &&
+                      strcmp(wc->conds[0].col_name, "id") == 0 &&
+                      (wc->conds[0].op == OP_EQ || wc->conds[0].op == OP_GT || wc->conds[0].op == OP_GTE));
+
+      printf("QUERY PLAN & EXECUTION METRICS:\n");
+      if (use_index) {
+        const char* op_str = "=";
+        if (wc->conds[0].op == OP_GT) op_str = ">";
+        else if (wc->conds[0].op == OP_GTE) op_str = ">=";
+        else if (wc->conds[0].op == OP_LT) op_str = "<";
+        else if (wc->conds[0].op == OP_LTE) op_str = "<=";
+        printf("  Plan: SEARCH TABLE %s USING INDEX _idx_%s_%s (%s %s %s)\n",
+               def->name, def->name, def->columns[idx_col_idx].name,
+               def->columns[idx_col_idx].name, op_str, wc->conds[0].raw_val);
+      } else if (pk_seek) {
+        printf("  Plan: SEARCH TABLE %s USING PRIMARY KEY (id = %s)\n",
+               def->name, wc->conds[0].raw_val);
+      } else {
+        printf("  Plan: SCAN TABLE %s\n", def->name);
+      }
+
+      uint32_t depth = btree_depth(pager, def->root_page_num);
+      printf("  B-Tree Traversal Depth: %u levels\n", depth);
+      printf("  Buffer Cache Hits: %lu pages\n", (unsigned long)pager->cache_hits);
+      printf("  Disk I/O Reads: %lu pages\n", (unsigned long)pager->disk_reads);
+      printf("  Rows Scanned: %lu\n", (unsigned long)rows_scanned);
+      printf("  Rows Yielded: %u\n", yielded_count);
+      printf("  Execution Time: %.3f ms\n", elapsed_ms);
     }
     for (uint32_t i = 0; i < count; i++) {
       value_free_row(entries[i].row, def->num_cols);

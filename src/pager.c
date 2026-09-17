@@ -90,6 +90,13 @@ Pager* pager_open(const char* filename) {
   return pager;
 }
 
+void pager_reset_stats(Pager* pager) {
+  if (pager) {
+    pager->disk_reads = 0;
+    pager->cache_hits = 0;
+  }
+}
+
 /* IEEE 802.3 32-bit CRC Checksum for WAL Frame Integrity */
 static uint32_t calculate_crc32(const uint8_t *data, size_t length) {
   uint32_t crc = 0xFFFFFFFF;
@@ -349,6 +356,7 @@ void* get_page(Pager* pager, uint32_t page_num) {
   }
 
   if (pager->pages[page_num] == NULL) {
+    pager->disk_reads++;
     void* page = malloc(PAGE_SIZE);
     memset(page, 0, PAGE_SIZE);
 
@@ -385,6 +393,8 @@ void* get_page(Pager* pager, uint32_t page_num) {
     }
     pager->pages[page_num] = page;
     if (page_num >= pager->num_pages) pager->num_pages = page_num + 1;
+  } else {
+    pager->cache_hits++;
   }
 
   /* Mark dirty if transaction is active */

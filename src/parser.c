@@ -536,11 +536,17 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
   memset(out, 0, sizeof(Statement));
   const char* p = skip_whitespace(input);
 
-  /* Handle EXPLAIN prefix */
+  /* Handle EXPLAIN / EXPLAIN ANALYZE prefix */
   if (strncasecmp(p, "explain", 7) == 0 && isspace((unsigned char)p[7])) {
-    out->is_explain = true;
     p += 7;
     p = skip_whitespace(p);
+    if (strncasecmp(p, "analyze", 7) == 0 && (p[7] == '\0' || isspace((unsigned char)p[7]))) {
+      out->is_explain_analyze = true;
+      p += 7;
+      p = skip_whitespace(p);
+    } else {
+      out->is_explain = true;
+    }
   }
 
   /* Handle WITH clause for CTEs */
