@@ -10,7 +10,10 @@ static void check_and_recover_journal(Pager* pager) {
       while (read(jfd, &pnum, 4) == 4) {
         if (read(jfd, page_buf, PAGE_SIZE) == PAGE_SIZE) {
           lseek(pager->file_descriptor, (off_t)pnum * PAGE_SIZE, SEEK_SET);
-          write(pager->file_descriptor, page_buf, PAGE_SIZE);
+          ssize_t w = write(pager->file_descriptor, page_buf, PAGE_SIZE);
+          if (w != (ssize_t)PAGE_SIZE) {
+            fprintf(stderr, "[RECOVERY] Warning: failed to write recovered page %u\n", pnum);
+          }
         }
       }
       close(jfd);
@@ -293,7 +296,9 @@ void pager_journal_page(Pager* pager, uint32_t page_num) {
   }
 
   ssize_t w = write(pager->journal_fd, journal_entry, 4 + PAGE_SIZE);
-  (void)w;
+  if (w != (ssize_t)(4 + PAGE_SIZE)) {
+    fprintf(stderr, "pager_journal_page: warning: write to journal failed\n");
+  }
 
   if (pager->page_is_journaled && page_num < pager->max_pages + 1024) {
     pager->page_is_journaled[page_num] = true;
@@ -411,7 +416,9 @@ void pager_flush(Pager* pager, uint32_t page_num) {
       memcpy(frame_buf + 8, pager->pages[page_num], PAGE_SIZE);
       lseek(pager->wal_fd, 0, SEEK_END);
       ssize_t w = write(pager->wal_fd, frame_buf, sizeof(frame_buf));
-      (void)w;
+      if (w != (ssize_t)sizeof(frame_buf)) {
+        fprintf(stderr, "pager_flush: warning: write to WAL failed\n");
+      }
       /* No fdatasync here — batched once per transaction by the caller
        * (pager_commit), not once per page. Fsyncing every individual page
        * flush turns an O(1)-syncs-per-transaction commit into O(pages),
@@ -421,8 +428,8 @@ void pager_flush(Pager* pager, uint32_t page_num) {
   }
 
   ssize_t bytes = pwrite(pager->file_descriptor, pager->pages[page_num], PAGE_SIZE, (off_t)page_num * PAGE_SIZE);
-  if (bytes == -1) {
-    /* Don't exit on Android — just report */
+  if (bytes != (ssize_t)PAGE_SIZE) {
+    fprintf(stderr, "pager_flush: warning: pwrite failed for page %u\n", page_num);
     return;
   }
   if ((page_num + 1) * PAGE_SIZE > pager->file_length) {
@@ -551,7 +558,10 @@ void pager_rollback(Pager* pager) {
           memcpy(pager->pages[pnum], page_buf, PAGE_SIZE);
         }
         lseek(pager->file_descriptor, (off_t)pnum * PAGE_SIZE, SEEK_SET);
-        write(pager->file_descriptor, page_buf, PAGE_SIZE);
+        ssize_t w = write(pager->file_descriptor, page_buf, PAGE_SIZE);
+        if (w != (ssize_t)PAGE_SIZE) {
+          fprintf(stderr, "pager_rollback: warning: write failed for page %u\n", pnum);
+        }
       }
     }
     close(jfd);
@@ -578,7 +588,9 @@ void pager_rollback(Pager* pager) {
     pager->num_pages = pager->num_pages_at_tx_start;
     pager->file_length = pager->num_pages * PAGE_SIZE;
     if (pager->file_descriptor != -1 && !pager->is_memory) {
-      ftruncate(pager->file_descriptor, (off_t)pager->file_length);
+      if (ftruncate(pager->file_descriptor, (off_t)pager->file_length) != 0) {
+        fprintf(stderr, "pager_rollback: warning: ftruncate failed\n");
+      }
     }
   }
 
@@ -638,10 +650,15 @@ void pager_rollback_to_savepoint(Pager* pager, const char* name) {
             memcpy(pager->pages[pnum], page_buf, PAGE_SIZE);
           }
           lseek(pager->file_descriptor, (off_t)pnum * PAGE_SIZE, SEEK_SET);
-          write(pager->file_descriptor, page_buf, PAGE_SIZE);
+          ssize_t w = write(pager->file_descriptor, page_buf, PAGE_SIZE);
+          if (w != (ssize_t)PAGE_SIZE) {
+            fprintf(stderr, "pager_rollback_to_savepoint: warning: write failed for page %u\n", pnum);
+          }
         }
       }
-      ftruncate(jfd, target_offset);
+      if (ftruncate(jfd, target_offset) != 0) {
+        fprintf(stderr, "pager_rollback_to_savepoint: warning: journal ftruncate failed\n");
+      }
     }
     close(jfd);
   }
@@ -657,7 +674,9 @@ void pager_rollback_to_savepoint(Pager* pager, const char* name) {
     pager->num_pages = target_pages;
     pager->file_length = pager->num_pages * PAGE_SIZE;
     if (pager->file_descriptor != -1 && !pager->is_memory) {
-      ftruncate(pager->file_descriptor, (off_t)pager->file_length);
+      if (ftruncate(pager->file_descriptor, (off_t)pager->file_length) != 0) {
+        fprintf(stderr, "pager_rollback_to_savepoint: warning: ftruncate failed\n");
+      }
     }
   } else {
     pager->num_pages = target_pages;
@@ -778,7 +797,10 @@ void pager_checkpoint(Pager* pager) {
         if (read(pager->wal_fd, page_buf, PAGE_SIZE) == PAGE_SIZE) {
           uint32_t computed_crc = calculate_crc32(page_buf, PAGE_SIZE);
           if (computed_crc == stored_crc) {
-            pwrite(pager->file_descriptor, page_buf, PAGE_SIZE, (off_t)f_pnum * PAGE_SIZE);
+            ssize_t bytes = pwrite(pager->file_descriptor, page_buf, PAGE_SIZE, (off_t)f_pnum * PAGE_SIZE);
+            if (bytes != (ssize_t)PAGE_SIZE) {
+              fprintf(stderr, "pager_checkpoint: warning: pwrite failed for frame page %u\n", f_pnum);
+            }
             if (f_pnum < pager->max_pages && pager->pages[f_pnum]) {
               memcpy(pager->pages[f_pnum], page_buf, PAGE_SIZE);
             }
@@ -787,7 +809,9 @@ void pager_checkpoint(Pager* pager) {
       }
     }
     fdatasync(pager->file_descriptor);
-    ftruncate(pager->wal_fd, 0);
+    if (ftruncate(pager->wal_fd, 0) != 0) {
+      fprintf(stderr, "pager_checkpoint: warning: WAL ftruncate failed\n");
+    }
     lseek(pager->wal_fd, 0, SEEK_SET);
     fsync(pager->wal_fd);
   }

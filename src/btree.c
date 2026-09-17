@@ -1,21 +1,21 @@
 #include "btree.h"
 
 /* ════════════════════════════════════════════════════════════════════════════
- *  Slotted Page Leaf Node Layout:
+ *  Slotted Page Leaf Node Layout (4-byte aligned):
  *
- *  Common Header (6 bytes):
- *    [node_type : 1] [is_root : 1] [parent_ptr : 4]
+ *  Common Header (8 bytes):
+ *    [node_type : 1] [is_root : 1] [pad : 2] [parent_ptr : 4]
  *
- *  Leaf Header (16 bytes total):
- *    Common Header + [num_cells : 4] + [next_leaf : 4] + [free_space_offset : 2]
+ *  Leaf Header (20 bytes total):
+ *    Common Header (8B) + [num_cells : 4] + [next_leaf : 4] + [free_space_offset : 2] + [pad : 2]
  *
- *  Slot Array (starts at offset 16):
+ *  Slot Array (starts at offset 20):
  *    Each slot is 4 bytes:
  *      [offset : 2] [size : 2]
  *    (Key is read directly from serialized row data at offset)
  *
- *  Internal Node Layout (32-byte keys):
- *    Common Header + [num_keys : 4] + [right_child : 4]
+ *  Internal Node Layout (32-byte keys, 16 bytes header):
+ *    Common Header (8B) + [num_keys : 4] + [right_child : 4]
  *    Each slot is 36 bytes: [child_page : 4] [key_bytes : 32]
  * ══════════════════════════════════════════════════════════════════════════ */
 
@@ -24,19 +24,19 @@ typedef enum { NODE_INTERNAL = 0, NODE_LEAF = 1 } NodeType;
 /* Common header offsets */
 #define NODE_TYPE_OFFSET        0u
 #define IS_ROOT_OFFSET          1u
-#define PARENT_POINTER_OFFSET   2u
-#define COMMON_NODE_HEADER_SIZE 6u
+#define PARENT_POINTER_OFFSET   4u
+#define COMMON_NODE_HEADER_SIZE 8u
 
 /* Leaf Header offsets */
-#define LEAF_NODE_NUM_CELLS_OFFSET  6u
-#define LEAF_NODE_NEXT_LEAF_OFFSET  10u
-#define LEAF_NODE_FREE_SPACE_OFFSET 14u
-#define LEAF_NODE_HEADER_SIZE       16u
+#define LEAF_NODE_NUM_CELLS_OFFSET  8u
+#define LEAF_NODE_NEXT_LEAF_OFFSET  12u
+#define LEAF_NODE_FREE_SPACE_OFFSET 16u
+#define LEAF_NODE_HEADER_SIZE       20u
 
 /* Internal Node offsets */
-#define INTERNAL_NODE_NUM_KEYS_OFFSET    6u
-#define INTERNAL_NODE_RIGHT_CHILD_OFFSET 10u
-#define INTERNAL_NODE_HEADER_SIZE        14u
+#define INTERNAL_NODE_NUM_KEYS_OFFSET    8u
+#define INTERNAL_NODE_RIGHT_CHILD_OFFSET 12u
+#define INTERNAL_NODE_HEADER_SIZE        16u
 #define INTERNAL_NODE_CHILD_SIZE         4u
 #define INTERNAL_NODE_KEY_SIZE           32u
 #define INTERNAL_NODE_CELL_SIZE          (INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE)
@@ -76,7 +76,7 @@ static inline uint32_t* node_parent(void* node) {
 }
 
 /* ── Leaf Accessors ──────────────────────────────────────────────────────── */
-static inline uint32_t* leaf_node_num_cells(void* node) {
+uint32_t* leaf_node_num_cells(void* node) {
   return (uint32_t*)((uint8_t*)node + LEAF_NODE_NUM_CELLS_OFFSET);
 }
 static inline uint32_t* leaf_node_next_leaf(void* node) {

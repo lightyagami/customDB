@@ -22,6 +22,7 @@ void    btree_delete(Cursor* cursor);
 void*   cursor_value(Cursor* cursor);   /* ptr to raw serialised row bytes  */
 void    cursor_advance(Cursor* cursor);
 void    btree_key_value(Cursor* cursor, Value* out_val);
+uint32_t* leaf_node_num_cells(void* node);
 
 /* ── Utility ─────────────────────────────────────────────────────────────── */
 int      compare_keys(ColumnType type, const void* k1, const void* k2);

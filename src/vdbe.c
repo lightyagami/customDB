@@ -204,7 +204,7 @@ void vdbe_run(Vdbe* vm) {
         
         vc->btree_cursor = btree_find(&vc->table_handle, &vm->regs[reg_idx].val);
         void* node = get_page(vm->pager, vc->btree_cursor->page_num);
-        uint32_t num_cells = *(uint32_t*)((uint8_t*)node + 6);
+        uint32_t num_cells = *leaf_node_num_cells(node);
         if (vc->btree_cursor->cell_num >= num_cells) {
           vm->pc = jump_pc;
         }
@@ -219,7 +219,7 @@ void vdbe_run(Vdbe* vm) {
         
         vc->btree_cursor = btree_find(&vc->table_handle, &vm->regs[reg_idx].val);
         void* node = get_page(vm->pager, vc->btree_cursor->page_num);
-        uint32_t num_cells = *(uint32_t*)((uint8_t*)node + 6);
+        uint32_t num_cells = *leaf_node_num_cells(node);
         if (vc->btree_cursor->cell_num >= num_cells) {
           vm->pc = jump_pc;
         } else {

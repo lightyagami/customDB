@@ -438,7 +438,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     btree_find_out(&main_tbl, &target_pk, &cur);
     if (!cur.end_of_table) {
       void* node = get_page(pager, cur.page_num);
-      uint32_t num_cells = *(uint32_t*)((uint8_t*)node + 6);
+      uint32_t num_cells = *leaf_node_num_cells(node);
       if (cur.cell_num < num_cells) {
         Value existing_key;
         btree_key_value(&cur, &existing_key);
@@ -2724,6 +2724,7 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
       }
       matching_ids[count++] = row_vals[0].int_val;
     }
+    value_free_row(row_vals, def->num_cols);
     cursor_advance(cursor);
   }
   free(cursor);
@@ -2736,7 +2737,7 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
     
     Cursor* cur = btree_find(&table, &target_id);
     void* node = get_page(pager, cur->page_num);
-    uint32_t num_cells = *(uint32_t*)((uint8_t*)node + 6);
+    uint32_t num_cells = *leaf_node_num_cells(node);
     if (cur->cell_num < num_cells) {
       Value existing_key;
       btree_key_value(cur, &existing_key);
@@ -2848,6 +2849,7 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
       }
       matching_ids[count++] = row_vals[0].int_val;
     }
+    value_free_row(row_vals, def->num_cols);
     cursor_advance(cursor);
   }
   free(cursor);
@@ -2860,7 +2862,7 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
     
     Cursor* cur = btree_find(&table, &target_id);
     void* node = get_page(pager, cur->page_num);
-    uint32_t num_cells = *(uint32_t*)((uint8_t*)node + 6);
+    uint32_t num_cells = *leaf_node_num_cells(node);
     if (cur->cell_num < num_cells) {
       Value existing_key;
       btree_key_value(cur, &existing_key);
@@ -3196,13 +3198,17 @@ static ExecuteResult execute_create_index(Statement* stmt, Catalog* catalog, Pag
       idx_where.conds[0].op = col->idx_where_op;
       strcpy(idx_where.conds[0].raw_val, col->idx_where_val);
       if (!eval_where_clause(def, main_values, &idx_where, catalog, pager)) {
+        value_free_row(main_values, def->num_cols);
         cursor_advance(cursor);
         continue;
       }
     }
 
     Value idx_values[2];
-    idx_values[0] = main_values[col_idx];          /* indexed column value */
+    value_init(&idx_values[0]);
+    value_init(&idx_values[1]);
+    value_copy(&idx_values[0], &main_values[col_idx]);
+    idx_values[0].is_null = main_values[col_idx].is_null;
     if (col->idx_is_expr) {
       if (strcasecmp(col->idx_expr_func, "lower") == 0 && (col->type == COL_TEXT || col->type == COL_VARCHAR)) {
         for (char* p = idx_values[0].text_val; *p; p++) *p = (char)tolower((unsigned char)*p);
@@ -3211,11 +3217,14 @@ static ExecuteResult execute_create_index(Statement* stmt, Catalog* catalog, Pag
       }
     }
     idx_values[1].int_val = main_values[0].int_val; /* primary key id */
+    idx_values[1].is_null = false;
 
     Cursor* idx_cur = btree_find(&idx_table, &idx_values[0]);
     btree_insert(idx_cur, idx_values);
+    value_free_row(idx_values, 2);
     free(idx_cur);
 
+    value_free_row(main_values, def->num_cols);
     cursor_advance(cursor);
   }
   free(cursor);
@@ -3455,7 +3464,9 @@ static ExecuteResult execute_vacuum(Catalog* catalog, Pager* pager) {
     pager->file_descriptor = fd;
     pager->num_pages = vac_num_pages;
     pager->file_length = (uint32_t)vac_num_pages * PAGE_SIZE;
-    ftruncate(pager->file_descriptor, (off_t)vac_num_pages * PAGE_SIZE);
+    if (ftruncate(pager->file_descriptor, (off_t)vac_num_pages * PAGE_SIZE) != 0) {
+      fprintf(stderr, "execute_vacuum: warning: ftruncate failed\n");
+    }
     for (uint32_t i = 0; i < pager->max_pages; i++) {
       if (pager->pages[i]) {
         free(pager->pages[i]);
