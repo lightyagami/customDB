@@ -6,8 +6,10 @@
 #include <signal.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <ctype.h>
 #include "dbms.h"
 
 #define DEFAULT_PORT 8888
@@ -31,8 +33,78 @@ typedef struct {
   struct sockaddr_in client_addr;
 } ClientContext;
 
-#include <sys/time.h>
-#include <ctype.h>
+#define MAX_SUBSCRIPTIONS 128
+#define MAX_CHANNELS_PER_CLIENT 16
+#define MAX_CHANNEL_NAME_LEN 64
+
+typedef struct {
+  int fd;
+  char channels[MAX_CHANNELS_PER_CLIENT][MAX_CHANNEL_NAME_LEN];
+  int num_channels;
+} ClientSubscription;
+
+static ClientSubscription g_subscriptions[MAX_SUBSCRIPTIONS];
+static pthread_mutex_t g_pubsub_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void pubsub_add_client(int fd) {
+  pthread_mutex_lock(&g_pubsub_mutex);
+  for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+    if (g_subscriptions[i].fd == 0) {
+      g_subscriptions[i].fd = fd;
+      g_subscriptions[i].num_channels = 0;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&g_pubsub_mutex);
+}
+
+static void pubsub_remove_client(int fd) {
+  pthread_mutex_lock(&g_pubsub_mutex);
+  for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+    if (g_subscriptions[i].fd == fd) {
+      memset(&g_subscriptions[i], 0, sizeof(ClientSubscription));
+      break;
+    }
+  }
+  pthread_mutex_unlock(&g_pubsub_mutex);
+}
+
+static void pubsub_subscribe(int fd, const char* channel) {
+  pthread_mutex_lock(&g_pubsub_mutex);
+  for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+    if (g_subscriptions[i].fd == fd) {
+      for (int c = 0; c < g_subscriptions[i].num_channels; c++) {
+        if (strcasecmp(g_subscriptions[i].channels[c], channel) == 0) {
+          pthread_mutex_unlock(&g_pubsub_mutex);
+          return; /* Already subscribed */
+        }
+      }
+      if (g_subscriptions[i].num_channels < MAX_CHANNELS_PER_CLIENT) {
+        snprintf(g_subscriptions[i].channels[g_subscriptions[i].num_channels++], MAX_CHANNEL_NAME_LEN, "%s", channel);
+      }
+      break;
+    }
+  }
+  pthread_mutex_unlock(&g_pubsub_mutex);
+}
+
+static void pubsub_notify(const char* channel, const char* payload) {
+  char notification[BUFFER_SIZE];
+  int nlen = snprintf(notification, sizeof(notification), "NOTIFY %s %s\n", channel, payload ? payload : "''");
+
+  pthread_mutex_lock(&g_pubsub_mutex);
+  for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+    if (g_subscriptions[i].fd != 0) {
+      for (int c = 0; c < g_subscriptions[i].num_channels; c++) {
+        if (strcasecmp(g_subscriptions[i].channels[c], channel) == 0) {
+          write(g_subscriptions[i].fd, notification, nlen);
+          break;
+        }
+      }
+    }
+  }
+  pthread_mutex_unlock(&g_pubsub_mutex);
+}
 
 static void send_http_response(int fd, int status_code, const char* status_text, const char* body) {
   char header[512];
@@ -255,6 +327,8 @@ static void* client_worker(void* arg) {
   const char* welcome = "DBMS Network Server 1.0 (Type SQL commands or .exit)\n";
   write(fd, welcome, strlen(welcome));
 
+  pubsub_add_client(fd);
+
   while (g_running) {
     ssize_t bytes = read(fd, recv_buf, sizeof(recv_buf) - 1);
     if (bytes <= 0) break;
@@ -275,6 +349,7 @@ static void* client_worker(void* arg) {
 
         if (strlen(query) > 0) {
           if (strncasecmp(query, ".exit", 5) == 0 || strncasecmp(query, "exit", 4) == 0 || strncasecmp(query, "quit", 4) == 0) {
+            pubsub_remove_client(fd);
             dbms_close(db);
             close(fd);
             free(ctx);
@@ -282,6 +357,62 @@ static void* client_worker(void* arg) {
           }
           if (strncasecmp(query, "ping", 4) == 0) {
             write(fd, "PONG\n", 5);
+            sql_len = 0;
+            continue;
+          }
+
+          if (strncasecmp(query, "listen", 6) == 0 && isspace((unsigned char)query[6])) {
+            const char* ch = query + 6;
+            while (*ch && isspace((unsigned char)*ch)) ch++;
+            char ch_name[MAX_CHANNEL_NAME_LEN] = {0};
+            int ci = 0;
+            while (*ch && !isspace((unsigned char)*ch) && *ch != ';' && ci < MAX_CHANNEL_NAME_LEN - 1) {
+              ch_name[ci++] = *ch++;
+            }
+            ch_name[ci] = '\0';
+            if (strlen(ch_name) > 0) {
+              pubsub_subscribe(fd, ch_name);
+              write(fd, "Executed.\n", 10);
+            } else {
+              write(fd, "Error: Missing channel name for LISTEN.\n", 40);
+            }
+            sql_len = 0;
+            continue;
+          }
+
+          if (strncasecmp(query, "notify", 6) == 0 && isspace((unsigned char)query[6])) {
+            const char* ch = query + 6;
+            while (*ch && isspace((unsigned char)*ch)) ch++;
+            char ch_name[MAX_CHANNEL_NAME_LEN] = {0};
+            int ci = 0;
+            while (*ch && !isspace((unsigned char)*ch) && *ch != ',' && *ch != ';' && ci < MAX_CHANNEL_NAME_LEN - 1) {
+              ch_name[ci++] = *ch++;
+            }
+            ch_name[ci] = '\0';
+            while (*ch && (isspace((unsigned char)*ch) || *ch == ',')) ch++;
+
+            char payload[BUFFER_SIZE] = {0};
+            if (*ch == '\'' || *ch == '"') {
+              char quote = *ch++;
+              int pi = 0;
+              while (*ch && *ch != quote && pi < (int)sizeof(payload) - 1) {
+                payload[pi++] = *ch++;
+              }
+              payload[pi] = '\0';
+            } else {
+              int pi = 0;
+              while (*ch && *ch != ';' && pi < (int)sizeof(payload) - 1) {
+                payload[pi++] = *ch++;
+              }
+              while (pi > 0 && isspace((unsigned char)payload[pi - 1])) payload[--pi] = '\0';
+            }
+
+            if (strlen(ch_name) > 0) {
+              pubsub_notify(ch_name, payload);
+              write(fd, "Executed.\n", 10);
+            } else {
+              write(fd, "Error: Missing channel name for NOTIFY.\n", 40);
+            }
             sql_len = 0;
             continue;
           }
@@ -323,6 +454,7 @@ static void* client_worker(void* arg) {
     }
   }
 
+  pubsub_remove_client(fd);
   dbms_close(db);
   close(fd);
   free(ctx);
