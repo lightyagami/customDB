@@ -48,8 +48,26 @@ typedef enum {
   OP_IS_NOT_NULL, /* IS NOT NULL */
   OP_MATCH,       /* MATCH */
   OP_LIKE,        /* LIKE */
-  OP_BETWEEN      /* BETWEEN */
+  OP_BETWEEN,     /* BETWEEN */
+  OP_GLOB,        /* GLOB */
+  OP_NOT_LIKE,    /* NOT LIKE */
+  OP_NOT_GLOB     /* NOT GLOB */
 } CompOp;
+
+typedef enum {
+  SET_NONE = 0,
+  SET_UNION,      /* UNION (distinct) */
+  SET_UNION_ALL,  /* UNION ALL */
+  SET_INTERSECT,  /* INTERSECT */
+  SET_EXCEPT      /* EXCEPT */
+} SetOp;
+
+typedef enum {
+  CONFLICT_ABORT = 0, /* default — error */
+  CONFLICT_IGNORE,    /* INSERT OR IGNORE */
+  CONFLICT_REPLACE,   /* INSERT OR REPLACE */
+  CONFLICT_UPDATE     /* ON CONFLICT DO UPDATE */
+} ConflictAction;
 
 #define MAX_WHERE_CONDS 4
 
@@ -284,6 +302,19 @@ struct Statement {
   char      new_table_name[TBL_NAME_SIZE];
   Column    new_col;
   char      drop_col_name[COL_NAME_SIZE];
+
+  /* RETURNING clause */
+  bool     has_returning;
+  uint32_t num_returning_cols;
+  char     returning_cols[MAX_SELECT_COLS][COL_NAME_SIZE];
+
+  /* Set operators: UNION / INTERSECT / EXCEPT */
+  SetOp      set_op;
+  Statement* set_rhs;   /* right-hand side SELECT (heap allocated) */
+
+  /* INSERT conflict resolution */
+  ConflictAction conflict_action;
 };
 
 PrepareResult prepare_statement(const char* input, Statement* out);
+void statement_free_children(Statement* stmt);

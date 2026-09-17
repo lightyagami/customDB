@@ -201,10 +201,7 @@ int dbms_exec(dbms* pDb, const char* sql, int (*callback)(void*, int, char**, ch
   if (prep != PREPARE_SUCCESS) {
     snprintf(pDb->last_error, sizeof(pDb->last_error), "SQL parse error");
     if (errmsg) *errmsg = strdup(pDb->last_error);
-    for (uint32_t c = 0; c < stmt->num_ctes; c++) {
-      if (stmt->ctes[c].cte_stmt) free(stmt->ctes[c].cte_stmt);
-      if (stmt->ctes[c].rec_stmt) free(stmt->ctes[c].rec_stmt);
-    }
+    statement_free_children(stmt);
     free(stmt);
     pthread_mutex_unlock(&pDb->mutex);
     if (pDb->file_mutex) pthread_mutex_unlock(pDb->file_mutex);
@@ -212,10 +209,7 @@ int dbms_exec(dbms* pDb, const char* sql, int (*callback)(void*, int, char**, ch
   }
 
   ExecuteResult res = execute_statement(stmt, &pDb->catalog, pDb->pager);
-  for (uint32_t c = 0; c < stmt->num_ctes; c++) {
-    if (stmt->ctes[c].cte_stmt) free(stmt->ctes[c].cte_stmt);
-    if (stmt->ctes[c].rec_stmt) free(stmt->ctes[c].rec_stmt);
-  }
+  statement_free_children(stmt);
   free(stmt);
   if (pDb->pager->lock_error) {
     snprintf(pDb->last_error, sizeof(pDb->last_error), "Database is locked by another process");
@@ -474,16 +468,7 @@ int dbms_finalize(dbms_stmt* pStmt) {
   }
   value_free_row(pStmt->current_row_vals, MAX_COLUMNS);
   value_free_row(pStmt->stmt.bound_values, MAX_COLUMNS);
-  for (uint32_t c = 0; c < pStmt->stmt.num_ctes; c++) {
-    if (pStmt->stmt.ctes[c].cte_stmt) {
-      free(pStmt->stmt.ctes[c].cte_stmt);
-      pStmt->stmt.ctes[c].cte_stmt = NULL;
-    }
-    if (pStmt->stmt.ctes[c].rec_stmt) {
-      free(pStmt->stmt.ctes[c].rec_stmt);
-      pStmt->stmt.ctes[c].rec_stmt = NULL;
-    }
-  }
+  statement_free_children(&pStmt->stmt);
   free(pStmt);
   return DBMS_OK;
 }

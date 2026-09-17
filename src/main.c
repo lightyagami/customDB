@@ -134,10 +134,7 @@ int main(int argc, char* argv[]) {
         default:
           break;
       }
-      for (uint32_t c = 0; c < statement->num_ctes; c++) {
-        if (statement->ctes[c].cte_stmt) free(statement->ctes[c].cte_stmt);
-        if (statement->ctes[c].rec_stmt) free(statement->ctes[c].rec_stmt);
-      }
+      statement_free_children(statement);
       free(statement);
       continue;
     }
@@ -184,10 +181,7 @@ int main(int argc, char* argv[]) {
         break;
     }
 
-    for (uint32_t c = 0; c < statement->num_ctes; c++) {
-      if (statement->ctes[c].cte_stmt) free(statement->ctes[c].cte_stmt);
-      if (statement->ctes[c].rec_stmt) free(statement->ctes[c].rec_stmt);
-    }
+    statement_free_children(statement);
     free(statement);
   }
 

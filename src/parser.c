@@ -178,8 +178,17 @@ static const char* parse_where_clause(const char* p, WhereClause* wc) {
       } else if (strncasecmp(p, "match", 5) == 0 && (isspace((unsigned char)p[5]) || p[5] == '\0' || p[5] == '\'')) {
         cond->op = OP_MATCH;
         p += 5;
+      } else if (strncasecmp(p, "not like", 8) == 0 && (isspace((unsigned char)p[8]) || p[8] == '\'' || p[8] == '"')) {
+        cond->op = OP_NOT_LIKE;
+        p += 8;
+      } else if (strncasecmp(p, "not glob", 8) == 0 && (isspace((unsigned char)p[8]) || p[8] == '\'' || p[8] == '"')) {
+        cond->op = OP_NOT_GLOB;
+        p += 8;
       } else if (strncasecmp(p, "like", 4) == 0 && (isspace((unsigned char)p[4]) || p[4] == '\'' || p[4] == '"')) {
         cond->op = OP_LIKE;
+        p += 4;
+      } else if (strncasecmp(p, "glob", 4) == 0 && (isspace((unsigned char)p[4]) || p[4] == '\'' || p[4] == '"')) {
+        cond->op = OP_GLOB;
         p += 4;
       } else if (strncasecmp(p, "between", 7) == 0 && isspace((unsigned char)p[7])) {
         cond->op = OP_BETWEEN;
@@ -674,16 +683,51 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
   if (strncasecmp(p, "insert", 6) == 0) {
     out->type = STATEMENT_INSERT;
     p += 6;
-    
+
+    /* INSERT OR REPLACE / INSERT OR IGNORE */
     p = skip_whitespace(p);
-    if (strncasecmp(p, "into", 4) == 0) {
+    if (strncasecmp(p, "or", 2) == 0 && isspace((unsigned char)p[2])) {
+      p += 2;
+      p = skip_whitespace(p);
+      if (strncasecmp(p, "replace", 7) == 0) {
+        out->conflict_action = CONFLICT_REPLACE;
+        p += 7;
+      } else if (strncasecmp(p, "ignore", 6) == 0) {
+        out->conflict_action = CONFLICT_IGNORE;
+        p += 6;
+      }
+    }
+
+    p = skip_whitespace(p);
+    if (strncasecmp(p, "into", 4) == 0 && isspace((unsigned char)p[4])) {
       p += 4;
     }
-    
+
     p = parse_identifier(p, out->table_name, TBL_NAME_SIZE);
     if (strlen(out->table_name) == 0) return PREPARE_SYNTAX_ERROR;
 
+    /* Optional column list: INSERT INTO t (col1, col2) VALUES ... */
     p = skip_whitespace(p);
+    char col_list[MAX_COLUMNS][COL_NAME_SIZE];
+    uint32_t col_list_count = 0;
+    if (*p == '(') {
+      /* Peek ahead: if it looks like a SELECT subquery, skip col list */
+      const char* peek = p + 1;
+      while (*peek && isspace((unsigned char)*peek)) peek++;
+      if (strncasecmp(peek, "select", 6) != 0) {
+        p++; /* consume '(' */
+        while (*p && *p != ')') {
+          p = skip_whitespace(p);
+          if (col_list_count < MAX_COLUMNS)
+            p = parse_identifier(p, col_list[col_list_count++], COL_NAME_SIZE);
+          p = skip_whitespace(p);
+          if (*p == ',') p++;
+        }
+        if (*p == ')') p++;
+        p = skip_whitespace(p);
+      }
+    }
+
     if (strncasecmp(p, "select", 6) == 0) {
       out->is_insert_select = true;
       out->insert_select_stmt = malloc(sizeof(Statement));
@@ -713,10 +757,18 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       uint32_t col_idx = 0;
       while (*p && *p != ')') {
         if (col_idx >= MAX_COLUMNS) return PREPARE_SYNTAX_ERROR;
-        
-        p = parse_value_token(p, out->multi_raw_values[out->num_multi_rows][col_idx], MAX_RAW_VAL);
+
+        char tmp_val[MAX_RAW_VAL];
+        p = parse_value_token(p, tmp_val, MAX_RAW_VAL);
+
+        /* Map to column position via col_list if provided */
+        uint32_t dest = col_idx;
+        if (col_list_count > 0 && col_idx < col_list_count) {
+          dest = col_idx; /* store in order; executor maps by col_list later */
+        }
+        snprintf(out->multi_raw_values[out->num_multi_rows][dest], MAX_RAW_VAL, "%s", tmp_val);
         if (out->num_multi_rows == 0) {
-          strncpy(out->raw_values[col_idx], out->multi_raw_values[0][col_idx], MAX_RAW_VAL - 1);
+          snprintf(out->raw_values[dest], MAX_RAW_VAL, "%s", tmp_val);
         }
         col_idx++;
 
@@ -741,8 +793,68 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
     if (out->num_multi_rows > 1) {
       out->is_multi_insert = true;
     }
-    return (out->num_values > 0) ? PREPARE_SUCCESS : PREPARE_SYNTAX_ERROR;
+    if (out->num_values == 0) return PREPARE_SYNTAX_ERROR;
+
+    /* ON CONFLICT DO UPDATE SET col = val, ... */
+    p = skip_whitespace(p);
+    if (strncasecmp(p, "on conflict", 11) == 0 && isspace((unsigned char)p[11])) {
+      p += 11;
+      p = skip_whitespace(p);
+      if (strncasecmp(p, "do update", 9) == 0 && isspace((unsigned char)p[9])) {
+        p += 9;
+        p = skip_whitespace(p);
+        if (strncasecmp(p, "set", 3) == 0 && isspace((unsigned char)p[3])) {
+          p += 3;
+          out->conflict_action = CONFLICT_UPDATE;
+          out->num_set_pairs = 0;
+          while (*p) {
+            p = skip_whitespace(p);
+            if (out->num_set_pairs >= MAX_COLUMNS) break;
+            SetPair* pair = &out->set_pairs[out->num_set_pairs];
+            p = parse_identifier(p, pair->col_name, COL_NAME_SIZE);
+            if (strlen(pair->col_name) == 0) break;
+            p = skip_whitespace(p);
+            if (*p != '=') break;
+            p++;
+            p = parse_value_token(p, pair->str_val, MAX_RAW_VAL);
+            out->num_set_pairs++;
+            p = skip_whitespace(p);
+            if (*p == ',') p++;
+            else break;
+          }
+        }
+      } else if (strncasecmp(p, "do nothing", 10) == 0) {
+        p += 10;
+        out->conflict_action = CONFLICT_IGNORE;
+      }
+    }
+
+    /* RETURNING col, col2 | * */
+    p = skip_whitespace(p);
+    if (strncasecmp(p, "returning", 9) == 0 && (isspace((unsigned char)p[9]) || p[9] == '*')) {
+      p += 9;
+      out->has_returning = true;
+      out->num_returning_cols = 0;
+      p = skip_whitespace(p);
+      if (*p == '*') {
+        strncpy(out->returning_cols[0], "*", COL_NAME_SIZE - 1);
+        out->num_returning_cols = 1;
+        p++;
+      } else {
+        while (*p && *p != ';' && *p != '\0') {
+          p = skip_whitespace(p);
+          if (out->num_returning_cols >= MAX_SELECT_COLS) break;
+          p = parse_identifier(p, out->returning_cols[out->num_returning_cols++], COL_NAME_SIZE);
+          p = skip_whitespace(p);
+          if (*p == ',') p++;
+          else break;
+        }
+      }
+    }
+
+    return PREPARE_SUCCESS;
   }
+
 
   if (strncasecmp(p, "select", 6) == 0) {
     out->type = STATEMENT_SELECT;
@@ -759,7 +871,8 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
     } else {
       /* Parse column or aggregate function list */
       out->num_select_cols = 0;
-      while (*p && strncasecmp(p, "from", 4) != 0) {
+      while (*p && *p != ';' && strncasecmp(p, "from", 4) != 0 &&
+             strncasecmp(p, "union", 5) != 0 && strncasecmp(p, "intersect", 9) != 0 && strncasecmp(p, "except", 6) != 0) {
         if (out->num_select_cols >= MAX_SELECT_COLS) return PREPARE_SYNTAX_ERROR;
         SelectCol* sc = &out->select_cols[out->num_select_cols];
         p = skip_whitespace(p);
@@ -863,7 +976,8 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
             while (*p && idx < sizeof(sc->col_name) - 1) {
               if (*p == '(') depth++;
               else if (*p == ')') depth--;
-              if (depth == 0 && (*p == ',' || strncasecmp(p, "from", 4) == 0)) break;
+              if (depth == 0 && (*p == ',' || *p == ';' || strncasecmp(p, "from", 4) == 0 ||
+                                 strncasecmp(p, "union", 5) == 0 || strncasecmp(p, "intersect", 9) == 0 || strncasecmp(p, "except", 6) == 0)) break;
               sc->col_name[idx++] = *p++;
             }
             sc->col_name[idx] = '\0';
@@ -877,7 +991,8 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
         p = skip_whitespace(p);
         if (*p == ',') {
           p++;
-        } else if (*p != '\0' && strncasecmp(p, "from", 4) != 0) {
+        } else if (*p != '\0' && *p != ';' && strncasecmp(p, "from", 4) != 0 &&
+                   strncasecmp(p, "union", 5) != 0 && strncasecmp(p, "intersect", 9) != 0 && strncasecmp(p, "except", 6) != 0) {
           return PREPARE_SYNTAX_ERROR;
         }
       }
@@ -890,6 +1005,35 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       if (strlen(out->table_name) == 0) return PREPARE_SYNTAX_ERROR;
     } else {
       out->table_name[0] = '\0';
+      /* Check for trailing set operations on bare select */
+      p = skip_whitespace(p);
+      SetOp bare_set_op = SET_NONE;
+      const char* bare_rhs = NULL;
+      if (strncasecmp(p, "union", 5) == 0 && (isspace((unsigned char)p[5]) || p[5] == '\0')) {
+        p += 5; p = skip_whitespace(p);
+        if (strncasecmp(p, "all", 3) == 0 && (isspace((unsigned char)p[3]) || p[3] == '\0')) {
+          bare_set_op = SET_UNION_ALL; p += 3;
+        } else {
+          bare_set_op = SET_UNION;
+        }
+        bare_rhs = p;
+      } else if (strncasecmp(p, "intersect", 9) == 0 && (isspace((unsigned char)p[9]) || p[9] == '\0')) {
+        bare_set_op = SET_INTERSECT; p += 9; bare_rhs = p;
+      } else if (strncasecmp(p, "except", 6) == 0 && (isspace((unsigned char)p[6]) || p[6] == '\0')) {
+        bare_set_op = SET_EXCEPT; p += 6; bare_rhs = p;
+      }
+      if (bare_set_op != SET_NONE && bare_rhs != NULL) {
+        out->set_op = bare_set_op;
+        out->set_rhs = malloc(sizeof(Statement));
+        if (!out->set_rhs) return PREPARE_SYNTAX_ERROR;
+        memset(out->set_rhs, 0, sizeof(Statement));
+        PrepareResult pr = prepare_statement(bare_rhs, out->set_rhs);
+        if (pr != PREPARE_SUCCESS) {
+          free(out->set_rhs);
+          out->set_rhs = NULL;
+          return pr;
+        }
+      }
       return PREPARE_SUCCESS;
     }
 
@@ -1103,6 +1247,43 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       }
     }
 
+    /* Set operators: UNION [ALL], INTERSECT, EXCEPT */
+    p = skip_whitespace(p);
+    SetOp detected_op = SET_NONE;
+    const char* rhs_start = NULL;
+    if (strncasecmp(p, "union", 5) == 0 && (isspace((unsigned char)p[5]) || p[5] == '\0')) {
+      p += 5;
+      p = skip_whitespace(p);
+      if (strncasecmp(p, "all", 3) == 0 && (isspace((unsigned char)p[3]) || p[3] == '\0')) {
+        detected_op = SET_UNION_ALL;
+        p += 3;
+      } else {
+        detected_op = SET_UNION;
+      }
+      rhs_start = p;
+    } else if (strncasecmp(p, "intersect", 9) == 0 && (isspace((unsigned char)p[9]) || p[9] == '\0')) {
+      detected_op = SET_INTERSECT;
+      p += 9;
+      rhs_start = p;
+    } else if (strncasecmp(p, "except", 6) == 0 && (isspace((unsigned char)p[6]) || p[6] == '\0')) {
+      detected_op = SET_EXCEPT;
+      p += 6;
+      rhs_start = p;
+    }
+
+    if (detected_op != SET_NONE && rhs_start != NULL) {
+      out->set_op = detected_op;
+      out->set_rhs = malloc(sizeof(Statement));
+      if (!out->set_rhs) return PREPARE_SYNTAX_ERROR;
+      memset(out->set_rhs, 0, sizeof(Statement));
+      PrepareResult pr = prepare_statement(rhs_start, out->set_rhs);
+      if (pr != PREPARE_SUCCESS) {
+        free(out->set_rhs);
+        out->set_rhs = NULL;
+        return pr;
+      }
+    }
+
     return PREPARE_SUCCESS;
   }
 
@@ -1165,6 +1346,30 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
 
     p = parse_where_clause(p, &out->where_clause);
     if (p == NULL) return PREPARE_SYNTAX_ERROR;
+
+    /* RETURNING col, col2 | * */
+    p = skip_whitespace(p);
+    if (strncasecmp(p, "returning", 9) == 0 && (isspace((unsigned char)p[9]) || p[9] == '*')) {
+      p += 9;
+      out->has_returning = true;
+      out->num_returning_cols = 0;
+      p = skip_whitespace(p);
+      if (*p == '*') {
+        strncpy(out->returning_cols[0], "*", COL_NAME_SIZE - 1);
+        out->num_returning_cols = 1;
+        p++;
+      } else {
+        while (*p && *p != ';' && *p != '\0') {
+          p = skip_whitespace(p);
+          if (out->num_returning_cols >= MAX_SELECT_COLS) break;
+          p = parse_identifier(p, out->returning_cols[out->num_returning_cols++], COL_NAME_SIZE);
+          p = skip_whitespace(p);
+          if (*p == ',') p++;
+          else break;
+        }
+      }
+    }
+
     p = skip_whitespace(p);
     if (*p == ';') p++;
     return PREPARE_SUCCESS;
@@ -1186,6 +1391,29 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
 
     p = parse_where_clause(p, &out->where_clause);
     if (p == NULL) return PREPARE_SYNTAX_ERROR;
+
+    /* RETURNING col, col2 | * */
+    p = skip_whitespace(p);
+    if (strncasecmp(p, "returning", 9) == 0 && (isspace((unsigned char)p[9]) || p[9] == '*')) {
+      p += 9;
+      out->has_returning = true;
+      out->num_returning_cols = 0;
+      p = skip_whitespace(p);
+      if (*p == '*') {
+        strncpy(out->returning_cols[0], "*", COL_NAME_SIZE - 1);
+        out->num_returning_cols = 1;
+        p++;
+      } else {
+        while (*p && *p != ';' && *p != '\0') {
+          p = skip_whitespace(p);
+          if (out->num_returning_cols >= MAX_SELECT_COLS) break;
+          p = parse_identifier(p, out->returning_cols[out->num_returning_cols++], COL_NAME_SIZE);
+          p = skip_whitespace(p);
+          if (*p == ',') p++;
+          else break;
+        }
+      }
+    }
 
     return PREPARE_SUCCESS;
   }
@@ -1445,6 +1673,16 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       p++;
       p = skip_whitespace(p);
       p = parse_identifier(p, out->pragma_value, sizeof(out->pragma_value));
+    } else if (*p == '(') {
+      p++;
+      p = skip_whitespace(p);
+      if (*p == '\'' || *p == '"') {
+        p = parse_value_token(p, out->pragma_value, sizeof(out->pragma_value));
+      } else {
+        p = parse_identifier(p, out->pragma_value, sizeof(out->pragma_value));
+      }
+      p = skip_whitespace(p);
+      if (*p == ')') p++;
     }
     return PREPARE_SUCCESS;
   }
@@ -1489,4 +1727,30 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
   }
 
   return PREPARE_UNRECOGNIZED_STATEMENT;
+}
+
+void statement_free_children(Statement* stmt) {
+  if (!stmt) return;
+  for (uint32_t c = 0; c < stmt->num_ctes; c++) {
+    if (stmt->ctes[c].cte_stmt) {
+      statement_free_children(stmt->ctes[c].cte_stmt);
+      free(stmt->ctes[c].cte_stmt);
+      stmt->ctes[c].cte_stmt = NULL;
+    }
+    if (stmt->ctes[c].rec_stmt) {
+      statement_free_children(stmt->ctes[c].rec_stmt);
+      free(stmt->ctes[c].rec_stmt);
+      stmt->ctes[c].rec_stmt = NULL;
+    }
+  }
+  if (stmt->insert_select_stmt) {
+    statement_free_children(stmt->insert_select_stmt);
+    free(stmt->insert_select_stmt);
+    stmt->insert_select_stmt = NULL;
+  }
+  if (stmt->set_rhs) {
+    statement_free_children(stmt->set_rhs);
+    free(stmt->set_rhs);
+    stmt->set_rhs = NULL;
+  }
 }
