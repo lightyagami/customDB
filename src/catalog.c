@@ -82,7 +82,8 @@ void value_move(Value* dst, Value* src) {
 /* ── On-disk catalog entry layout ────────────────────────────────────────── */
 #define DISK_COL_SIZE    200u
 #define VTAB_BASE_OFFSET (IDX_NAME_SIZE + 4u + 4u + MAX_COLUMNS * DISK_COL_SIZE)
-#define DISK_ENTRY_SIZE  (VTAB_BASE_OFFSET + 1u + 64u + 256u)
+#define DISK_TTL_OFFSET  (VTAB_BASE_OFFSET + 1u + 64u + 256u)
+#define DISK_ENTRY_SIZE  (DISK_TTL_OFFSET + 4u)
 
 /* ── Computed fields ─────────────────────────────────────────────────────── */
 void tabledef_compute(TableDef* def) {
@@ -167,6 +168,7 @@ void catalog_load(Catalog* catalog, Pager* pager) {
     def->is_virtual = (is_v == 1);
     memcpy(def->vtab_module, base + VTAB_BASE_OFFSET + 1, 64); def->vtab_module[63] = '\0';
     memcpy(def->vtab_args, base + VTAB_BASE_OFFSET + 65, 256); def->vtab_args[255] = '\0';
+    memcpy(&def->default_ttl, base + DISK_TTL_OFFSET, 4);
     tabledef_compute(def);
   }
 
@@ -246,6 +248,7 @@ void catalog_save(Catalog* catalog, Pager* pager) {
     memcpy(base + VTAB_BASE_OFFSET, &is_v, 1);
     memcpy(base + VTAB_BASE_OFFSET + 1, def->vtab_module, 64);
     memcpy(base + VTAB_BASE_OFFSET + 65, def->vtab_args, 256);
+    memcpy(base + DISK_TTL_OFFSET, &def->default_ttl, 4);
   }
 
   uint8_t* vt_page_ptr = (uint8_t*)get_page(pager, 15);
@@ -306,8 +309,7 @@ static uint32_t get_varint(const uint8_t* p, uint64_t* v) {
   return i;
 }
 
-/* ── Row serialization ───────────────────────────────────────────────────── */
-uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
+uint32_t serialize_row_with_ttl(TableDef* def, Value* values, uint64_t expire_at, void* dest) {
   uint8_t* out = (uint8_t*)dest;
   
   uint8_t hdr_buf[PAGE_SIZE];
@@ -466,10 +468,23 @@ uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
     free(ser_body);
   }
 
+  /* Append 12-byte TTL footer if expire_at > 0: [0x54 0x54 0x4c 0x21][uint64_t expire_at] */
+  if (expire_at > 0) {
+    uint32_t magic = 0x214c5454; /* "TTL!" */
+    memcpy(out + p, &magic, 4);
+    p += 4;
+    memcpy(out + p, &expire_at, 8);
+    p += 8;
+  }
+
   return p;
 }
 
-uint32_t deserialize_row(TableDef* def, void* src, Value* values) {
+uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
+  return serialize_row_with_ttl(def, values, 0, dest);
+}
+
+uint32_t deserialize_row_with_ttl(TableDef* def, void* src, Value* values, uint64_t* out_expire_at) {
   const uint8_t* in = (const uint8_t*)src;
   
   uint64_t total_hdr_size = 0;
@@ -546,7 +561,22 @@ uint32_t deserialize_row(TableDef* def, void* src, Value* values) {
     }
   }
 
+  uint64_t exp = 0;
+  uint32_t magic = 0;
+  memcpy(&magic, in + cur_body, 4);
+  if (magic == 0x214c5454) {
+    memcpy(&exp, in + cur_body + 4, 8);
+    cur_body += 12;
+  }
+  if (out_expire_at) {
+    *out_expire_at = exp;
+  }
+
   return cur_body;
+}
+
+uint32_t deserialize_row(TableDef* def, void* src, Value* values) {
+  return deserialize_row_with_ttl(def, src, values, NULL);
 }
 
 void print_row(TableDef* def, Value* values) {

@@ -363,9 +363,13 @@ void vdbe_run(Vdbe* vm) {
         }
 
         /* Seek and insert using stack Cursor */
+        uint64_t expire_at = 0;
+        if (i->p4.double_val > 0) expire_at = (uint64_t)i->p4.double_val;
+        else if (i->p4.int_val > 0) expire_at = (uint64_t)i->p4.int_val;
+
         Cursor bcur;
         btree_find_out(&vc->table_handle, &values[0], &bcur);
-        btree_insert(&bcur, values);
+        btree_insert_with_ttl(&bcur, values, expire_at);
         value_free_row(values, vc->def.num_cols);
         break;
       }

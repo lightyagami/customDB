@@ -14,6 +14,7 @@ void    btree_start_out(Table* table, Cursor* out_cursor);
 
 /* Insert a new row */
 void    btree_insert(Cursor* cursor, Value* values);
+void    btree_insert_with_ttl(Cursor* cursor, Value* values, uint64_t expire_at);
 
 /* Delete the row the cursor currently points at */
 void    btree_delete(Cursor* cursor);

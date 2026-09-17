@@ -332,7 +332,7 @@ __attribute__((destructor)) static void btree_thread_cleanup(void) {
   }
 }
 
-static void serialize_cell_for_leaf(TableDef* def, Value* values, Pager* pager, uint8_t* out_cell, uint32_t* out_cell_size) {
+static void serialize_cell_for_leaf(TableDef* def, Value* values, uint64_t expire_at, Pager* pager, uint8_t* out_cell, uint32_t* out_cell_size) {
   uint32_t estimated_len = 256;
   for (uint32_t i = 0; i < def->num_cols; i++) {
     if (!values[i].is_null) {
@@ -352,13 +352,13 @@ static void serialize_cell_for_leaf(TableDef* def, Value* values, Pager* pager, 
     ser_buf = malloc(ser_cap);
   }
 
-  uint32_t total_size = serialize_row(def, values, ser_buf);
+  uint32_t total_size = serialize_row_with_ttl(def, values, expire_at, ser_buf);
   while (total_size > ser_cap) {
     ser_cap = total_size + 65536;
     uint8_t* new_buf = (ser_buf == stack_buf) ? malloc(ser_cap) : realloc(ser_buf, ser_cap);
     if (new_buf) {
       ser_buf = new_buf;
-      total_size = serialize_row(def, values, ser_buf);
+      total_size = serialize_row_with_ttl(def, values, expire_at, ser_buf);
     } else {
       break;
     }
@@ -924,9 +924,9 @@ static void internal_node_split_and_insert(Table* table, uint32_t parent_page, u
 }
 
 /* ── Leaf Insert with Slotted Defrag ─────────────────────────────────────── */
-static void leaf_node_split_and_insert(Cursor* cursor, Value* values);
+static void leaf_node_split_and_insert(Cursor* cursor, Value* values, uint64_t expire_at);
 
-static void leaf_node_insert(Cursor* cursor, Value* values) {
+static void leaf_node_insert(Cursor* cursor, Value* values, uint64_t expire_at) {
   void* node  = get_page(cursor->table->pager, cursor->page_num);
   pager_journal_page(cursor->table->pager, cursor->page_num);
   uint32_t nc = *leaf_node_num_cells(node);
@@ -934,7 +934,7 @@ static void leaf_node_insert(Cursor* cursor, Value* values) {
   /* Serialize the row into a cell (with overflow chain if oversized) */
   uint8_t temp_buf[BTREE_MAX_LOCAL_PAYLOAD];
   uint32_t size = 0;
-  serialize_cell_for_leaf(cursor->table->def, values, cursor->table->pager, temp_buf, &size);
+  serialize_cell_for_leaf(cursor->table->def, values, expire_at, cursor->table->pager, temp_buf, &size);
 
   uint16_t free_space = *leaf_node_free_space(node);
   uint32_t slots_end = LEAF_NODE_HEADER_SIZE + nc * sizeof(PageSlot);
@@ -946,7 +946,7 @@ static void leaf_node_insert(Cursor* cursor, Value* values) {
     free_space = *leaf_node_free_space(node);
     /* If still full, split the node */
     if (free_space < slots_end || (free_space - slots_end) < needed) {
-      leaf_node_split_and_insert(cursor, values);
+      leaf_node_split_and_insert(cursor, values, expire_at);
       return;
     }
   }
@@ -970,7 +970,7 @@ static void leaf_node_insert(Cursor* cursor, Value* values) {
 }
 
 /* ── Slotted Split ───────────────────────────────────────────────────────── */
-static void leaf_node_split_and_insert(Cursor* cursor, Value* values) {
+static void leaf_node_split_and_insert(Cursor* cursor, Value* values, uint64_t expire_at) {
   void* old_node   = get_page(cursor->table->pager, cursor->page_num);
   
   uint8_t old_max[INTERNAL_NODE_KEY_SIZE];
@@ -990,7 +990,7 @@ static void leaf_node_split_and_insert(Cursor* cursor, Value* values) {
 
   uint8_t new_val_buf[BTREE_MAX_LOCAL_PAYLOAD];
   uint32_t new_val_size = 0;
-  serialize_cell_for_leaf(cursor->table->def, values, cursor->table->pager, new_val_buf, &new_val_size);
+  serialize_cell_for_leaf(cursor->table->def, values, expire_at, cursor->table->pager, new_val_buf, &new_val_size);
 
   /* Build list of all cells (existing + new) */
   for (uint32_t i = 0; i < total_cells; i++) {
@@ -1062,8 +1062,12 @@ static void leaf_node_split_and_insert(Cursor* cursor, Value* values) {
   }
 }
 
+void btree_insert_with_ttl(Cursor* cursor, Value* values, uint64_t expire_at) {
+  leaf_node_insert(cursor, values, expire_at);
+}
+
 void btree_insert(Cursor* cursor, Value* values) {
-  leaf_node_insert(cursor, values);
+  btree_insert_with_ttl(cursor, values, 0);
 }
 
 /* ── Slotted Borrows & Merges ────────────────────────────────────────────── */

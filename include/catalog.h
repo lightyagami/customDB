@@ -114,6 +114,8 @@ typedef struct {
   bool     is_virtual;
   char     vtab_module[64];
   char     vtab_args[256];
+  /* Row-level Time-To-Live (TTL in seconds; 0 = no TTL) */
+  uint32_t default_ttl;
 } TableDef;
 
 typedef struct {
@@ -154,6 +156,8 @@ void      tabledef_compute(TableDef* def);
 
 /* ── Row serialization ───────────────────────────────────────────────────── */
 uint32_t serialize_row(TableDef* def, Value* values, void* dest);
+uint32_t serialize_row_with_ttl(TableDef* def, Value* values, uint64_t expire_at, void* dest);
 uint32_t deserialize_row(TableDef* def, void* src, Value* values);
+uint32_t deserialize_row_with_ttl(TableDef* def, void* src, Value* values, uint64_t* out_expire_at);
 void print_row(TableDef* def, Value* values);
 void print_schema(TableDef* def);

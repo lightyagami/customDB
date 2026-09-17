@@ -681,7 +681,15 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     value_free(&target_pk);
   }
 
-  vdbe_add_inst(vm, OP_Insert, 0, 1, 0, (Value){0});
+  uint64_t expire_at = 0;
+  uint32_t ttl_sec = (stmt->expires_sec > 0) ? stmt->expires_sec : def->default_ttl;
+  if (ttl_sec > 0) {
+    expire_at = (uint64_t)time(NULL) + ttl_sec;
+  }
+  Value ttl_val;
+  value_init(&ttl_val);
+  ttl_val.double_val = (double)expire_at;
+  vdbe_add_inst(vm, OP_Insert, 0, 1, 0, ttl_val);
   vdbe_add_inst(vm, OP_Halt, 0, 0, 0, (Value){0});
 
   vdbe_run(vm);
@@ -1731,9 +1739,16 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
     uint32_t count = 0;
     Value (*all_rows)[MAX_COLUMNS] = malloc(sizeof(Value[MAX_COLUMNS]) * capacity);
 
+    time_t now_ts = time(NULL);
     while (!cursor->end_of_table) {
       Value row_vals[MAX_COLUMNS];
-      deserialize_row(def, cursor_value(cursor), row_vals);
+      uint64_t row_expire_at = 0;
+      deserialize_row_with_ttl(def, cursor_value(cursor), row_vals, &row_expire_at);
+      if (row_expire_at > 0 && (time_t)row_expire_at < now_ts) {
+        value_free_row(row_vals, def->num_cols);
+        cursor_advance(cursor);
+        continue;
+      }
       if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
         if (count >= capacity) {
           capacity *= 2;
@@ -1855,10 +1870,17 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
     uint32_t count = 0;
     RowSortEntry* entries = malloc(sizeof(RowSortEntry) * capacity);
 
+    time_t now_ts = time(NULL);
     while (!cursor->end_of_table) {
       rows_scanned++;
       Value row_vals[MAX_COLUMNS];
-      deserialize_row(def, cursor_value(cursor), row_vals);
+      uint64_t row_expire_at = 0;
+      deserialize_row_with_ttl(def, cursor_value(cursor), row_vals, &row_expire_at);
+      if (row_expire_at > 0 && (time_t)row_expire_at < now_ts) {
+        value_free_row(row_vals, def->num_cols);
+        cursor_advance(cursor);
+        continue;
+      }
       if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
         if (count >= capacity) {
           capacity *= 2;
@@ -2408,13 +2430,20 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
     return EXECUTE_CATALOG_FULL;
   }
 
+  time_t now_ts = time(NULL);
   while (!l_cur->end_of_table) {
     if (stream_count >= stream_cap) {
       stream_cap *= 2;
       stream = realloc(stream, sizeof(JoinedStreamRow) * stream_cap);
     }
     Value row_vals[MAX_COLUMNS];
-    deserialize_row(left_def, cursor_value(l_cur), row_vals);
+    uint64_t row_expire_at = 0;
+    deserialize_row_with_ttl(left_def, cursor_value(l_cur), row_vals, &row_expire_at);
+    if (row_expire_at > 0 && (time_t)row_expire_at < now_ts) {
+      value_free_row(row_vals, left_def->num_cols);
+      cursor_advance(l_cur);
+      continue;
+    }
     stream[stream_count].num_vals = left_def->num_cols;
     for (uint32_t c = 0; c < left_def->num_cols; c++) {
       value_init(&stream[stream_count].vals[c]);
@@ -2494,7 +2523,13 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
     Cursor* r_cur = btree_start(&right_tbl);
     while (!r_cur->end_of_table) {
       Value r_vals[MAX_COLUMNS];
-      deserialize_row(right_def, cursor_value(r_cur), r_vals);
+      uint64_t r_expire_at = 0;
+      deserialize_row_with_ttl(right_def, cursor_value(r_cur), r_vals, &r_expire_at);
+      if (r_expire_at > 0 && (time_t)r_expire_at < now_ts) {
+        value_free_row(r_vals, right_def->num_cols);
+        cursor_advance(r_cur);
+        continue;
+      }
       Value* key = &r_vals[right_col_idx];
 
       HashJoinNode* node = malloc(sizeof(HashJoinNode));
@@ -2764,9 +2799,16 @@ static ExecuteResult run_aggregate_select(Statement* stmt, TableDef* def, Catalo
     has_values[i] = false;
   }
 
+  time_t now_ts = time(NULL);
   while (!cursor->end_of_table) {
     Value row_vals[MAX_COLUMNS];
-    deserialize_row(def, cursor_value(cursor), row_vals);
+    uint64_t row_expire_at = 0;
+    deserialize_row_with_ttl(def, cursor_value(cursor), row_vals, &row_expire_at);
+    if (row_expire_at > 0 && (time_t)row_expire_at < now_ts) {
+      value_free_row(row_vals, def->num_cols);
+      cursor_advance(cursor);
+      continue;
+    }
 
     if (eval_where_clause(def, row_vals, &stmt->where_clause, catalog, pager)) {
       for (uint32_t i = 0; i < stmt->num_select_cols; i++) {
@@ -2857,9 +2899,16 @@ static ExecuteResult run_group_by_select(Statement* stmt, TableDef* def, Catalog
   GroupBucket* buckets = malloc(sizeof(GroupBucket) * capacity);
   uint32_t num_buckets = 0;
 
+  time_t now_ts = time(NULL);
   while (!cursor->end_of_table) {
     Value row_vals[MAX_COLUMNS];
-    deserialize_row(def, cursor_value(cursor), row_vals);
+    uint64_t row_expire_at = 0;
+    deserialize_row_with_ttl(def, cursor_value(cursor), row_vals, &row_expire_at);
+    if (row_expire_at > 0 && (time_t)row_expire_at < now_ts) {
+      value_free_row(row_vals, def->num_cols);
+      cursor_advance(cursor);
+      continue;
+    }
 
     if (eval_where_clause(def, row_vals, &stmt->where_clause, catalog, pager)) {
       Value key = row_vals[group_col_idx];
@@ -4307,6 +4356,57 @@ static ExecuteResult execute_pragma(Statement* stmt, Catalog* catalog, Pager* pa
     for (uint32_t t = 0; t < catalog->num_tables; t++) {
       printf("(main, %s, table, %u, 0, 0)\n", catalog->tables[t].name, catalog->tables[t].num_cols);
     }
+    return EXECUTE_SUCCESS;
+  }
+  if (strcasecmp(stmt->pragma_name, "reap_expired") == 0) {
+    uint32_t total_reaped = 0;
+    time_t now_ts = time(NULL);
+    const char* target_tbl = (strlen(stmt->pragma_value) > 0) ? stmt->pragma_value : NULL;
+
+    for (uint32_t t = 0; t < catalog->num_tables; t++) {
+      TableDef* def = &catalog->tables[t];
+      if (target_tbl && strcasecmp(def->name, target_tbl) != 0) continue;
+      if (def->is_virtual) continue;
+
+      Table table = { pager, def };
+      Cursor* cur = btree_start(&table);
+      uint32_t cap = 16;
+      uint32_t del_count = 0;
+      int32_t* expired_ids = malloc(sizeof(int32_t) * cap);
+
+      while (!cur->end_of_table) {
+        Value row_vals[MAX_COLUMNS];
+        uint64_t row_expire_at = 0;
+        deserialize_row_with_ttl(def, cursor_value(cur), row_vals, &row_expire_at);
+        if (row_expire_at > 0 && (time_t)row_expire_at < now_ts) {
+          if (del_count >= cap) {
+            cap *= 2;
+            expired_ids = realloc(expired_ids, sizeof(int32_t) * cap);
+          }
+          expired_ids[del_count++] = row_vals[0].int_val;
+        }
+        value_free_row(row_vals, def->num_cols);
+        cursor_advance(cur);
+      }
+      free(cur);
+
+      for (uint32_t i = 0; i < del_count; i++) {
+        Statement del_stmt;
+        memset(&del_stmt, 0, sizeof(Statement));
+        del_stmt.type = STATEMENT_DELETE;
+        strncpy(del_stmt.table_name, def->name, sizeof(del_stmt.table_name) - 1);
+        del_stmt.where_clause.has_where = true;
+        del_stmt.where_clause.num_conds = 1;
+        strncpy(del_stmt.where_clause.conds[0].col_name, def->columns[0].name, sizeof(del_stmt.where_clause.conds[0].col_name) - 1);
+        del_stmt.where_clause.conds[0].op = OP_EQ;
+        snprintf(del_stmt.where_clause.conds[0].raw_val, sizeof(del_stmt.where_clause.conds[0].raw_val), "%d", expired_ids[i]);
+
+        run_delete_vm(&del_stmt, def, catalog, pager);
+        total_reaped++;
+      }
+      free(expired_ids);
+    }
+    printf("Reaped %u expired row(s).\n", total_reaped);
     return EXECUTE_SUCCESS;
   }
   if (strcasecmp(stmt->pragma_name, "integrity_check") == 0) {

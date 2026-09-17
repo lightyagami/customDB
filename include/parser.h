@@ -211,6 +211,7 @@ struct Statement {
   char     multi_raw_values[MAX_MULTI_ROWS][MAX_COLUMNS][MAX_RAW_VAL];
   bool     is_insert_select;
   Statement* insert_select_stmt;
+  uint32_t expires_sec;   /* INSERT ... EXPIRES <seconds> (0 = default/none) */
 
   /* SELECT / DELETE WHERE, UPDATE WHERE */
   WhereClause where_clause;

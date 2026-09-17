@@ -835,6 +835,15 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       }
     }
 
+    /* EXPIRES <seconds> */
+    p = skip_whitespace(p);
+    if (strncasecmp(p, "expires", 7) == 0 && isspace((unsigned char)p[7])) {
+      p += 7;
+      p = skip_whitespace(p);
+      out->expires_sec = (uint32_t)atoi(p);
+      while (*p && isdigit((unsigned char)*p)) p++;
+    }
+
     /* RETURNING col, col2 | * */
     p = skip_whitespace(p);
     if (strncasecmp(p, "returning", 9) == 0 && (isspace((unsigned char)p[9]) || p[9] == '*')) {
@@ -856,6 +865,15 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
           else break;
         }
       }
+    }
+
+    /* Check EXPIRES after RETURNING if placed at end */
+    p = skip_whitespace(p);
+    if (strncasecmp(p, "expires", 7) == 0 && isspace((unsigned char)p[7])) {
+      p += 7;
+      p = skip_whitespace(p);
+      out->expires_sec = (uint32_t)atoi(p);
+      while (*p && isdigit((unsigned char)*p)) p++;
     }
 
     return PREPARE_SUCCESS;
@@ -1566,6 +1584,25 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
 
       PrepareResult res = parse_create_cols(p, &out->new_table);
       if (res != PREPARE_SUCCESS) return res;
+
+      /* Find closing parenthesis of columns to check for WITH TTL = <sec> */
+      const char* post = skip_whitespace(p);
+      if (*post == '(') {
+        int depth = 1;
+        post++;
+        while (*post && depth > 0) {
+          if (*post == '(') depth++;
+          else if (*post == ')') depth--;
+          post++;
+        }
+      }
+      post = skip_whitespace(post);
+      if (strncasecmp(post, "with ttl", 8) == 0) {
+        post += 8;
+        post = skip_whitespace(post);
+        if (*post == '=') { post++; post = skip_whitespace(post); }
+        out->new_table.default_ttl = (uint32_t)atoi(post);
+      }
 
       return PREPARE_SUCCESS;
     }
