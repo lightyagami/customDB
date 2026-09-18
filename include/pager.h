@@ -72,6 +72,7 @@ typedef struct {
   pthread_mutex_t  swap_mutex;
   pthread_mutex_t  epoch_mutex;
   pthread_mutex_t  writer_mutex;
+  uint64_t         tx_snapshot_xid;
   struct {
     uint64_t snapshot_xid;
     bool     active;

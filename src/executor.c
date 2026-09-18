@@ -43,6 +43,24 @@ bool row_is_visible_and_active(TableDef* def, const void* row_bytes, uint64_t sn
   return true;
 }
 
+static inline uint64_t get_current_snapshot_xid(Pager* pager) {
+  if (pager->in_transaction) {
+    if (pthread_equal(pager->writer_tid, pthread_self()) && pager->is_shadowed) {
+      bool has_shadows = false;
+      for (uint32_t i = 0; i < pager->shadow_capacity; i++) {
+        if (pager->is_shadowed[i]) { has_shadows = true; break; }
+      }
+      if (has_shadows) {
+        return pager->current_commit_lsn ? pager->current_commit_lsn : (pager->wal_lsn + 1);
+      }
+    }
+    if (pager->tx_snapshot_xid > 0) {
+      return pager->tx_snapshot_xid;
+    }
+  }
+  return pager->wal_lsn;
+}
+
 typedef struct {
   char    alias[64];
   char    filename[256];
@@ -2150,7 +2168,7 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
     Value (*all_rows)[MAX_COLUMNS] = malloc(sizeof(Value[MAX_COLUMNS]) * capacity);
 
     time_t now_ts = time(NULL);
-    uint64_t snapshot_xid = pager->wal_lsn;
+    uint64_t snapshot_xid = get_current_snapshot_xid(pager);
     while (!cursor->end_of_table) {
       Value row_vals[MAX_COLUMNS];
       if (!row_is_visible_and_active(def, cursor_value(cursor), snapshot_xid, row_vals, (uint64_t)now_ts)) {
@@ -2330,7 +2348,7 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
     uint32_t count = 0;
     RowSortEntry* entries = malloc(sizeof(RowSortEntry) * capacity);
     time_t now_ts = time(NULL);
-    uint64_t snapshot_xid = pager->wal_lsn;
+    uint64_t snapshot_xid = get_current_snapshot_xid(pager);
 
     if (path_type == ACCESS_PK_SEEK) {
       Table table = { pager, def };
@@ -2950,7 +2968,7 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
   }
 
   time_t now_ts = time(NULL);
-  uint64_t snapshot_xid = pager->wal_lsn;
+  uint64_t snapshot_xid = get_current_snapshot_xid(pager);
   while (!l_cur->end_of_table) {
     if (stream_count >= stream_cap) {
       stream_cap *= 2;
@@ -3354,7 +3372,7 @@ static ExecuteResult run_aggregate_select(Statement* stmt, TableDef* def, Catalo
   }
 
   time_t now_ts = time(NULL);
-  uint64_t snapshot_xid = pager->wal_lsn;
+  uint64_t snapshot_xid = get_current_snapshot_xid(pager);
   while (!cursor->end_of_table) {
     Value row_vals[MAX_COLUMNS];
     if (!row_is_visible_and_active(def, cursor_value(cursor), snapshot_xid, row_vals, (uint64_t)now_ts)) {
@@ -3452,7 +3470,7 @@ static ExecuteResult run_group_by_select(Statement* stmt, TableDef* def, Catalog
   uint32_t num_buckets = 0;
 
   time_t now_ts = time(NULL);
-  uint64_t snapshot_xid = pager->wal_lsn;
+  uint64_t snapshot_xid = get_current_snapshot_xid(pager);
   while (!cursor->end_of_table) {
     Value row_vals[MAX_COLUMNS];
     if (!row_is_visible_and_active(def, cursor_value(cursor), snapshot_xid, row_vals, (uint64_t)now_ts)) {

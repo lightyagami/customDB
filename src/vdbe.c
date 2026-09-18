@@ -8,7 +8,17 @@ Vdbe* vdbe_create(Pager* pager, Catalog* catalog) {
   vm->catalog = catalog;
   vm->max_insts = 16;
   vm->insts = malloc(sizeof(Instruction) * vm->max_insts);
-  vm->snapshot_xid = pager_register_snapshot(pager);
+  vm->registered_snapshot_xid = pager_register_snapshot(pager);
+  vm->snapshot_xid = vm->registered_snapshot_xid;
+  if (pager->in_transaction && pthread_equal(pager->writer_tid, pthread_self()) && pager->is_shadowed) {
+    bool has_shadows = false;
+    for (uint32_t i = 0; i < pager->shadow_capacity; i++) {
+      if (pager->is_shadowed[i]) { has_shadows = true; break; }
+    }
+    if (has_shadows) {
+      vm->snapshot_xid = pager->current_commit_lsn ? pager->current_commit_lsn : (pager->wal_lsn + 1);
+    }
+  }
   return vm;
 }
 
@@ -42,8 +52,9 @@ static int compare_sorter_entries(const void* a, const void* b) {
 
 void vdbe_free(Vdbe* vm) {
   if (!vm) return;
-  if (vm->pager) {
-    pager_unregister_snapshot(vm->pager, vm->snapshot_xid);
+  if (vm->pager && vm->registered_snapshot_xid > 0) {
+    pager_unregister_snapshot(vm->pager, vm->registered_snapshot_xid);
+    vm->registered_snapshot_xid = 0;
   }
   for (uint32_t c = 0; c < MAX_CURSORS; c++) {
     if (vm->cursors[c].is_open) {

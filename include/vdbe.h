@@ -87,6 +87,7 @@ typedef struct {
   uint32_t     pc;
   VmSorter     sorter;
   uint64_t     snapshot_xid;
+  uint64_t     registered_snapshot_xid;
 } Vdbe;
 
 Vdbe* vdbe_create(Pager* pager, Catalog* catalog);

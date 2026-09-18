@@ -193,3 +193,57 @@ def test_mvcc_hot_update_and_index_seek():
 
     if os.path.exists(db_file):
         os.remove(db_file)
+
+def test_mvcc_concurrent_readers_and_writes_with_vacuum():
+    """Verify that an active reader transaction pins the snapshot across concurrent updates, deletes, and queries."""
+    db_file = "test_mvcc_vac_iso.db"
+    for f in [db_file, f"{db_file}-wal", f"{db_file}-journal"]:
+        if os.path.exists(f):
+            os.remove(f)
+
+    # 1. Initialize table with 2 rows
+    p_init = subprocess.Popen(["./db", db_file], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p_init.communicate("PRAGMA journal_mode = WAL;\nCREATE TABLE stock (id INT PRIMARY KEY, symbol TEXT, price INT);\nINSERT INTO stock VALUES (1, 'GOOG', 100);\nINSERT INTO stock VALUES (2, 'AAPL', 150);\n.exit\n")
+
+    # 2. Reader A begins transaction and executes initial query
+    p_reader = subprocess.Popen(["./db", db_file], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p_reader.stdin.write("begin\n")
+    p_reader.stdin.write("SELECT id, symbol, price FROM stock WHERE id = 1;\n")
+    p_reader.stdin.flush()
+    time.sleep(0.2)
+
+    # 3. Writer B updates GOOG to 200, deletes AAPL, and inserts MSFT
+    p_writer = subprocess.Popen(["./db", db_file], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p_writer.communicate("UPDATE stock SET price = 200 WHERE id = 1;\nDELETE FROM stock WHERE id = 2;\nINSERT INTO stock VALUES (3, 'MSFT', 300);\n.exit\n")
+
+    # 4. Reader A queries again within its transaction:
+    # Must still see GOOG at 100, AAPL at 150, and must NOT see MSFT
+    p_reader.stdin.write("SELECT id, symbol, price FROM stock WHERE id = 1;\n")
+    p_reader.stdin.write("SELECT id, symbol, price FROM stock WHERE id = 2;\n")
+    p_reader.stdin.write("SELECT count(*) FROM stock;\n")
+    p_reader.stdin.write("commit\n")
+    # After commit, new queries see updated state
+    p_reader.stdin.write("SELECT id, symbol, price FROM stock WHERE id = 1;\n")
+    p_reader.stdin.write("SELECT count(*) FROM stock;\n")
+    p_reader.stdin.write(".exit\n")
+    out_r, _ = p_reader.communicate()
+
+    lines = [l.strip() for l in out_r.splitlines() if "(" in l and not l.startswith("CREATE")]
+    # First select inside tx: (1, GOOG, 100)
+    assert "(1, GOOG, 100)" in lines[0]
+    # Second select inside tx: still (1, GOOG, 100)
+    assert "(1, GOOG, 100)" in lines[1]
+    # Third select inside tx: (2, AAPL, 150)
+    assert "(2, AAPL, 150)" in lines[2]
+    # Fourth select inside tx: count is 2
+    assert "(2)" in lines[3]
+
+    # After commit:
+    # Fifth select: (1, GOOG, 200)
+    assert "(1, GOOG, 200)" in lines[4]
+    # Sixth select: count is 2 (GOOG and MSFT)
+    assert "(2)" in lines[5]
+
+    if os.path.exists(db_file):
+        os.remove(db_file)
+

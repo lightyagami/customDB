@@ -384,11 +384,12 @@ void pager_begin_transaction(Pager* pager) {
   }
   pager_refresh_if_modified(pager);
   pager->in_transaction = true;
-  pager->writer_tid = pthread_self();
+  pager->writer_tid = 0;
   pager->num_pages_at_tx_start = pager->num_pages;
   if (!pager->is_memory && pager->file_descriptor != -1) {
     pager->file_length = (uint32_t)lseek(pager->file_descriptor, 0, SEEK_END);
   }
+  pager->tx_snapshot_xid = pager_register_snapshot(pager);
 }
 
 void pager_shadow_page_write(Pager* pager, uint32_t page_num) {
@@ -707,6 +708,11 @@ void pager_commit(Pager* pager) {
       free(pager->is_dirty);
       pager->is_dirty = NULL;
     }
+    if (pager->tx_snapshot_xid > 0) {
+      pager_unregister_snapshot(pager, pager->tx_snapshot_xid);
+      pager->tx_snapshot_xid = 0;
+    }
+    pager->writer_tid = 0;
     pager->in_transaction = false;
     pager_unlock(pager);
     printf("Transaction committed.\n");
@@ -790,6 +796,12 @@ void pager_commit(Pager* pager) {
     free(pager->is_dirty);
     pager->is_dirty = NULL;
   }
+
+  if (pager->tx_snapshot_xid > 0) {
+    pager_unregister_snapshot(pager, pager->tx_snapshot_xid);
+    pager->tx_snapshot_xid = 0;
+  }
+  pager->writer_tid = 0;
 
   pager->in_transaction = false;
   pager_unlock(pager);
@@ -875,6 +887,12 @@ void pager_rollback(Pager* pager) {
       }
     }
   }
+
+  if (pager->tx_snapshot_xid > 0) {
+    pager_unregister_snapshot(pager, pager->tx_snapshot_xid);
+    pager->tx_snapshot_xid = 0;
+  }
+  pager->writer_tid = 0;
 
   pager->in_transaction = false;
   pager->num_savepoints = 0;
@@ -1533,11 +1551,10 @@ bool pager_restore(const char* src_file, const char* dest_file,
 }
 
 uint64_t pager_register_snapshot(Pager* pager) {
-  if (pager->in_transaction && pthread_equal(pager->writer_tid, pthread_self())) {
-    return pager->wal_lsn + 1;
-  }
   pthread_mutex_lock(&pager->epoch_mutex);
-  uint64_t snap = pager->wal_lsn;
+  uint64_t snap = (pager->in_transaction && pager->tx_snapshot_xid > 0)
+                  ? pager->tx_snapshot_xid
+                  : pager->wal_lsn;
   for (int i = 0; i < 64; i++) {
     if (!pager->active_snapshots[i].active) {
       pager->active_snapshots[i].snapshot_xid = snap;
@@ -1550,9 +1567,6 @@ uint64_t pager_register_snapshot(Pager* pager) {
 }
 
 void pager_unregister_snapshot(Pager* pager, uint64_t snapshot_xid) {
-  if (pager->in_transaction && pthread_equal(pager->writer_tid, pthread_self())) {
-    return;
-  }
   pthread_mutex_lock(&pager->epoch_mutex);
   for (int i = 0; i < 64; i++) {
     if (pager->active_snapshots[i].active && pager->active_snapshots[i].snapshot_xid == snapshot_xid) {
