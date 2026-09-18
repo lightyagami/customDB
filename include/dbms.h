@@ -67,6 +67,7 @@ DBMS_API double      dbms_column_double(dbms_stmt* pStmt, int col);
 DBMS_API const char* dbms_column_text(dbms_stmt* pStmt, int col);
 DBMS_API const void* dbms_column_blob(dbms_stmt* pStmt, int col);
 DBMS_API int         dbms_column_bytes(dbms_stmt* pStmt, int col);
+DBMS_API int         dbms_column_is_null(dbms_stmt* pStmt, int col);
 
 /* ── Utilities ────────────────────────────────────────────────────────────── */
 DBMS_API int64_t dbms_last_insert_rowid(dbms* pDb);

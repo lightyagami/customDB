@@ -263,13 +263,13 @@ static void handle_http_request(int fd, dbms* db, const char* initial_data, ssiz
         if (row_idx > 0) roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, ", ");
         roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, "[");
         for (int c = 0; c < col_count; c++) {
-          const char* txt = dbms_column_text(stmt, c);
           if (c > 0) roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, ", ");
-          if (!txt || strcmp(txt, "NULL") == 0) {
+          if (dbms_column_is_null(stmt, c)) {
             roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, "null");
           } else {
+            const char* txt = dbms_column_text(stmt, c);
             char esc_val[512];
-            escape_json_string(txt, esc_val, sizeof(esc_val));
+            escape_json_string(txt ? txt : "", esc_val, sizeof(esc_val));
             roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, "\"%s\"", esc_val);
           }
         }

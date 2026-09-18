@@ -587,6 +587,13 @@ int dbms_column_bytes(dbms_stmt* pStmt, int col) {
   return (int)strlen(pStmt->current_row_vals[actual].text_val);
 }
 
+int dbms_column_is_null(dbms_stmt* pStmt, int col) {
+  if (pStmt == NULL || !pStmt->has_current_row) return 1;
+  int actual = get_projected_col_idx(pStmt, col);
+  if (actual < 0 || actual >= MAX_COLUMNS) return 1;
+  return pStmt->current_row_vals[actual].is_null ? 1 : 0;
+}
+
 int64_t dbms_last_insert_rowid(dbms* pDb) {
   if (pDb == NULL) return 0;
   return pDb->last_rowid;

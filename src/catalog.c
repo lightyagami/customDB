@@ -446,6 +446,24 @@ uint32_t serialize_row_with_ttl(TableDef* def, Value* values, uint64_t expire_at
     }
   }
 
+  /* If expire_at > 0, append a special varint marker (10 = TTL present) and body */
+  if (expire_at > 0) {
+    if (hdr_len + 16 <= sizeof(hdr_buf)) {
+      hdr_len += put_varint(hdr_buf + hdr_len, 10); /* 10 = TTL 8-byte uint64 follows in body */
+    }
+    if (body_len + 8 > ser_body_cap) {
+      uint32_t new_cap = (body_len + 8 + 4096) * 2;
+      uint8_t* new_buf = (ser_body == stack_body) ? malloc(new_cap) : realloc(ser_body, new_cap);
+      if (new_buf) {
+        if (ser_body == stack_body) memcpy(new_buf, stack_body, body_len);
+        ser_body = new_buf;
+        ser_body_cap = new_cap;
+      }
+    }
+    memcpy(ser_body + body_len, &expire_at, 8);
+    body_len += 8;
+  }
+
   /* Compute and write header size varint (including its own size) */
   uint32_t total_hdr_size = hdr_len + 1;
   while (1) {
@@ -466,15 +484,6 @@ uint32_t serialize_row_with_ttl(TableDef* def, Value* values, uint64_t expire_at
 
   if (ser_body != stack_body) {
     free(ser_body);
-  }
-
-  /* Append 12-byte TTL footer if expire_at > 0: [0x54 0x54 0x4c 0x21][uint64_t expire_at] */
-  if (expire_at > 0) {
-    uint32_t magic = 0x214c5454; /* "TTL!" */
-    memcpy(out + p, &magic, 4);
-    p += 4;
-    memcpy(out + p, &expire_at, 8);
-    p += 8;
   }
 
   return p;
@@ -562,11 +571,13 @@ uint32_t deserialize_row_with_ttl(TableDef* def, void* src, Value* values, uint6
   }
 
   uint64_t exp = 0;
-  uint32_t magic = 0;
-  memcpy(&magic, in + cur_body, 4);
-  if (magic == 0x214c5454) {
-    memcpy(&exp, in + cur_body + 4, 8);
-    cur_body += 12;
+  if (cur_hdr < body_offset) {
+    uint64_t extra_type = 0;
+    get_varint(in + cur_hdr, &extra_type);
+    if (extra_type == 10) {
+      memcpy(&exp, in + cur_body, 8);
+      cur_body += 8;
+    }
   }
   if (out_expire_at) {
     *out_expire_at = exp;
