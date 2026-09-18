@@ -283,10 +283,12 @@ void pager_begin_transaction(Pager* pager) {
   }
   pager->lock_error = false;
 
-  /* Flush all cached pages to disk so on-disk state is clean baseline */
-  for (uint32_t i = 0; i < pager->max_pages; i++) {
-    if (pager->pages[i] != NULL) {
-      pager_flush(pager, i);
+  /* In rollback mode, flush all cached pages to disk so on-disk state is clean baseline */
+  if (!pager->use_wal) {
+    for (uint32_t i = 0; i < pager->max_pages; i++) {
+      if (pager->pages[i] != NULL) {
+        pager_flush(pager, i);
+      }
     }
   }
   pager->num_pages_at_tx_start = pager->num_pages;
@@ -474,7 +476,7 @@ void pager_flush(Pager* pager, uint32_t page_num) {
 
       if (pager->wal_frame_size == WAL_FRAME_SIZE_V2) {
         uint64_t commit_ts = pager->current_commit_ts ? pager->current_commit_ts : (uint64_t)time(NULL);
-        uint64_t lsn = ++pager->wal_lsn;
+        uint64_t lsn = pager->current_commit_lsn ? pager->current_commit_lsn : ++pager->wal_lsn;
         uint8_t frame_buf[WAL_FRAME_SIZE_V2];
         memcpy(frame_buf, &page_num, 4);
         memcpy(frame_buf + 4, &crc, 4);
@@ -566,6 +568,7 @@ void pager_commit(Pager* pager) {
 
   /* Flush ONLY dirty cached pages to disk */
   pager->current_commit_ts = (uint64_t)time(NULL);
+  pager->current_commit_lsn = ++pager->wal_lsn;
   for (uint32_t i = 0; i < pager->num_pages; i++) {
     if (i < pager->max_pages && pager->pages[i]) {
       if (pager->is_dirty == NULL || pager->is_dirty[i]) {
@@ -574,6 +577,7 @@ void pager_commit(Pager* pager) {
     }
   }
   pager->current_commit_ts = 0;
+  pager->current_commit_lsn = 0;
 
   if (pager->use_wal && pager->wal_fd != -1) {
     fdatasync(pager->wal_fd);

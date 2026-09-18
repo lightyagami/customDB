@@ -270,9 +270,11 @@ void catalog_save(Catalog* catalog, Pager* pager) {
   uint8_t* p0 = (uint8_t*)get_page(pager, 0);
   memcpy(p0 + 4092, &pager->freelist_head, 4);
 
-  for (uint32_t p = 0; p < pager->max_pages; p++) {
-    if (pager->pages[p] != NULL) {
-      pager_flush(pager, p);
+  if (!pager->use_wal) {
+    for (uint32_t p = 0; p < pager->max_pages; p++) {
+      if (pager->pages[p] != NULL) {
+        pager_flush(pager, p);
+      }
     }
   }
 }

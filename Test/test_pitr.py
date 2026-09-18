@@ -197,7 +197,92 @@ def test_pitr_non_wal_backup_restore():
 
     cleanup(db_file, backup_file, rec_file)
 
+def test_pitr_atomic_multipage_transaction():
+    db_file = "test_pitr_atomic.db"
+    backup_file = "test_pitr_atomic_bk.db"
+    rec_file = "test_pitr_atomic_rec.db"
+
+    cleanup(db_file, backup_file, rec_file)
+
+    # 1. Setup schema and index in non-WAL, then switch to WAL
+    run_db(db_file, [
+        "create table products (id INT, cat INT, title VARCHAR(32))",
+        "create index idx_cat on products (cat)",
+        "pragma journal_mode = wal",
+        ".exit"
+    ])
+
+    wal_path = db_file + "-wal"
+    frame_size = 4120
+    frames_before = ((os.path.getsize(wal_path) - 4) // frame_size) if (os.path.exists(wal_path) and os.path.getsize(wal_path) >= 4) else 0
+
+    # 2. Insert row in WAL mode — single transaction dirtying table + index pages
+    run_db(db_file, [
+        "pragma journal_mode = wal",
+        "insert into products values (1, 100, 'Laptop')",
+        ".exit"
+    ])
+
+    # Inspect WAL frames: all frames generated in this commit MUST share the same LSN
+    assert os.path.exists(wal_path)
+    with open(wal_path, "rb") as f:
+        magic = struct.unpack("<I", f.read(4))[0]
+        assert magic == 0x574C3200
+        wal_len = os.path.getsize(wal_path)
+        num_frames = (wal_len - 4) // frame_size
+        new_frames = num_frames - frames_before
+        assert new_frames >= 2, f"Expected at least 2 frames for multi-page insert, got {new_frames}"
+        
+        insert_lsns = []
+        for i in range(frames_before, num_frames):
+            f.seek(4 + i * frame_size + 4 + 4 + 8) # LSN offset
+            lsn = struct.unpack("<Q", f.read(8))[0]
+            insert_lsns.append(lsn)
+
+        # All frames in the insert transaction must share the same LSN!
+        target_lsn = insert_lsns[0]
+        assert all(l == target_lsn for l in insert_lsns), f"Frames in transaction have divergent LSNs: {insert_lsns}"
+
+    # 3. Backup database
+    run_db(db_file, [
+        "pragma journal_mode = wal",
+        f"backup database to '{backup_file}'",
+        ".exit"
+    ])
+
+    # 4. Restore until target_lsn
+    lines_res, _ = run_db(db_file, [
+        f"restore database from '{backup_file}' until lsn {target_lsn} to '{rec_file}'",
+        ".exit"
+    ])
+    assert any("Restored to LSN" in l for l in lines_res)
+
+    # 5. Query via index seek: WHERE cat = 100
+    lines_explain, _ = run_db(rec_file, [
+        "explain analyze select * from products where cat = 100",
+        ".exit"
+    ])
+    assert any("INDEX" in l for l in lines_explain), f"Expected index seek plan: {lines_explain}"
+
+    lines_seek, _ = run_db(rec_file, [
+        "select * from products where cat = 100",
+        ".exit"
+    ])
+    tups_seek = get_tuples(lines_seek)
+    assert tups_seek == ["(1, 100, Laptop)"], f"Index seek returned wrong tuples: {tups_seek}"
+
+    # Query via table scan
+    lines_scan, _ = run_db(rec_file, [
+        "select * from products order by id asc",
+        ".exit"
+    ])
+    tups_scan = get_tuples(lines_scan)
+    assert tups_scan == ["(1, 100, Laptop)"], f"Scan returned wrong tuples: {tups_scan}"
+
+    cleanup(db_file, backup_file, rec_file)
+
 if __name__ == "__main__":
     test_pitr_wal_and_restore()
     test_pitr_non_wal_backup_restore()
+    test_pitr_atomic_multipage_transaction()
     print("All PITR tests passed!")

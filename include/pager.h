@@ -39,6 +39,7 @@ typedef struct {
   uint32_t wal_frame_size;
   uint64_t wal_lsn;
   uint64_t current_commit_ts;
+  uint64_t current_commit_lsn;
 
   /* Savepoints */
   uint32_t num_savepoints;
