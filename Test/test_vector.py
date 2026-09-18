@@ -66,6 +66,20 @@ def test_vector_type_and_distance():
     out_raw = "\n".join(run_db(db_file, insert_raw))
     assert "(3, 0)" in out_raw or "(3, 0.0)" in out_raw, f"Expected raw bracket vector to insert & match: {out_raw}"
 
+    # 6. Test vector similarity search: ORDER BY l2_distance(...) ASC LIMIT 1
+    knn_cmds = [
+        "select id from items order by l2_distance(embedding, '[1.0, 2.0, 3.0]') asc limit 1",
+        ".exit"
+    ]
+    lines_knn = run_db(db_file, knn_cmds)
+    result_rows = []
+    for l in lines_knn:
+        s = l.replace("db >", "").strip()
+        if s.startswith("(") and s.endswith(")"):
+            result_rows.append(s)
+    assert len(result_rows) == 1, f"Expected exactly 1 row returned with LIMIT 1, got: {result_rows}"
+    assert result_rows[0] == "(1)" or result_rows[0] == "(3)", f"Expected nearest row, got: {result_rows[0]}"
+
     # Clean up
     if os.path.exists(db_file):
         os.remove(db_file)

@@ -19,6 +19,62 @@ static const char* parse_identifier(const char* p, char* dest, uint32_t max_len)
   return p;
 }
 
+static const char* parse_order_by_expr(const char* p, char* dest, uint32_t max_len) {
+  p = skip_whitespace(p);
+  uint32_t len = 0;
+  int paren_depth = 0;
+  int bracket_depth = 0;
+  bool in_single_quote = false;
+  bool in_double_quote = false;
+
+  while (*p) {
+    if (!in_single_quote && !in_double_quote) {
+      if (*p == '\'') { in_single_quote = true; }
+      else if (*p == '"') { in_double_quote = true; }
+      else if (*p == '(') { paren_depth++; }
+      else if (*p == ')') { if (paren_depth > 0) paren_depth--; }
+      else if (*p == '[') { bracket_depth++; }
+      else if (*p == ']') { if (bracket_depth > 0) bracket_depth--; }
+      else if (paren_depth == 0 && bracket_depth == 0) {
+        if (*p == ',' || *p == ';') break;
+        if (isspace((unsigned char)*p)) {
+          const char* la = skip_whitespace(p);
+          if (strncasecmp(la, "asc", 3) == 0 && (isspace((unsigned char)la[3]) || la[3] == ',' || la[3] == ';' || la[3] == '\0')) {
+            break;
+          }
+          if (strncasecmp(la, "desc", 4) == 0 && (isspace((unsigned char)la[4]) || la[4] == ',' || la[4] == ';' || la[4] == '\0')) {
+            break;
+          }
+          if (strncasecmp(la, "collate", 7) == 0 && (isspace((unsigned char)la[7]) || la[7] == '\0')) {
+            break;
+          }
+          if (strncasecmp(la, "limit", 5) == 0 && (isspace((unsigned char)la[5]) || la[5] == '\0')) {
+            break;
+          }
+          if (strncasecmp(la, "offset", 6) == 0 && (isspace((unsigned char)la[6]) || la[6] == '\0')) {
+            break;
+          }
+        }
+      }
+    } else if (in_single_quote) {
+      if (*p == '\'') in_single_quote = false;
+    } else if (in_double_quote) {
+      if (*p == '"') in_double_quote = false;
+    }
+
+    if (len < max_len - 1) {
+      dest[len++] = *p;
+    }
+    p++;
+  }
+  while (len > 0 && isspace((unsigned char)dest[len - 1])) {
+    len--;
+  }
+  dest[len] = '\0';
+  return p;
+}
+
+
 /* Helper to parse a string value (handles single/double quotes, vector brackets, or unquoted strings) */
 static const char* parse_value_token_ex(const char* p, char* dest, uint32_t max_len, bool* out_is_null, bool* out_was_quoted) {
   p = skip_whitespace(p);
@@ -198,10 +254,10 @@ static const char* parse_where_clause(const char* p, WhereClause* wc) {
       } else if (*p == '=') {
         cond->op = OP_EQ;
         p++;
-      } else if (strncasecmp(p, "is not null", 11) == 0 && (isspace((unsigned char)p[11]) || p[11] == '\0' || p[11] == ')')) {
+      } else if (strncasecmp(p, "is not null", 11) == 0 && (isspace((unsigned char)p[11]) || p[11] == '\0' || p[11] == ')' || p[11] == ';')) {
         cond->op = OP_IS_NOT_NULL;
         p += 11;
-      } else if (strncasecmp(p, "is null", 7) == 0 && (isspace((unsigned char)p[7]) || p[7] == '\0' || p[7] == ')')) {
+      } else if (strncasecmp(p, "is null", 7) == 0 && (isspace((unsigned char)p[7]) || p[7] == '\0' || p[7] == ')' || p[7] == ';')) {
         cond->op = OP_IS_NULL;
         p += 7;
       } else if (strncasecmp(p, "match", 5) == 0 && (isspace((unsigned char)p[5]) || p[5] == '\0' || p[5] == '\'')) {
@@ -1247,13 +1303,14 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       out->num_order_by = 0;
       while (*p) {
         p = skip_whitespace(p);
+        if (*p == '\0' || *p == ';') break;
         if (out->num_order_by >= 4) break;
         OrderByItem* item = &out->order_by_items[out->num_order_by++];
-        p = parse_identifier(p, item->col_name, COL_NAME_SIZE);
+        p = parse_order_by_expr(p, item->col_name, sizeof(item->col_name));
         if (strlen(item->col_name) == 0) return PREPARE_SYNTAX_ERROR;
 
         p = skip_whitespace(p);
-        if (strncasecmp(p, "collate", 7) == 0) {
+        if (strncasecmp(p, "collate", 7) == 0 && (isspace((unsigned char)p[7]) || p[7] == '\0')) {
           p += 7;
           p = skip_whitespace(p);
           if (strncasecmp(p, "nocase", 6) == 0) { item->collation = COLL_NOCASE; p += 6; }
@@ -1264,10 +1321,10 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
         }
 
         p = skip_whitespace(p);
-        if (strncasecmp(p, "desc", 4) == 0) {
+        if (strncasecmp(p, "desc", 4) == 0 && (isspace((unsigned char)p[4]) || p[4] == ',' || p[4] == ';' || p[4] == '\0')) {
           item->is_desc = true;
           p += 4;
-        } else if (strncasecmp(p, "asc", 3) == 0) {
+        } else if (strncasecmp(p, "asc", 3) == 0 && (isspace((unsigned char)p[3]) || p[3] == ',' || p[3] == ';' || p[3] == '\0')) {
           item->is_desc = false;
           p += 3;
         } else {

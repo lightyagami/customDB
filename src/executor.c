@@ -235,10 +235,15 @@ typedef struct {
 static int compare_row_sort_entries(const void* a, const void* b) {
   const RowSortEntry* ra = (const RowSortEntry*)a;
   const RowSortEntry* rb = (const RowSortEntry*)b;
-  for (uint32_t k = 0; k < ra->num_sort_keys; k++) {
+  uint32_t n_keys = (ra->num_sort_keys < rb->num_sort_keys) ? ra->num_sort_keys : rb->num_sort_keys;
+  for (uint32_t k = 0; k < n_keys; k++) {
     ColumnType type = ra->sort_types[k];
     int cmp = 0;
-    if (type == COL_INT) {
+    if (ra->sort_keys[k].is_null || rb->sort_keys[k].is_null) {
+      if (ra->sort_keys[k].is_null && rb->sort_keys[k].is_null) cmp = 0;
+      else if (ra->sort_keys[k].is_null) cmp = -1;
+      else cmp = 1;
+    } else if (type == COL_INT) {
       int32_t va = ra->sort_keys[k].int_val;
       int32_t vb = rb->sort_keys[k].int_val;
       cmp = (va > vb) - (va < vb);
@@ -993,6 +998,58 @@ void eval_expr_string(const char* expr, TableDef* def, Value* row_vals, char* ou
     }
     long long r = ((long long)rand() << 32) | (long long)rand();
     snprintf(out_buf, out_size, "%lld", r);
+    return;
+  }
+
+  /* abs(x) */
+  if (strncasecmp(expr, "abs(", 4) == 0) {
+    const char* p = expr + 4;
+    while (*p && isspace((unsigned char)*p)) p++;
+    char arg[COL_NAME_SIZE] = {0};
+    uint32_t a_idx = 0;
+    while (*p && *p != ')' && !isspace((unsigned char)*p) && a_idx < sizeof(arg) - 1) {
+      arg[a_idx++] = *p++;
+    }
+    arg[a_idx] = '\0';
+    double val = 0.0;
+    bool found = false;
+    if (def && row_vals) {
+      for (uint32_t c = 0; c < def->num_cols; c++) {
+        if (strcasecmp(def->columns[c].name, arg) == 0) {
+          if (def->columns[c].type == COL_INT) val = (double)abs(row_vals[c].int_val);
+          else val = fabs(row_vals[c].double_val);
+          found = true;
+          break;
+        }
+      }
+    }
+    if (!found) {
+      val = fabs(atof(arg));
+    }
+    if ((double)(long long)val == val) snprintf(out_buf, out_size, "%lld", (long long)val);
+    else snprintf(out_buf, out_size, "%.8g", val);
+    return;
+  }
+
+  /* length(x) */
+  if (strncasecmp(expr, "length(", 7) == 0) {
+    const char* p = expr + 7;
+    while (*p && isspace((unsigned char)*p)) p++;
+    char arg[COL_NAME_SIZE] = {0};
+    uint32_t a_idx = 0;
+    while (*p && *p != ')' && !isspace((unsigned char)*p) && a_idx < sizeof(arg) - 1) {
+      arg[a_idx++] = *p++;
+    }
+    arg[a_idx] = '\0';
+    if (def && row_vals) {
+      for (uint32_t c = 0; c < def->num_cols; c++) {
+        if (strcasecmp(def->columns[c].name, arg) == 0) {
+          snprintf(out_buf, out_size, "%zu", strlen(row_vals[c].text_val ? row_vals[c].text_val : ""));
+          return;
+        }
+      }
+    }
+    snprintf(out_buf, out_size, "%zu", strlen(arg));
     return;
   }
 
@@ -2092,14 +2149,55 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
             const char* target_col = (stmt->num_order_by > 0) ? stmt->order_by_items[k].col_name : stmt->order_by_col;
             bool target_desc = (stmt->num_order_by > 0) ? stmt->order_by_items[k].is_desc : stmt->order_by_desc;
             CollationType target_coll = (stmt->num_order_by > 0) ? stmt->order_by_items[k].collation : stmt->order_by_collation;
+
+            char resolved_expr[256];
+            snprintf(resolved_expr, sizeof(resolved_expr), "%s", target_col);
+            if (isdigit((unsigned char)target_col[0]) && stmt->num_select_cols > 0) {
+              int pos = atoi(target_col);
+              if (pos >= 1 && pos <= (int)stmt->num_select_cols) {
+                snprintf(resolved_expr, sizeof(resolved_expr), "%s", stmt->select_cols[pos - 1].col_name);
+              }
+            }
+
+            bool found_col = false;
             for (uint32_t c = 0; c < def->num_cols; c++) {
-              if (strcmp(def->columns[c].name, target_col) == 0) {
+              if (strcasecmp(def->columns[c].name, resolved_expr) == 0) {
                 uint32_t sk_idx = entries[count].num_sort_keys++;
                 value_copy(&entries[count].sort_keys[sk_idx], &row_vals[c]);
                 entries[count].sort_types[sk_idx] = def->columns[c].type;
                 entries[count].sort_colls[sk_idx] = target_coll;
                 entries[count].sort_descs[sk_idx] = target_desc;
+                found_col = true;
                 break;
+              }
+            }
+
+            if (!found_col) {
+              char expr_out[256] = {0};
+              eval_expr_string(resolved_expr, def, row_vals, expr_out, sizeof(expr_out));
+              if (expr_out[0] != '\0') {
+                uint32_t sk_idx = entries[count].num_sort_keys++;
+                entries[count].sort_colls[sk_idx] = target_coll;
+                entries[count].sort_descs[sk_idx] = target_desc;
+                if (strcasecmp(expr_out, "null") == 0) {
+                  entries[count].sort_types[sk_idx] = COL_INT;
+                  entries[count].sort_keys[sk_idx].is_null = true;
+                } else if (strchr(expr_out, '.') != NULL || strchr(expr_out, 'e') != NULL || strchr(expr_out, 'E') != NULL) {
+                  entries[count].sort_types[sk_idx] = COL_DOUBLE;
+                  entries[count].sort_keys[sk_idx].double_val = atof(expr_out);
+                } else {
+                  bool is_num = (strlen(expr_out) > 0);
+                  for (size_t s = (expr_out[0] == '-' ? 1 : 0); expr_out[s]; s++) {
+                    if (!isdigit((unsigned char)expr_out[s])) { is_num = false; break; }
+                  }
+                  if (is_num) {
+                    entries[count].sort_types[sk_idx] = COL_INT;
+                    entries[count].sort_keys[sk_idx].int_val = atoi(expr_out);
+                  } else {
+                    entries[count].sort_types[sk_idx] = COL_TEXT;
+                    value_set_text(&entries[count].sort_keys[sk_idx], expr_out);
+                  }
+                }
               }
             }
           }
@@ -2916,6 +3014,27 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
           if (k_idx != -1) {
             value_copy(&e->sort_keys[k], &stream[i].vals[k_idx]);
             e->sort_types[k] = combined_def.columns[k_idx].type;
+          } else {
+            char expr_out[256] = {0};
+            eval_expr_string(stmt->order_by_items[k].col_name, &combined_def, stream[i].vals, expr_out, sizeof(expr_out));
+            if (expr_out[0] != '\0') {
+              if (strchr(expr_out, '.') != NULL || strchr(expr_out, 'e') != NULL || strchr(expr_out, 'E') != NULL) {
+                e->sort_types[k] = COL_DOUBLE;
+                e->sort_keys[k].double_val = atof(expr_out);
+              } else {
+                bool is_num = (strlen(expr_out) > 0);
+                for (size_t s = (expr_out[0] == '-' ? 1 : 0); expr_out[s]; s++) {
+                  if (!isdigit((unsigned char)expr_out[s])) { is_num = false; break; }
+                }
+                if (is_num) {
+                  e->sort_types[k] = COL_INT;
+                  e->sort_keys[k].int_val = atoi(expr_out);
+                } else {
+                  e->sort_types[k] = COL_TEXT;
+                  value_set_text(&e->sort_keys[k], expr_out);
+                }
+              }
+            }
           }
           e->sort_descs[k] = stmt->order_by_items[k].is_desc;
           e->sort_colls[k] = stmt->order_by_items[k].collation;
@@ -2924,8 +3043,31 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
         e->num_sort_keys = 1;
         if (order_by_idx != -1) {
           value_copy(&e->sort_keys[0], &stream[i].vals[order_by_idx]);
+          e->sort_types[0] = combined_def.columns[order_by_idx].type;
+        } else {
+          char expr_out[256] = {0};
+          eval_expr_string(stmt->order_by_col, &combined_def, stream[i].vals, expr_out, sizeof(expr_out));
+          if (expr_out[0] != '\0') {
+            if (strchr(expr_out, '.') != NULL || strchr(expr_out, 'e') != NULL || strchr(expr_out, 'E') != NULL) {
+              e->sort_types[0] = COL_DOUBLE;
+              e->sort_keys[0].double_val = atof(expr_out);
+            } else {
+              bool is_num = (strlen(expr_out) > 0);
+              for (size_t s = (expr_out[0] == '-' ? 1 : 0); expr_out[s]; s++) {
+                if (!isdigit((unsigned char)expr_out[s])) { is_num = false; break; }
+              }
+              if (is_num) {
+                e->sort_types[0] = COL_INT;
+                e->sort_keys[0].int_val = atoi(expr_out);
+              } else {
+                e->sort_types[0] = COL_TEXT;
+                value_set_text(&e->sort_keys[0], expr_out);
+              }
+            }
+          } else {
+            e->sort_types[0] = COL_INT;
+          }
         }
-        e->sort_types[0] = (order_by_idx != -1) ? combined_def.columns[order_by_idx].type : COL_INT;
         e->sort_descs[0] = stmt->order_by_desc;
         e->sort_colls[0] = stmt->order_by_collation;
       }

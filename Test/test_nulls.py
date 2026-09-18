@@ -21,9 +21,10 @@ def test_null_system():
     ]
     run_db(db_file, cmds)
 
-    # 2. Test IS NULL query
+    # 2. Test IS NULL query (both with and without trailing semicolon)
     null_cmds = [
         "select * from users where age is null",
+        "select * from users where age is null;",
         ".exit"
     ]
     lines_null = run_db(db_file, null_cmds)
@@ -31,9 +32,10 @@ def test_null_system():
     assert "(1, NULL, Alice)" in out_null, f"Expected (1, NULL, Alice), got:\n{out_null}"
     assert "Bob" not in out_null, f"Bob should not match IS NULL filter:\n{out_null}"
 
-    # 3. Test IS NOT NULL query
+    # 3. Test IS NOT NULL query (both with and without trailing semicolon)
     not_null_cmds = [
         "select * from users where age is not null",
+        "select * from users where age is not null;",
         ".exit"
     ]
     lines_not_null = run_db(db_file, not_null_cmds)

@@ -79,7 +79,7 @@ typedef enum {
 } LogicOp;
 
 typedef struct {
-  char          col_name[COL_NAME_SIZE];
+  char          col_name[256];
   bool          is_desc;
   CollationType collation;
 } OrderByItem;
@@ -247,7 +247,7 @@ struct Statement {
 
   /* ORDER BY */
   bool          has_order_by;
-  char          order_by_col[COL_NAME_SIZE];
+  char          order_by_col[256];
   bool          order_by_desc;
   CollationType order_by_collation;
   uint32_t      num_order_by;
