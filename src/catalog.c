@@ -109,6 +109,11 @@ void catalog_load(Catalog* catalog, Pager* pager) {
   catalog->num_tables = (num <= MAX_TABLES) ? num : 0;
   pager->reserved_catalog_pages = 33;
   memcpy(&pager->freelist_head, page0 + 4092, 4);
+  uint64_t saved_lsn = 0;
+  memcpy(&saved_lsn, page0 + 4084, 8);
+  if (saved_lsn > pager->wal_lsn) {
+    pager->wal_lsn = saved_lsn;
+  }
 
   for (uint32_t t = 0; t < catalog->num_tables; t++) {
     uint32_t page_num = (t == 0) ? 0 : (t < 15 ? t : t + 1);
@@ -269,6 +274,7 @@ void catalog_save(Catalog* catalog, Pager* pager) {
 
   uint8_t* p0 = (uint8_t*)get_page(pager, 0);
   memcpy(p0 + 4092, &pager->freelist_head, 4);
+  memcpy(p0 + 4084, &pager->wal_lsn, 8);
 
   if (!pager->use_wal) {
     for (uint32_t p = 0; p < pager->max_pages; p++) {
@@ -317,7 +323,7 @@ static uint32_t get_varint(const uint8_t* p, uint64_t* v) {
   return i;
 }
 
-uint32_t serialize_row_with_ttl(TableDef* def, Value* values, uint64_t expire_at, void* dest) {
+uint32_t serialize_row_with_mvcc(TableDef* def, Value* values, uint64_t expire_at, uint64_t xmin, uint64_t xmax, void* dest) {
   uint8_t* out = (uint8_t*)dest;
   
   uint8_t hdr_buf[PAGE_SIZE];
@@ -458,7 +464,7 @@ uint32_t serialize_row_with_ttl(TableDef* def, Value* values, uint64_t expire_at
   /* If expire_at > 0, append a special varint marker (10 = TTL present) and body */
   if (expire_at > 0) {
     if (hdr_len + 16 <= sizeof(hdr_buf)) {
-      hdr_len += put_varint(hdr_buf + hdr_len, 10); /* 10 = TTL 8-byte uint64 follows in body */
+      hdr_len += put_varint(hdr_buf + hdr_len, SERIAL_TYPE_TTL); /* 10 = TTL 8-byte uint64 follows in body */
     }
     if (body_len + 8 > ser_body_cap) {
       uint32_t new_cap = (body_len + 8 + 4096) * 2;
@@ -470,6 +476,39 @@ uint32_t serialize_row_with_ttl(TableDef* def, Value* values, uint64_t expire_at
       }
     }
     memcpy(ser_body + body_len, &expire_at, 8);
+    body_len += 8;
+  }
+
+  /* If xmin > 0 or xmax > 0, append varint markers and bodies for both */
+  if (xmin > 0 || xmax > 0) {
+    if (hdr_len + 16 <= sizeof(hdr_buf)) {
+      hdr_len += put_varint(hdr_buf + hdr_len, SERIAL_TYPE_XMIN);
+    }
+    if (body_len + 8 > ser_body_cap) {
+      uint32_t new_cap = (body_len + 8 + 4096) * 2;
+      uint8_t* new_buf = (ser_body == stack_body) ? malloc(new_cap) : realloc(ser_body, new_cap);
+      if (new_buf) {
+        if (ser_body == stack_body) memcpy(new_buf, stack_body, body_len);
+        ser_body = new_buf;
+        ser_body_cap = new_cap;
+      }
+    }
+    memcpy(ser_body + body_len, &xmin, 8);
+    body_len += 8;
+
+    if (hdr_len + 16 <= sizeof(hdr_buf)) {
+      hdr_len += put_varint(hdr_buf + hdr_len, SERIAL_TYPE_XMAX);
+    }
+    if (body_len + 8 > ser_body_cap) {
+      uint32_t new_cap = (body_len + 8 + 4096) * 2;
+      uint8_t* new_buf = (ser_body == stack_body) ? malloc(new_cap) : realloc(ser_body, new_cap);
+      if (new_buf) {
+        if (ser_body == stack_body) memcpy(new_buf, stack_body, body_len);
+        ser_body = new_buf;
+        ser_body_cap = new_cap;
+      }
+    }
+    memcpy(ser_body + body_len, &xmax, 8);
     body_len += 8;
   }
 
@@ -498,11 +537,15 @@ uint32_t serialize_row_with_ttl(TableDef* def, Value* values, uint64_t expire_at
   return p;
 }
 
-uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
-  return serialize_row_with_ttl(def, values, 0, dest);
+uint32_t serialize_row_with_ttl(TableDef* def, Value* values, uint64_t expire_at, void* dest) {
+  return serialize_row_with_mvcc(def, values, expire_at, 0, 0, dest);
 }
 
-uint32_t deserialize_row_with_ttl(TableDef* def, void* src, Value* values, uint64_t* out_expire_at) {
+uint32_t serialize_row(TableDef* def, Value* values, void* dest) {
+  return serialize_row_with_mvcc(def, values, 0, 0, 0, dest);
+}
+
+uint32_t deserialize_row_with_mvcc(TableDef* def, void* src, Value* values, uint64_t* out_expire_at, uint64_t* out_xmin, uint64_t* out_xmax) {
   const uint8_t* in = (const uint8_t*)src;
   
   uint64_t total_hdr_size = 0;
@@ -519,53 +562,65 @@ uint32_t deserialize_row_with_ttl(TableDef* def, void* src, Value* values, uint6
     uint64_t serial_type = 0;
     cur_hdr += get_varint(in + cur_hdr, &serial_type);
     
-    value_init(&values[i]);
+    if (values) value_init(&values[i]);
 
     if (serial_type == 0) {
       /* NULL value */
-      values[i].is_null = true;
+      if (values) values[i].is_null = true;
     } else if (serial_type == 1) {
       /* 8-bit signed int */
       int8_t val = (int8_t)in[cur_body++];
-      if (col->type == COL_DOUBLE || col->type == COL_NUMERIC || col->type == COL_DECIMAL) values[i].double_val = val;
-      else if (col->type == COL_FLOAT) values[i].float_val = val;
-      else values[i].int_val = val;
+      if (values) {
+        if (col->type == COL_DOUBLE || col->type == COL_NUMERIC || col->type == COL_DECIMAL) values[i].double_val = val;
+        else if (col->type == COL_FLOAT) values[i].float_val = val;
+        else values[i].int_val = val;
+      }
     } else if (serial_type == 2) {
       /* 16-bit signed int */
       int16_t val;
       memcpy(&val, in + cur_body, 2);
       cur_body += 2;
-      if (col->type == COL_DOUBLE || col->type == COL_NUMERIC || col->type == COL_DECIMAL) values[i].double_val = val;
-      else if (col->type == COL_FLOAT) values[i].float_val = val;
-      else values[i].int_val = val;
+      if (values) {
+        if (col->type == COL_DOUBLE || col->type == COL_NUMERIC || col->type == COL_DECIMAL) values[i].double_val = val;
+        else if (col->type == COL_FLOAT) values[i].float_val = val;
+        else values[i].int_val = val;
+      }
     } else if (serial_type == 4) {
       /* 32-bit signed int */
       int32_t val;
       memcpy(&val, in + cur_body, 4);
       cur_body += 4;
-      if (col->type == COL_DOUBLE || col->type == COL_NUMERIC || col->type == COL_DECIMAL) values[i].double_val = val;
-      else if (col->type == COL_FLOAT) values[i].float_val = val;
-      else values[i].int_val = val;
+      if (values) {
+        if (col->type == COL_DOUBLE || col->type == COL_NUMERIC || col->type == COL_DECIMAL) values[i].double_val = val;
+        else if (col->type == COL_FLOAT) values[i].float_val = val;
+        else values[i].int_val = val;
+      }
     } else if (serial_type == 7) {
       /* 64-bit IEEE double */
       double val;
       memcpy(&val, in + cur_body, 8);
       cur_body += 8;
-      if (col->type == COL_FLOAT) { values[i].float_val = (float)val; values[i].double_val = val; }
-      else if (col->type == COL_DOUBLE || col->type == COL_NUMERIC || col->type == COL_DECIMAL) values[i].double_val = val;
-      else values[i].int_val = (int32_t)val;
+      if (values) {
+        if (col->type == COL_FLOAT) { values[i].float_val = (float)val; values[i].double_val = val; }
+        else if (col->type == COL_DOUBLE || col->type == COL_NUMERIC || col->type == COL_DECIMAL) values[i].double_val = val;
+        else values[i].int_val = (int32_t)val;
+      }
     } else if (serial_type == 8) {
       /* Constant 0 */
-      if (col->type == COL_BOOL) values[i].bool_val = false;
-      else if (col->type == COL_DOUBLE || col->type == COL_NUMERIC || col->type == COL_DECIMAL) values[i].double_val = 0.0;
-      else if (col->type == COL_FLOAT) values[i].float_val = 0.0f;
-      else values[i].int_val = 0;
+      if (values) {
+        if (col->type == COL_BOOL) values[i].bool_val = false;
+        else if (col->type == COL_DOUBLE || col->type == COL_NUMERIC || col->type == COL_DECIMAL) values[i].double_val = 0.0;
+        else if (col->type == COL_FLOAT) values[i].float_val = 0.0f;
+        else values[i].int_val = 0;
+      }
     } else if (serial_type == 9) {
       /* Constant 1 */
-      if (col->type == COL_BOOL) values[i].bool_val = true;
-      else if (col->type == COL_DOUBLE || col->type == COL_NUMERIC || col->type == COL_DECIMAL) values[i].double_val = 1.0;
-      else if (col->type == COL_FLOAT) values[i].float_val = 1.0f;
-      else values[i].int_val = 1;
+      if (values) {
+        if (col->type == COL_BOOL) values[i].bool_val = true;
+        else if (col->type == COL_DOUBLE || col->type == COL_NUMERIC || col->type == COL_DECIMAL) values[i].double_val = 1.0;
+        else if (col->type == COL_FLOAT) values[i].float_val = 1.0f;
+        else values[i].int_val = 1;
+      }
     } else if (serial_type >= 12) {
       /* String/Blob of arbitrary length */
       uint32_t len = 0;
@@ -574,29 +629,49 @@ uint32_t deserialize_row_with_ttl(TableDef* def, void* src, Value* values, uint6
       } else {
         len = (uint32_t)((serial_type - 13) / 2);
       }
-      value_set_text_len(&values[i], (const char*)(in + cur_body), len);
+      if (values) value_set_text_len(&values[i], (const char*)(in + cur_body), len);
       cur_body += len;
     }
   }
 
   uint64_t exp = 0;
-  if (cur_hdr < body_offset) {
+  uint64_t xmin = 0;
+  uint64_t xmax = 0;
+  while (cur_hdr < body_offset) {
     uint64_t extra_type = 0;
-    get_varint(in + cur_hdr, &extra_type);
-    if (extra_type == 10) {
+    cur_hdr += get_varint(in + cur_hdr, &extra_type);
+    if (extra_type == SERIAL_TYPE_TTL) {
       memcpy(&exp, in + cur_body, 8);
       cur_body += 8;
+    } else if (extra_type == SERIAL_TYPE_XMIN) {
+      memcpy(&xmin, in + cur_body, 8);
+      cur_body += 8;
+    } else if (extra_type == SERIAL_TYPE_XMAX) {
+      memcpy(&xmax, in + cur_body, 8);
+      cur_body += 8;
+    } else {
+      break;
     }
   }
   if (out_expire_at) {
     *out_expire_at = exp;
   }
+  if (out_xmin) {
+    *out_xmin = xmin;
+  }
+  if (out_xmax) {
+    *out_xmax = xmax;
+  }
 
   return cur_body;
 }
 
+uint32_t deserialize_row_with_ttl(TableDef* def, void* src, Value* values, uint64_t* out_expire_at) {
+  return deserialize_row_with_mvcc(def, src, values, out_expire_at, NULL, NULL);
+}
+
 uint32_t deserialize_row(TableDef* def, void* src, Value* values) {
-  return deserialize_row_with_ttl(def, src, values, NULL);
+  return deserialize_row_with_mvcc(def, src, values, NULL, NULL, NULL);
 }
 
 void print_row(TableDef* def, Value* values) {

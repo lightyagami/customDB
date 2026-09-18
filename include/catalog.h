@@ -158,9 +158,15 @@ ViewDef*  catalog_find_view(Catalog* catalog, const char* name);
 void      tabledef_compute(TableDef* def);
 
 /* ── Row serialization ───────────────────────────────────────────────────── */
+#define SERIAL_TYPE_TTL   10
+#define SERIAL_TYPE_XMIN  14
+#define SERIAL_TYPE_XMAX  15
+
 uint32_t serialize_row(TableDef* def, Value* values, void* dest);
 uint32_t serialize_row_with_ttl(TableDef* def, Value* values, uint64_t expire_at, void* dest);
+uint32_t serialize_row_with_mvcc(TableDef* def, Value* values, uint64_t expire_at, uint64_t xmin, uint64_t xmax, void* dest);
 uint32_t deserialize_row(TableDef* def, void* src, Value* values);
 uint32_t deserialize_row_with_ttl(TableDef* def, void* src, Value* values, uint64_t* out_expire_at);
+uint32_t deserialize_row_with_mvcc(TableDef* def, void* src, Value* values, uint64_t* out_expire_at, uint64_t* out_xmin, uint64_t* out_xmax);
 void print_row(TableDef* def, Value* values);
 void print_schema(TableDef* def);

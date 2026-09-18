@@ -111,6 +111,10 @@ struct dbms_stmt {
   Cursor* btree_cur;
   Value current_row_vals[MAX_COLUMNS];
   bool has_current_row;
+
+  /* MVCC Snapshot isolation */
+  uint64_t snapshot_xid;
+  bool has_snapshot;
 };
 
 int dbms_open(const char* filename, dbms** ppDb) {
@@ -378,28 +382,35 @@ int dbms_bind_null(dbms_stmt* pStmt, int index) {
 int dbms_step(dbms_stmt* pStmt) {
   if (pStmt == NULL || pStmt->db == NULL) return DBMS_MISUSE;
 
-  if (pStmt->db->file_mutex) pthread_mutex_lock(pStmt->db->file_mutex);
-  pthread_mutex_lock(&pStmt->db->mutex);
-
   if (pStmt->stmt.type == STATEMENT_SELECT) {
+    pthread_mutex_lock(&pStmt->db->mutex);
+
     if (!pStmt->executed) {
       resolve_param_placeholders(&pStmt->stmt);
       pStmt->target_def = catalog_find(&pStmt->db->catalog, pStmt->stmt.table_name);
       if (pStmt->target_def == NULL) {
         pthread_mutex_unlock(&pStmt->db->mutex);
-        if (pStmt->db->file_mutex) pthread_mutex_unlock(pStmt->db->file_mutex);
         return DBMS_ERROR;
       }
+
+      pStmt->snapshot_xid = pager_register_snapshot(pStmt->db->pager);
+      pStmt->has_snapshot = true;
 
       pStmt->target_table = (Table){ pStmt->db->pager, pStmt->target_def };
       pStmt->btree_cur = btree_start(&pStmt->target_table);
       pStmt->executed = true;
     }
 
+    time_t now_ts = time(NULL);
     while (pStmt->btree_cur && !pStmt->btree_cur->end_of_table) {
       value_free_row(pStmt->current_row_vals, MAX_COLUMNS);
-      deserialize_row(pStmt->target_def, cursor_value(pStmt->btree_cur), pStmt->current_row_vals);
+      const void* raw_cell = cursor_value(pStmt->btree_cur);
+      bool visible = row_is_visible_and_active(pStmt->target_def, raw_cell, pStmt->snapshot_xid, pStmt->current_row_vals, (uint64_t)now_ts);
       cursor_advance(pStmt->btree_cur);
+
+      if (!visible) {
+        continue;
+      }
 
       if (pStmt->stmt.where_clause.has_where) {
         if (!eval_where_clause(pStmt->target_def, pStmt->current_row_vals, &pStmt->stmt.where_clause, &pStmt->db->catalog, pStmt->db->pager)) {
@@ -409,7 +420,6 @@ int dbms_step(dbms_stmt* pStmt) {
 
       pStmt->has_current_row = true;
       pthread_mutex_unlock(&pStmt->db->mutex);
-      if (pStmt->db->file_mutex) pthread_mutex_unlock(pStmt->db->file_mutex);
       return DBMS_ROW;
     }
 
@@ -419,12 +429,18 @@ int dbms_step(dbms_stmt* pStmt) {
       free(pStmt->btree_cur);
       pStmt->btree_cur = NULL;
     }
+    if (pStmt->has_snapshot) {
+      pager_unregister_snapshot(pStmt->db->pager, pStmt->snapshot_xid);
+      pStmt->has_snapshot = false;
+    }
     pthread_mutex_unlock(&pStmt->db->mutex);
-    if (pStmt->db->file_mutex) pthread_mutex_unlock(pStmt->db->file_mutex);
     return DBMS_DONE;
   }
 
   /* DML/DDL execution */
+  if (pStmt->db->file_mutex) pthread_mutex_lock(pStmt->db->file_mutex);
+  pthread_mutex_lock(&pStmt->db->mutex);
+
   if (!pStmt->executed) {
     /* Resolve bound '?' parameters before execution */
     resolve_param_placeholders(&pStmt->stmt);
@@ -450,6 +466,10 @@ int dbms_reset(dbms_stmt* pStmt) {
   if (pStmt->btree_cur) {
     free(pStmt->btree_cur);
     pStmt->btree_cur = NULL;
+  }
+  if (pStmt->has_snapshot && pStmt->db && pStmt->db->pager) {
+    pager_unregister_snapshot(pStmt->db->pager, pStmt->snapshot_xid);
+    pStmt->has_snapshot = false;
   }
   value_free_row(pStmt->current_row_vals, MAX_COLUMNS);
   pStmt->executed = false;

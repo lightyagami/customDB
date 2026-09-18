@@ -15,6 +15,34 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
 static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* catalog, Pager* pager);
 static void print_returning_row(Statement* stmt, TableDef* def, Value* row_vals);
 
+bool row_is_visible_and_active(TableDef* def, const void* row_bytes, uint64_t snapshot_xid, Value* out_values, uint64_t now_ts) {
+  uint64_t expire_at = 0;
+  uint64_t xmin = 0;
+  uint64_t xmax = 0;
+
+  deserialize_row_with_mvcc(def, (void*)row_bytes, out_values, &expire_at, &xmin, &xmax);
+
+  /* 1. TTL check */
+  if (expire_at > 0 && now_ts > 0 && (time_t)expire_at < (time_t)now_ts) {
+    value_free_row(out_values, def->num_cols);
+    return false;
+  }
+
+  /* 2. Creation visibility: row created after reader's snapshot */
+  if (xmin > snapshot_xid) {
+    value_free_row(out_values, def->num_cols);
+    return false;
+  }
+
+  /* 3. Deletion visibility: row deleted before or at reader's snapshot */
+  if (xmax != 0 && xmax <= snapshot_xid) {
+    value_free_row(out_values, def->num_cols);
+    return false;
+  }
+
+  return true;
+}
+
 typedef struct {
   char    alias[64];
   char    filename[256];
@@ -352,10 +380,11 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
   bool auto_tx = false;
   if (!pager->in_transaction) {
     pager_begin_transaction(pager);
-    if (pager->lock_error) {
-      return EXECUTE_BUSY;
-    }
     auto_tx = true;
+  }
+  if (!pager_ensure_write_lock(pager)) {
+    if (auto_tx) pager_rollback(pager);
+    return EXECUTE_BUSY;
   }
 
   fire_triggers(catalog, pager, def, NULL, NULL, TRIGGER_BEFORE, TRIGGER_INSERT);
@@ -571,6 +600,8 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     }
   }
 
+  uint64_t txn_xid = pager->current_commit_lsn ? pager->current_commit_lsn : (pager->wal_lsn + 1);
+
   /* Validate UNIQUE constraint across existing rows */
   for (uint32_t c = 1; c < def->num_cols; c++) {
     if (def->columns[c].is_unique) {
@@ -581,7 +612,14 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
         bool u_dup = false;
         while (!u_cur->end_of_table) {
           Value rvals[MAX_COLUMNS];
-          deserialize_row(def, cursor_value(u_cur), rvals);
+          uint64_t r_exp = 0, r_xmin = 0, r_xmax = 0;
+          deserialize_row_with_mvcc(def, cursor_value(u_cur), rvals, &r_exp, &r_xmin, &r_xmax);
+          /* Ignore dead rows */
+          if (r_xmax != 0 && r_xmax <= txn_xid) {
+            value_free_row(rvals, def->num_cols);
+            cursor_advance(u_cur);
+            continue;
+          }
           Value* u_actual = &rvals[c];
 
           bool match = false;
@@ -617,7 +655,13 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     bool dup_found = false;
     while (!cur->end_of_table) {
       Value r_vals[MAX_COLUMNS];
-      deserialize_row(def, cursor_value(cur), r_vals);
+      uint64_t r_exp = 0, r_xmin = 0, r_xmax = 0;
+      deserialize_row_with_mvcc(def, cursor_value(cur), r_vals, &r_exp, &r_xmin, &r_xmax);
+      if (r_xmax != 0 && r_xmax <= txn_xid) {
+        value_free_row(r_vals, def->num_cols);
+        cursor_advance(cur);
+        continue;
+      }
       bool all_pk_match = true;
       for (uint32_t p = 0; p < def->num_pk_cols; p++) {
         int pk_col_idx = -1;
@@ -672,78 +716,89 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     Table main_tbl = { pager, def };
     Cursor cur;
     btree_find_out(&main_tbl, &target_pk, &cur);
-    if (!cur.end_of_table) {
-      void* node = get_page(pager, cur.page_num);
-      uint32_t num_cells = *leaf_node_num_cells(node);
-      if (cur.cell_num < num_cells) {
-        Value existing_key;
-        btree_key_value(&cur, &existing_key);
-        if (compare_values(def->columns[0].type, &existing_key, &target_pk) == 0) {
-          value_free(&existing_key);
-          vdbe_free(vm);
-          if (stmt->conflict_action == CONFLICT_IGNORE) {
+    while (!cur.end_of_table) {
+      Value existing_key;
+      btree_key_value(&cur, &existing_key);
+      if (compare_values(def->columns[0].type, &existing_key, &target_pk) != 0) {
+        value_free(&existing_key);
+        break;
+      }
+      value_free(&existing_key);
+
+      Value r_vals[MAX_COLUMNS];
+      uint64_t r_exp = 0, r_xmin = 0, r_xmax = 0;
+      deserialize_row_with_mvcc(def, cursor_value(&cur), r_vals, &r_exp, &r_xmin, &r_xmax);
+      value_free_row(r_vals, def->num_cols);
+
+      /* If existing cell is live (xmax == 0 or xmax > txn_xid), conflict! */
+      if (r_xmax == 0 || r_xmax > txn_xid) {
+        vdbe_free(vm);
+        if (stmt->conflict_action == CONFLICT_IGNORE) {
+          value_free(&target_pk);
+          if (auto_tx && pager->in_transaction) {
+            catalog_save(catalog, pager);
+            pager_commit(pager);
+          }
+          return EXECUTE_SUCCESS;
+        }
+        if (stmt->conflict_action == CONFLICT_REPLACE) {
+          Statement* del_s = calloc(1, sizeof(Statement));
+          if (del_s) {
+            del_s->type = STATEMENT_DELETE;
+            strcpy(del_s->table_name, def->name);
+            del_s->where_clause.has_where = true;
+            del_s->where_clause.num_conds = 1;
+            strcpy(del_s->where_clause.conds[0].col_name, def->columns[0].name);
+            del_s->where_clause.conds[0].op = OP_EQ;
+            if (def->columns[0].type == COL_INT) snprintf(del_s->where_clause.conds[0].raw_val, sizeof(del_s->where_clause.conds[0].raw_val), "%d", target_pk.int_val);
+            else snprintf(del_s->where_clause.conds[0].raw_val, sizeof(del_s->where_clause.conds[0].raw_val), "%s", target_pk.text_val);
+            run_delete_vm(del_s, def, catalog, pager);
+            free(del_s);
+          }
+          value_free(&target_pk);
+          Statement* retry_s = calloc(1, sizeof(Statement));
+          if (retry_s) {
+            *retry_s = *stmt;
+            retry_s->conflict_action = CONFLICT_ABORT;
+            ExecuteResult res = run_insert_vm(retry_s, def, catalog, pager);
+            free(retry_s);
+            if (auto_tx && pager->in_transaction) {
+              catalog_save(catalog, pager);
+              pager_commit(pager);
+            }
+            return res;
+          }
+        }
+        if (stmt->conflict_action == CONFLICT_UPDATE) {
+          Statement* upd_s = calloc(1, sizeof(Statement));
+          if (upd_s) {
+            upd_s->type = STATEMENT_UPDATE;
+            strcpy(upd_s->table_name, def->name);
+            upd_s->num_set_pairs = stmt->num_set_pairs;
+            memcpy(upd_s->set_pairs, stmt->set_pairs, sizeof(stmt->set_pairs));
+            upd_s->where_clause.has_where = true;
+            upd_s->where_clause.num_conds = 1;
+            strcpy(upd_s->where_clause.conds[0].col_name, def->columns[0].name);
+            upd_s->where_clause.conds[0].op = OP_EQ;
+            if (def->columns[0].type == COL_INT) snprintf(upd_s->where_clause.conds[0].raw_val, sizeof(upd_s->where_clause.conds[0].raw_val), "%d", target_pk.int_val);
+            else snprintf(upd_s->where_clause.conds[0].raw_val, sizeof(upd_s->where_clause.conds[0].raw_val), "%s", target_pk.text_val);
+            ExecuteResult res = run_update_vm(upd_s, def, catalog, pager);
+            free(upd_s);
             value_free(&target_pk);
             if (auto_tx && pager->in_transaction) {
               catalog_save(catalog, pager);
               pager_commit(pager);
             }
-            return EXECUTE_SUCCESS;
+            return res;
           }
-          if (stmt->conflict_action == CONFLICT_REPLACE) {
-            Statement* del_s = calloc(1, sizeof(Statement));
-            if (del_s) {
-              del_s->type = STATEMENT_DELETE;
-              strcpy(del_s->table_name, def->name);
-              del_s->where_clause.has_where = true;
-              del_s->where_clause.num_conds = 1;
-              strcpy(del_s->where_clause.conds[0].col_name, def->columns[0].name);
-              del_s->where_clause.conds[0].op = OP_EQ;
-              if (def->columns[0].type == COL_INT) snprintf(del_s->where_clause.conds[0].raw_val, sizeof(del_s->where_clause.conds[0].raw_val), "%d", target_pk.int_val);
-              else snprintf(del_s->where_clause.conds[0].raw_val, sizeof(del_s->where_clause.conds[0].raw_val), "%s", target_pk.text_val);
-              run_delete_vm(del_s, def, catalog, pager);
-              free(del_s);
-            }
-            value_free(&target_pk);
-            Statement* retry_s = calloc(1, sizeof(Statement));
-            if (retry_s) {
-              *retry_s = *stmt;
-              retry_s->conflict_action = CONFLICT_ABORT;
-              ExecuteResult res = run_insert_vm(retry_s, def, catalog, pager);
-              free(retry_s);
-              return res;
-            }
-          }
-          if (stmt->conflict_action == CONFLICT_UPDATE) {
-            Statement* upd_s = calloc(1, sizeof(Statement));
-            if (upd_s) {
-              upd_s->type = STATEMENT_UPDATE;
-              strcpy(upd_s->table_name, def->name);
-              upd_s->num_set_pairs = stmt->num_set_pairs;
-              memcpy(upd_s->set_pairs, stmt->set_pairs, sizeof(stmt->set_pairs));
-              upd_s->where_clause.has_where = true;
-              upd_s->where_clause.num_conds = 1;
-              strcpy(upd_s->where_clause.conds[0].col_name, def->columns[0].name);
-              upd_s->where_clause.conds[0].op = OP_EQ;
-              if (def->columns[0].type == COL_INT) snprintf(upd_s->where_clause.conds[0].raw_val, sizeof(upd_s->where_clause.conds[0].raw_val), "%d", target_pk.int_val);
-              else snprintf(upd_s->where_clause.conds[0].raw_val, sizeof(upd_s->where_clause.conds[0].raw_val), "%s", target_pk.text_val);
-              ExecuteResult res = run_update_vm(upd_s, def, catalog, pager);
-              free(upd_s);
-              value_free(&target_pk);
-              if (auto_tx && pager->in_transaction) {
-                catalog_save(catalog, pager);
-                pager_commit(pager);
-              }
-              return res;
-            }
-          }
-          value_free(&target_pk);
-          if (auto_tx && pager->in_transaction) {
-            pager_rollback(pager);
-          }
-          return EXECUTE_DUPLICATE_KEY;
         }
-        value_free(&existing_key);
+        value_free(&target_pk);
+        if (auto_tx && pager->in_transaction) {
+          pager_rollback(pager);
+        }
+        return EXECUTE_DUPLICATE_KEY;
       }
+      cursor_advance(&cur);
     }
     value_free(&target_pk);
   }
@@ -2095,12 +2150,10 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
     Value (*all_rows)[MAX_COLUMNS] = malloc(sizeof(Value[MAX_COLUMNS]) * capacity);
 
     time_t now_ts = time(NULL);
+    uint64_t snapshot_xid = pager->wal_lsn;
     while (!cursor->end_of_table) {
       Value row_vals[MAX_COLUMNS];
-      uint64_t row_expire_at = 0;
-      deserialize_row_with_ttl(def, cursor_value(cursor), row_vals, &row_expire_at);
-      if (row_expire_at > 0 && (time_t)row_expire_at < now_ts) {
-        value_free_row(row_vals, def->num_cols);
+      if (!row_is_visible_and_active(def, cursor_value(cursor), snapshot_xid, row_vals, (uint64_t)now_ts)) {
         cursor_advance(cursor);
         continue;
       }
@@ -2277,6 +2330,7 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
     uint32_t count = 0;
     RowSortEntry* entries = malloc(sizeof(RowSortEntry) * capacity);
     time_t now_ts = time(NULL);
+    uint64_t snapshot_xid = pager->wal_lsn;
 
     if (path_type == ACCESS_PK_SEEK) {
       Table table = { pager, def };
@@ -2285,32 +2339,34 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
 
       Cursor* cursor = btree_find(&table, &target_pk);
       if (seek_cond->op == OP_EQ) {
-        if (!cursor->end_of_table) {
+        while (!cursor->end_of_table) {
+          Value cur_pk;
+          btree_key_value(cursor, &cur_pk);
+          int cmp = compare_values(def->columns[0].type, &cur_pk, &target_pk);
+          value_free(&cur_pk);
+          if (cmp != 0) break;
+
           rows_scanned++;
           Value row_vals[MAX_COLUMNS];
-          uint64_t row_expire_at = 0;
-          deserialize_row_with_ttl(def, cursor_value(cursor), row_vals, &row_expire_at);
-          if (compare_values(def->columns[0].type, &row_vals[0], &target_pk) == 0) {
-            if (row_expire_at == 0 || (time_t)row_expire_at >= now_ts) {
-              if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
-                add_selected_row(&entries, &count, &capacity, stmt, def, row_vals);
-              }
+          if (row_is_visible_and_active(def, cursor_value(cursor), snapshot_xid, row_vals, (uint64_t)now_ts)) {
+            if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
+              add_selected_row(&entries, &count, &capacity, stmt, def, row_vals);
             }
+            value_free_row(row_vals, def->num_cols);
+            break; /* Found the visible version for this PK in this snapshot */
           }
-          value_free_row(row_vals, def->num_cols);
+          cursor_advance(cursor);
         }
       } else { /* OP_GT or OP_GTE */
         while (!cursor->end_of_table) {
           rows_scanned++;
           Value row_vals[MAX_COLUMNS];
-          uint64_t row_expire_at = 0;
-          deserialize_row_with_ttl(def, cursor_value(cursor), row_vals, &row_expire_at);
-          if (row_expire_at == 0 || (time_t)row_expire_at >= now_ts) {
+          if (row_is_visible_and_active(def, cursor_value(cursor), snapshot_xid, row_vals, (uint64_t)now_ts)) {
             if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
               add_selected_row(&entries, &count, &capacity, stmt, def, row_vals);
             }
+            value_free_row(row_vals, def->num_cols);
           }
-          value_free_row(row_vals, def->num_cols);
           cursor_advance(cursor);
         }
       }
@@ -2350,18 +2406,22 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
         rows_scanned++;
 
         Cursor* main_cur = btree_find(&main_table, &cur_idx_vals[1]);
-        if (!main_cur->end_of_table) {
+        while (!main_cur->end_of_table) {
+          Value cur_pk;
+          btree_key_value(main_cur, &cur_pk);
+          int cmp = compare_values(def->columns[0].type, &cur_pk, &cur_idx_vals[1]);
+          value_free(&cur_pk);
+          if (cmp != 0) break;
+
           Value row_vals[MAX_COLUMNS];
-          uint64_t row_expire_at = 0;
-          deserialize_row_with_ttl(def, cursor_value(main_cur), row_vals, &row_expire_at);
-          if (compare_values(def->columns[0].type, &row_vals[0], &cur_idx_vals[1]) == 0) {
-            if (row_expire_at == 0 || (time_t)row_expire_at >= now_ts) {
-              if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
-                add_selected_row(&entries, &count, &capacity, stmt, def, row_vals);
-              }
+          if (row_is_visible_and_active(def, cursor_value(main_cur), snapshot_xid, row_vals, (uint64_t)now_ts)) {
+            if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
+              add_selected_row(&entries, &count, &capacity, stmt, def, row_vals);
             }
+            value_free_row(row_vals, def->num_cols);
+            break; /* Found visible row for this PK */
           }
-          value_free_row(row_vals, def->num_cols);
+          cursor_advance(main_cur);
         }
         free(main_cur);
         value_free_row(cur_idx_vals, 2);
@@ -2376,17 +2436,12 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
       while (!cursor->end_of_table) {
         rows_scanned++;
         Value row_vals[MAX_COLUMNS];
-        uint64_t row_expire_at = 0;
-        deserialize_row_with_ttl(def, cursor_value(cursor), row_vals, &row_expire_at);
-        if (row_expire_at > 0 && (time_t)row_expire_at < now_ts) {
+        if (row_is_visible_and_active(def, cursor_value(cursor), snapshot_xid, row_vals, (uint64_t)now_ts)) {
+          if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
+            add_selected_row(&entries, &count, &capacity, stmt, def, row_vals);
+          }
           value_free_row(row_vals, def->num_cols);
-          cursor_advance(cursor);
-          continue;
         }
-        if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
-          add_selected_row(&entries, &count, &capacity, stmt, def, row_vals);
-        }
-        value_free_row(row_vals, def->num_cols);
         cursor_advance(cursor);
       }
       free(cursor);
@@ -2895,16 +2950,14 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
   }
 
   time_t now_ts = time(NULL);
+  uint64_t snapshot_xid = pager->wal_lsn;
   while (!l_cur->end_of_table) {
     if (stream_count >= stream_cap) {
       stream_cap *= 2;
       stream = realloc(stream, sizeof(JoinedStreamRow) * stream_cap);
     }
     Value row_vals[MAX_COLUMNS];
-    uint64_t row_expire_at = 0;
-    deserialize_row_with_ttl(left_def, cursor_value(l_cur), row_vals, &row_expire_at);
-    if (row_expire_at > 0 && (time_t)row_expire_at < now_ts) {
-      value_free_row(row_vals, left_def->num_cols);
+    if (!row_is_visible_and_active(left_def, cursor_value(l_cur), snapshot_xid, row_vals, (uint64_t)now_ts)) {
       cursor_advance(l_cur);
       continue;
     }
@@ -2987,10 +3040,7 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
     Cursor* r_cur = btree_start(&right_tbl);
     while (!r_cur->end_of_table) {
       Value r_vals[MAX_COLUMNS];
-      uint64_t r_expire_at = 0;
-      deserialize_row_with_ttl(right_def, cursor_value(r_cur), r_vals, &r_expire_at);
-      if (r_expire_at > 0 && (time_t)r_expire_at < now_ts) {
-        value_free_row(r_vals, right_def->num_cols);
+      if (!row_is_visible_and_active(right_def, cursor_value(r_cur), snapshot_xid, r_vals, (uint64_t)now_ts)) {
         cursor_advance(r_cur);
         continue;
       }
@@ -3304,12 +3354,10 @@ static ExecuteResult run_aggregate_select(Statement* stmt, TableDef* def, Catalo
   }
 
   time_t now_ts = time(NULL);
+  uint64_t snapshot_xid = pager->wal_lsn;
   while (!cursor->end_of_table) {
     Value row_vals[MAX_COLUMNS];
-    uint64_t row_expire_at = 0;
-    deserialize_row_with_ttl(def, cursor_value(cursor), row_vals, &row_expire_at);
-    if (row_expire_at > 0 && (time_t)row_expire_at < now_ts) {
-      value_free_row(row_vals, def->num_cols);
+    if (!row_is_visible_and_active(def, cursor_value(cursor), snapshot_xid, row_vals, (uint64_t)now_ts)) {
       cursor_advance(cursor);
       continue;
     }
@@ -3404,12 +3452,10 @@ static ExecuteResult run_group_by_select(Statement* stmt, TableDef* def, Catalog
   uint32_t num_buckets = 0;
 
   time_t now_ts = time(NULL);
+  uint64_t snapshot_xid = pager->wal_lsn;
   while (!cursor->end_of_table) {
     Value row_vals[MAX_COLUMNS];
-    uint64_t row_expire_at = 0;
-    deserialize_row_with_ttl(def, cursor_value(cursor), row_vals, &row_expire_at);
-    if (row_expire_at > 0 && (time_t)row_expire_at < now_ts) {
-      value_free_row(row_vals, def->num_cols);
+    if (!row_is_visible_and_active(def, cursor_value(cursor), snapshot_xid, row_vals, (uint64_t)now_ts)) {
       cursor_advance(cursor);
       continue;
     }
@@ -3943,6 +3989,18 @@ bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog*
 
 /* Compile and run DELETE statement on VDBE */
 static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* catalog, Pager* pager) {
+  bool auto_tx = false;
+  if (!pager->in_transaction) {
+    pager_begin_transaction(pager);
+    auto_tx = true;
+  }
+  if (!pager_ensure_write_lock(pager)) {
+    if (auto_tx) pager_rollback(pager);
+    return EXECUTE_BUSY;
+  }
+  uint64_t txn_xid = pager->current_commit_lsn ? pager->current_commit_lsn : (pager->wal_lsn + 1);
+  time_t now_ts = time(NULL);
+
   /* 1. Scan table and collect IDs of matching rows */
   Table table = { pager, def };
   Cursor* cursor = btree_start(&table);
@@ -3961,42 +4019,48 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
         Cursor* c_cur = btree_start(&child_tbl);
         while (!c_cur->end_of_table) {
           Value c_row[MAX_COLUMNS];
-          deserialize_row(child_def, cursor_value(c_cur), c_row);
-          Value* child_val = &c_row[cc];
+          if (row_is_visible_and_active(child_def, cursor_value(c_cur), txn_xid, c_row, (uint64_t)now_ts)) {
+            Value* child_val = &c_row[cc];
 
-          /* Check if this child row references any row queued for deletion */
-          Cursor* p_cur = btree_start(&table);
-          while (!p_cur->end_of_table) {
-            Value p_row[MAX_COLUMNS];
-            deserialize_row(def, cursor_value(p_cur), p_row);
-            if (eval_where_clause(def, p_row, &stmt->where_clause, catalog, pager)) {
-              int target_pcol = 0;
-              for (uint32_t pc = 0; pc < def->num_cols; pc++) {
-                if (strcmp(def->columns[pc].name, child_def->columns[cc].fk_target_col) == 0) {
-                  target_pcol = (int)pc;
-                  break;
+            /* Check if this child row references any row queued for deletion */
+            Cursor* p_cur = btree_start(&table);
+            while (!p_cur->end_of_table) {
+              Value p_row[MAX_COLUMNS];
+              if (row_is_visible_and_active(def, cursor_value(p_cur), txn_xid, p_row, (uint64_t)now_ts)) {
+                if (eval_where_clause(def, p_row, &stmt->where_clause, catalog, pager)) {
+                  int target_pcol = 0;
+                  for (uint32_t pc = 0; pc < def->num_cols; pc++) {
+                    if (strcmp(def->columns[pc].name, child_def->columns[cc].fk_target_col) == 0) {
+                      target_pcol = (int)pc;
+                      break;
+                    }
+                  }
+                  Value* parent_val = &p_row[target_pcol];
+                  bool match = false;
+                  ColumnType ktype = def->columns[target_pcol].type;
+                  if (ktype == COL_INT) match = (child_val->int_val == parent_val->int_val);
+                  else if (ktype == COL_FLOAT) match = (child_val->float_val == parent_val->float_val);
+                  else if (ktype == COL_DOUBLE) match = (child_val->double_val == parent_val->double_val);
+                  else if (ktype == COL_BOOL) match = (child_val->bool_val == parent_val->bool_val);
+                  else match = (strcmp(child_val->text_val, parent_val->text_val) == 0);
+
+                  if (match) {
+                    value_free_row(p_row, def->num_cols);
+                    value_free_row(c_row, child_def->num_cols);
+                    free(p_cur);
+                    free(c_cur);
+                    free(cursor);
+                    free(matching_ids);
+                    return EXECUTE_CONSTRAINT_FOREIGN_KEY;
+                  }
                 }
+                value_free_row(p_row, def->num_cols);
               }
-              Value* parent_val = &p_row[target_pcol];
-              bool match = false;
-              ColumnType ktype = def->columns[target_pcol].type;
-              if (ktype == COL_INT) match = (child_val->int_val == parent_val->int_val);
-              else if (ktype == COL_FLOAT) match = (child_val->float_val == parent_val->float_val);
-              else if (ktype == COL_DOUBLE) match = (child_val->double_val == parent_val->double_val);
-              else if (ktype == COL_BOOL) match = (child_val->bool_val == parent_val->bool_val);
-              else match = (strcmp(child_val->text_val, parent_val->text_val) == 0);
-
-              if (match) {
-                free(p_cur);
-                free(c_cur);
-                free(cursor);
-                free(matching_ids);
-                return EXECUTE_CONSTRAINT_FOREIGN_KEY;
-              }
+              cursor_advance(p_cur);
             }
-            cursor_advance(p_cur);
+            free(p_cur);
+            value_free_row(c_row, child_def->num_cols);
           }
-          free(p_cur);
           cursor_advance(c_cur);
         }
         free(c_cur);
@@ -4006,68 +4070,46 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
 
   while (!cursor->end_of_table) {
     Value row_vals[MAX_COLUMNS];
-    deserialize_row(def, cursor_value(cursor), row_vals);
-    
-    if (eval_where_clause(def, row_vals, &stmt->where_clause, catalog, pager)) {
-      if (count >= capacity) {
-        capacity *= 2;
-        matching_ids = realloc(matching_ids, sizeof(int32_t) * capacity);
+    if (row_is_visible_and_active(def, cursor_value(cursor), txn_xid, row_vals, (uint64_t)now_ts)) {
+      if (eval_where_clause(def, row_vals, &stmt->where_clause, catalog, pager)) {
+        if (count >= capacity) {
+          capacity *= 2;
+          matching_ids = realloc(matching_ids, sizeof(int32_t) * capacity);
+        }
+        matching_ids[count++] = row_vals[0].int_val;
       }
-      matching_ids[count++] = row_vals[0].int_val;
+      value_free_row(row_vals, def->num_cols);
     }
-    value_free_row(row_vals, def->num_cols);
     cursor_advance(cursor);
   }
   free(cursor);
 
-  /* 2. Delete each matching row and its secondary index entries */
+  /* 2. Soft-delete each matching row (MVCC: stamp xmax = txn_xid) */
   for (uint32_t i = 0; i < count; i++) {
     Value target_id;
     memset(&target_id, 0, sizeof(Value));
     target_id.int_val = matching_ids[i];
     
     Cursor* cur = btree_find(&table, &target_id);
-    void* node = get_page(pager, cur->page_num);
-    uint32_t num_cells = *leaf_node_num_cells(node);
-    if (cur->cell_num < num_cells) {
+    while (!cur->end_of_table) {
       Value existing_key;
       btree_key_value(cur, &existing_key);
-      if (existing_key.int_val == target_id.int_val) {
-        Value values[MAX_COLUMNS];
-        deserialize_row(def, cursor_value(cur), values);
+      if (existing_key.int_val != target_id.int_val) {
+        value_free(&existing_key);
+        break;
+      }
+      value_free(&existing_key);
+
+      Value values[MAX_COLUMNS];
+      if (row_is_visible_and_active(def, cursor_value(cur), txn_xid, values, (uint64_t)now_ts)) {
+        uint64_t expire_at = 0, old_xmin = 0, old_xmax = 0;
+        deserialize_row_with_mvcc(def, cursor_value(cur), NULL, &expire_at, &old_xmin, &old_xmax);
+        (void)old_xmax;
         
         fire_triggers(catalog, pager, def, values, NULL, TRIGGER_BEFORE, TRIGGER_DELETE);
 
-        /* Delete secondary index entries */
-        for (uint32_t c = 1; c < def->num_cols; c++) {
-          if (def->columns[c].has_index) {
-            TableDef idx_def;
-            memset(&idx_def, 0, sizeof(TableDef));
-            make_idx_name(idx_def.name, def->name, def->columns[c].name);
-            idx_def.root_page_num = def->columns[c].index_root_page;
-            idx_def.num_cols = 2;
-            memcpy(&idx_def.columns[0], &def->columns[c], sizeof(Column));
-            strcpy(idx_def.columns[1].name, "id");
-            idx_def.columns[1].type = COL_INT;
-            idx_def.columns[1].size = 4;
-            tabledef_compute(&idx_def);
-
-            Table idx_table = { pager, &idx_def };
-            Cursor* idx_cur = btree_find(&idx_table, &values[c]);
-            while (!idx_cur->end_of_table) {
-              Value cur_idx_vals[2];
-              deserialize_row(&idx_def, cursor_value(idx_cur), cur_idx_vals);
-              if (cur_idx_vals[1].int_val == values[0].int_val) {
-                btree_delete(idx_cur);
-                value_free_row(cur_idx_vals, 2);
-                break;
-              }
-              value_free_row(cur_idx_vals, 2);
-              cursor_advance(idx_cur);
-            }
-            free(idx_cur);
-          }
-        }
+        /* Secondary index entries are NOT deleted during MVCC delete;
+           they remain valid for older snapshots and will be cleaned up during vacuum_mvcc. */
 
         /* Check foreign key ON DELETE CASCADE */
         for (uint32_t t = 0; t < catalog->num_tables; t++) {
@@ -4105,13 +4147,18 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
           }
         }
 
-        /* Delete from main table */
+        /* Non-destructive delete: replace the cell with xmax = txn_xid */
         btree_delete(cur);
+        Cursor* ins_cur = btree_find(&table, &target_id);
+        btree_insert_with_mvcc(ins_cur, values, expire_at, old_xmin, txn_xid);
+        free(ins_cur);
+
         fire_triggers(catalog, pager, def, values, NULL, TRIGGER_AFTER, TRIGGER_DELETE);
         print_returning_row(stmt, def, values);
         value_free_row(values, def->num_cols);
+        break;
       }
-      value_free(&existing_key);
+      cursor_advance(cur);
     }
     free(cur);
   }
@@ -4120,11 +4167,27 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
   if (pager->auto_vacuum) {
     execute_vacuum(catalog, pager);
   }
+  if (auto_tx && pager->in_transaction) {
+    catalog_save(catalog, pager);
+    pager_commit(pager);
+  }
   return EXECUTE_SUCCESS;
 }
 
 /* Compile and run UPDATE statement on VDBE */
 static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* catalog, Pager* pager) {
+  bool auto_tx = false;
+  if (!pager->in_transaction) {
+    pager_begin_transaction(pager);
+    auto_tx = true;
+  }
+  if (!pager_ensure_write_lock(pager)) {
+    if (auto_tx) pager_rollback(pager);
+    return EXECUTE_BUSY;
+  }
+  uint64_t txn_xid = pager->current_commit_lsn ? pager->current_commit_lsn : (pager->wal_lsn + 1);
+  time_t now_ts = time(NULL);
+
   /* 1. Scan table and collect IDs of matching rows */
   Table table = { pager, def };
   Cursor* cursor = btree_start(&table);
@@ -4135,70 +4198,46 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
   
   while (!cursor->end_of_table) {
     Value row_vals[MAX_COLUMNS];
-    deserialize_row(def, cursor_value(cursor), row_vals);
-    
-    if (eval_where_clause(def, row_vals, &stmt->where_clause, catalog, pager)) {
-      if (count >= capacity) {
-        capacity *= 2;
-        matching_ids = realloc(matching_ids, sizeof(int32_t) * capacity);
+    if (row_is_visible_and_active(def, cursor_value(cursor), txn_xid, row_vals, (uint64_t)now_ts)) {
+      if (eval_where_clause(def, row_vals, &stmt->where_clause, catalog, pager)) {
+        if (count >= capacity) {
+          capacity *= 2;
+          matching_ids = realloc(matching_ids, sizeof(int32_t) * capacity);
+        }
+        matching_ids[count++] = row_vals[0].int_val;
       }
-      matching_ids[count++] = row_vals[0].int_val;
+      value_free_row(row_vals, def->num_cols);
     }
-    value_free_row(row_vals, def->num_cols);
     cursor_advance(cursor);
   }
   free(cursor);
 
-  /* 2. Update each matching row and its secondary index entries */
+  /* 2. Update each matching row (MVCC: old.xmax = txn_xid, new.xmin = txn_xid) */
   for (uint32_t i = 0; i < count; i++) {
     Value target_id;
     memset(&target_id, 0, sizeof(Value));
     target_id.int_val = matching_ids[i];
     
     Cursor* cur = btree_find(&table, &target_id);
-    void* node = get_page(pager, cur->page_num);
-    uint32_t num_cells = *leaf_node_num_cells(node);
-    if (cur->cell_num < num_cells) {
+    while (!cur->end_of_table) {
       Value existing_key;
       btree_key_value(cur, &existing_key);
-      if (existing_key.int_val == target_id.int_val) {
-        Value old_values[MAX_COLUMNS];
-        deserialize_row(def, cursor_value(cur), old_values);
+      if (existing_key.int_val != target_id.int_val) {
+        value_free(&existing_key);
+        break;
+      }
+      value_free(&existing_key);
+
+      Value old_values[MAX_COLUMNS];
+      if (row_is_visible_and_active(def, cursor_value(cur), txn_xid, old_values, (uint64_t)now_ts)) {
+        uint64_t expire_at = 0, old_xmin = 0, old_xmax = 0;
+        deserialize_row_with_mvcc(def, cursor_value(cur), NULL, &expire_at, &old_xmin, &old_xmax);
+        (void)old_xmax;
+
         Value values[MAX_COLUMNS];
         for (uint32_t c = 0; c < def->num_cols; c++) {
           value_init(&values[c]);
           value_copy(&values[c], &old_values[c]);
-        }
-        
-        /* Delete from secondary indexes first */
-        for (uint32_t c = 1; c < def->num_cols; c++) {
-          if (def->columns[c].has_index) {
-            TableDef idx_def;
-            memset(&idx_def, 0, sizeof(TableDef));
-            make_idx_name(idx_def.name, def->name, def->columns[c].name);
-            idx_def.root_page_num = def->columns[c].index_root_page;
-            idx_def.num_cols = 2;
-            memcpy(&idx_def.columns[0], &def->columns[c], sizeof(Column));
-            strcpy(idx_def.columns[1].name, "id");
-            idx_def.columns[1].type = COL_INT;
-            idx_def.columns[1].size = 4;
-            tabledef_compute(&idx_def);
-
-            Table idx_table = { pager, &idx_def };
-            Cursor* idx_cur = btree_find(&idx_table, &old_values[c]);
-            while (!idx_cur->end_of_table) {
-              Value cur_idx_vals[2];
-              deserialize_row(&idx_def, cursor_value(idx_cur), cur_idx_vals);
-              if (cur_idx_vals[1].int_val == old_values[0].int_val) {
-                btree_delete(idx_cur);
-                value_free_row(cur_idx_vals, 2);
-                break;
-              }
-              value_free_row(cur_idx_vals, 2);
-              cursor_advance(idx_cur);
-            }
-            free(idx_cur);
-          }
         }
         
         /* Apply updates */
@@ -4213,6 +4252,8 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
             }
           }
           if (col_idx < 0) {
+            value_free_row(old_values, def->num_cols);
+            value_free_row(values, def->num_cols);
             free(cur);
             free(matching_ids);
             return EXECUTE_BAD_SCHEMA;
@@ -4249,19 +4290,29 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
         /* Fire BEFORE UPDATE trigger with old and new values */
         fire_triggers(catalog, pager, def, old_values, values, TRIGGER_BEFORE, TRIGGER_UPDATE);
 
-        /* Delete current main table entry */
+        /* 1. Mark old row version dead (xmax = txn_xid) */
         btree_delete(cur);
-        free(cur);
-        
-        /* Re-insert updated values to main table */
-        Cursor* ins_cursor = btree_find(&table, &values[0]);
-        btree_insert(ins_cursor, values);
-        free(ins_cursor);
+        Cursor* ins_old = btree_find(&table, &target_id);
+        btree_insert_with_mvcc(ins_old, old_values, expire_at, old_xmin, txn_xid);
+        free(ins_old);
 
-        /* Re-insert updated values to secondary indexes */
+        /* 2. Insert new row version (xmin = txn_xid, xmax = 0) */
+        Cursor* ins_new = btree_find(&table, &values[0]);
+        btree_insert_with_mvcc(ins_new, values, expire_at, txn_xid, 0);
+        free(ins_new);
+
+        /* 3. Heap-Only Tuple (HOT) secondary index optimization:
+              Only insert into secondary index if the indexed column value changed! */
         for (uint32_t c = 1; c < def->num_cols; c++) {
           if (def->columns[c].has_index) {
             Column* icol = &def->columns[c];
+            bool col_changed = (old_values[c].is_null != values[c].is_null) ||
+                               (compare_values(icol->type, &old_values[c], &values[c]) != 0);
+            if (!col_changed) {
+              /* HOT: column value unchanged, index already routes to PK */
+              continue;
+            }
+
             if (icol->idx_is_partial) {
               WhereClause idx_where;
               memset(&idx_where, 0, sizeof(WhereClause));
@@ -4357,14 +4408,18 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
         print_returning_row(stmt, def, values);
         value_free_row(old_values, def->num_cols);
         value_free_row(values, def->num_cols);
+        break;
       }
-      value_free(&existing_key);
-    } else {
-      free(cur);
+      cursor_advance(cur);
     }
+    free(cur);
   }
   
   free(matching_ids);
+  if (auto_tx && pager->in_transaction) {
+    catalog_save(catalog, pager);
+    pager_commit(pager);
+  }
   return EXECUTE_SUCCESS;
 }
 
@@ -4485,6 +4540,16 @@ static ExecuteResult execute_create_index(Statement* stmt, Catalog* catalog, Pag
     return EXECUTE_TABLE_NOT_FOUND;
   }
 
+  bool auto_tx = false;
+  if (!pager->in_transaction) {
+    pager_begin_transaction(pager);
+    auto_tx = true;
+  }
+  if (!pager_ensure_write_lock(pager)) {
+    if (auto_tx) pager_rollback(pager);
+    return EXECUTE_BUSY;
+  }
+
   int col_idx = -1;
   for (uint32_t i = 0; i < def->num_cols; i++) {
     if (strcmp(def->columns[i].name, stmt->index_col_name) == 0) {
@@ -4493,11 +4558,13 @@ static ExecuteResult execute_create_index(Statement* stmt, Catalog* catalog, Pag
     }
   }
   if (col_idx == -1) {
+    if (auto_tx) pager_rollback(pager);
     return EXECUTE_BAD_SCHEMA;
   }
 
   Column* col = &def->columns[col_idx];
   if (col->has_index) {
+    if (auto_tx) pager_rollback(pager);
     printf("Index on column '%s' already exists.\n", col->name);
     return EXECUTE_SUCCESS;
   }
@@ -4590,6 +4657,11 @@ static ExecuteResult execute_create_index(Statement* stmt, Catalog* catalog, Pag
     }
   } else {
     strcpy(cols_str, col->name);
+  }
+
+  if (auto_tx && pager->in_transaction) {
+    catalog_save(catalog, pager);
+    pager_commit(pager);
   }
 
   printf("Index '%s' created on %s(%s) with root page %u.\n",
@@ -4957,6 +5029,76 @@ static ExecuteResult execute_pragma(Statement* stmt, Catalog* catalog, Pager* pa
     printf("Reaped %u expired row(s).\n", total_reaped);
     return EXECUTE_SUCCESS;
   }
+  if (strcasecmp(stmt->pragma_name, "vacuum_mvcc") == 0) {
+    uint64_t min_active = pager_get_min_active_snapshot_xid(pager);
+    uint32_t purged_count = 0;
+    time_t now_ts = time(NULL);
+
+    for (uint32_t t = 0; t < catalog->num_tables; t++) {
+      TableDef* def = &catalog->tables[t];
+      if (def->is_virtual) continue;
+
+      Table table = { pager, def };
+      Cursor* cur = btree_start(&table);
+
+      while (!cur->end_of_table) {
+        Value row_vals[MAX_COLUMNS];
+        uint64_t expire_at = 0, xmin = 0, xmax = 0;
+        deserialize_row_with_mvcc(def, cursor_value(cur), row_vals, &expire_at, &xmin, &xmax);
+
+        bool is_dead = false;
+        if (xmax != 0 && xmax <= min_active) {
+          is_dead = true;
+        } else if (expire_at > 0 && (time_t)expire_at < now_ts) {
+          is_dead = true;
+        }
+
+        if (is_dead) {
+          /* Purge from secondary indexes */
+          for (uint32_t c = 1; c < def->num_cols; c++) {
+            if (def->columns[c].has_index) {
+              TableDef idx_def;
+              memset(&idx_def, 0, sizeof(TableDef));
+              make_idx_name(idx_def.name, def->name, def->columns[c].name);
+              idx_def.root_page_num = def->columns[c].index_root_page;
+              idx_def.num_cols = 2;
+              memcpy(&idx_def.columns[0], &def->columns[c], sizeof(Column));
+              strcpy(idx_def.columns[1].name, "id");
+              idx_def.columns[1].type = COL_INT;
+              idx_def.columns[1].size = 4;
+              tabledef_compute(&idx_def);
+
+              Table idx_table = { pager, &idx_def };
+              Cursor* idx_cur = btree_find(&idx_table, &row_vals[c]);
+              while (!idx_cur->end_of_table) {
+                Value cur_idx_vals[2];
+                deserialize_row(&idx_def, cursor_value(idx_cur), cur_idx_vals);
+                if (cur_idx_vals[1].int_val == row_vals[0].int_val) {
+                  btree_delete(idx_cur);
+                  value_free_row(cur_idx_vals, 2);
+                  break;
+                }
+                value_free_row(cur_idx_vals, 2);
+                cursor_advance(idx_cur);
+              }
+              free(idx_cur);
+            }
+          }
+
+          /* Physically delete the dead row version from the main table */
+          btree_delete(cur);
+          purged_count++;
+          /* btree_delete advances cur to the shifted next cell */
+        } else {
+          cursor_advance(cur);
+        }
+        value_free_row(row_vals, def->num_cols);
+      }
+      free(cur);
+    }
+    printf("Vacuumed %u dead MVCC row version(s).\n", purged_count);
+    return EXECUTE_SUCCESS;
+  }
   if (strcasecmp(stmt->pragma_name, "integrity_check") == 0) {
     printf("ok\n");
     return EXECUTE_SUCCESS;
@@ -5257,6 +5399,7 @@ static ExecuteResult execute_alter_table(Statement* stmt, Catalog* catalog, Page
 }
 
 ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager) {
+  pager_refresh_if_modified(pager);
   if (stmt->type == STATEMENT_ALTER_TABLE) {
     return execute_alter_table(stmt, catalog, pager);
   }

@@ -1,4 +1,5 @@
 #include "vdbe.h"
+#include "executor.h"
 
 Vdbe* vdbe_create(Pager* pager, Catalog* catalog) {
   Vdbe* vm = malloc(sizeof(Vdbe));
@@ -7,6 +8,7 @@ Vdbe* vdbe_create(Pager* pager, Catalog* catalog) {
   vm->catalog = catalog;
   vm->max_insts = 16;
   vm->insts = malloc(sizeof(Instruction) * vm->max_insts);
+  vm->snapshot_xid = pager_register_snapshot(pager);
   return vm;
 }
 
@@ -40,6 +42,9 @@ static int compare_sorter_entries(const void* a, const void* b) {
 
 void vdbe_free(Vdbe* vm) {
   if (!vm) return;
+  if (vm->pager) {
+    pager_unregister_snapshot(vm->pager, vm->snapshot_xid);
+  }
   for (uint32_t c = 0; c < MAX_CURSORS; c++) {
     if (vm->cursors[c].is_open) {
       if (vm->cursors[c].btree_cursor) {
@@ -94,7 +99,6 @@ void vdbe_run(Vdbe* vm) {
         if (i->p1 == 1) {
           pager_begin_transaction(vm->pager);
         } else if (i->p1 == 2) {
-          catalog_save(vm->catalog, vm->pager);
           pager_commit(vm->pager);
         } else if (i->p1 == 3) {
           pager_rollback(vm->pager);
@@ -178,6 +182,16 @@ void vdbe_run(Vdbe* vm) {
         VmCursor* vc = &vm->cursors[cursor_idx];
         if (vc->btree_cursor) free(vc->btree_cursor);
         vc->btree_cursor = btree_start(&vc->table_handle);
+        bool is_index = (strncmp(vc->def.name, "_idx_", 5) == 0);
+        time_t now_ts = time(NULL);
+        while (!vc->btree_cursor->end_of_table && !is_index) {
+          Value r_vals[MAX_COLUMNS];
+          if (row_is_visible_and_active(&vc->def, cursor_value(vc->btree_cursor), vm->snapshot_xid, r_vals, (uint64_t)now_ts)) {
+            value_free_row(r_vals, vc->def.num_cols);
+            break;
+          }
+          cursor_advance(vc->btree_cursor);
+        }
         if (vc->btree_cursor->end_of_table) {
           vm->pc = jump_pc;
         }
@@ -187,7 +201,18 @@ void vdbe_run(Vdbe* vm) {
         uint32_t cursor_idx = i->p1;
         uint32_t jump_pc = i->p2;
         VmCursor* vc = &vm->cursors[cursor_idx];
-        cursor_advance(vc->btree_cursor);
+        bool is_index = (strncmp(vc->def.name, "_idx_", 5) == 0);
+        time_t now_ts = time(NULL);
+        do {
+          cursor_advance(vc->btree_cursor);
+          if (vc->btree_cursor->end_of_table || is_index) break;
+          Value r_vals[MAX_COLUMNS];
+          if (row_is_visible_and_active(&vc->def, cursor_value(vc->btree_cursor), vm->snapshot_xid, r_vals, (uint64_t)now_ts)) {
+            value_free_row(r_vals, vc->def.num_cols);
+            break;
+          }
+        } while (!vc->btree_cursor->end_of_table);
+
         if (vc->btree_cursor->end_of_table) {
           /* Do not jump, proceed to next instruction */
         } else {
@@ -203,9 +228,17 @@ void vdbe_run(Vdbe* vm) {
         if (vc->btree_cursor) free(vc->btree_cursor);
         
         vc->btree_cursor = btree_find(&vc->table_handle, &vm->regs[reg_idx].val);
-        void* node = get_page(vm->pager, vc->btree_cursor->page_num);
-        uint32_t num_cells = *leaf_node_num_cells(node);
-        if (vc->btree_cursor->cell_num >= num_cells) {
+        bool is_index = (strncmp(vc->def.name, "_idx_", 5) == 0);
+        time_t now_ts = time(NULL);
+        while (!vc->btree_cursor->end_of_table && !is_index) {
+          Value r_vals[MAX_COLUMNS];
+          if (row_is_visible_and_active(&vc->def, cursor_value(vc->btree_cursor), vm->snapshot_xid, r_vals, (uint64_t)now_ts)) {
+            value_free_row(r_vals, vc->def.num_cols);
+            break;
+          }
+          cursor_advance(vc->btree_cursor);
+        }
+        if (vc->btree_cursor->end_of_table) {
           vm->pc = jump_pc;
         }
         break;
@@ -218,21 +251,25 @@ void vdbe_run(Vdbe* vm) {
         if (vc->btree_cursor) free(vc->btree_cursor);
         
         vc->btree_cursor = btree_find(&vc->table_handle, &vm->regs[reg_idx].val);
-        void* node = get_page(vm->pager, vc->btree_cursor->page_num);
-        uint32_t num_cells = *leaf_node_num_cells(node);
-        if (vc->btree_cursor->cell_num >= num_cells) {
-          vm->pc = jump_pc;
-        } else {
-          /* Skip keys that are equal to register value */
+        bool is_index = (strncmp(vc->def.name, "_idx_", 5) == 0);
+        time_t now_ts = time(NULL);
+        while (!vc->btree_cursor->end_of_table) {
           Value existing_val;
           btree_key_value(vc->btree_cursor, &existing_val);
           int cmp = compare_values(vc->def.columns[0].type, &existing_val, &vm->regs[reg_idx].val);
-          if (cmp == 0) {
-            cursor_advance(vc->btree_cursor);
-            if (vc->btree_cursor->end_of_table) {
-              vm->pc = jump_pc;
+          value_free(&existing_val);
+          if (cmp > 0) {
+            if (is_index) break;
+            Value r_vals[MAX_COLUMNS];
+            if (row_is_visible_and_active(&vc->def, cursor_value(vc->btree_cursor), vm->snapshot_xid, r_vals, (uint64_t)now_ts)) {
+              value_free_row(r_vals, vc->def.num_cols);
+              break;
             }
           }
+          cursor_advance(vc->btree_cursor);
+        }
+        if (vc->btree_cursor->end_of_table) {
+          vm->pc = jump_pc;
         }
         break;
       }
@@ -370,7 +407,8 @@ void vdbe_run(Vdbe* vm) {
 
         Cursor bcur;
         btree_find_out(&vc->table_handle, &values[0], &bcur);
-        btree_insert_with_ttl(&bcur, values, expire_at);
+        uint64_t txn_xid = vm->pager->current_commit_lsn ? vm->pager->current_commit_lsn : (vm->pager->wal_lsn + 1);
+        btree_insert_with_mvcc(&bcur, values, expire_at, txn_xid, 0);
         value_free_row(values, vc->def.num_cols);
         break;
       }

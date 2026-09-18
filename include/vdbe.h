@@ -86,6 +86,7 @@ typedef struct {
   bool         cmp_result;
   uint32_t     pc;
   VmSorter     sorter;
+  uint64_t     snapshot_xid;
 } Vdbe;
 
 Vdbe* vdbe_create(Pager* pager, Catalog* catalog);

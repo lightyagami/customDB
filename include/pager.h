@@ -64,6 +64,20 @@ typedef struct {
   /* Table-Level Fine-Grained Concurrency Locks */
   pthread_rwlock_t table_rwlocks[MAX_TABLES];
 
+  /* MVCC Concurrency, Shadow-Page COW & Snapshot Epoch Registry */
+  void**           shadow_pages;
+  bool*            is_shadowed;
+  uint32_t         shadow_capacity;
+  pthread_t        writer_tid;
+  pthread_mutex_t  swap_mutex;
+  pthread_mutex_t  epoch_mutex;
+  pthread_mutex_t  writer_mutex;
+  struct {
+    uint64_t snapshot_xid;
+    bool     active;
+  } active_snapshots[64];
+  struct RetiredPage* retired_pages_head;
+
   /* Set to true if a lock could not be acquired after retries.
    * Callers should check this and propagate the error rather than
    * proceeding with potentially unsafe writes. */
@@ -73,6 +87,12 @@ typedef struct {
   uint64_t disk_reads;
   uint64_t cache_hits;
 } Pager;
+
+typedef struct RetiredPage {
+  void* buffer;
+  uint64_t retired_lsn;
+  struct RetiredPage* next;
+} RetiredPage;
 
 Pager*   pager_open(const char* filename);
 void     pager_reset_stats(Pager* pager);
@@ -88,6 +108,7 @@ void     pager_unlock(Pager* pager);
 
 /* Transactions & ACID Journaling */
 void     pager_begin_transaction(Pager* pager);
+bool     pager_ensure_write_lock(Pager* pager);
 void     pager_journal_page(Pager* pager, uint32_t page_num);
 void     pager_commit(Pager* pager);
 void     pager_rollback(Pager* pager);
@@ -104,3 +125,11 @@ void     pager_backup(Pager* pager, const char* dest_filename);
 bool     pager_restore(const char* src_file, const char* dest_file,
                        uint64_t until_ts, bool use_ts,
                        uint64_t until_lsn, bool use_lsn);
+
+/* MVCC Snapshot Registry & Epoch Reclamation */
+uint64_t pager_register_snapshot(Pager* pager);
+void     pager_unregister_snapshot(Pager* pager, uint64_t snapshot_xid);
+uint64_t pager_get_min_active_snapshot_xid(Pager* pager);
+void     pager_reclaim_retired_pages(Pager* pager);
+void     pager_shadow_page_write(Pager* pager, uint32_t page_num);
+void     pager_refresh_if_modified(Pager* pager);

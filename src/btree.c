@@ -335,7 +335,7 @@ __attribute__((destructor)) static void btree_thread_cleanup(void) {
   }
 }
 
-static void serialize_cell_for_leaf(TableDef* def, Value* values, uint64_t expire_at, Pager* pager, uint8_t* out_cell, uint32_t* out_cell_size) {
+static void serialize_cell_for_leaf(TableDef* def, Value* values, uint64_t expire_at, uint64_t xmin, uint64_t xmax, Pager* pager, uint8_t* out_cell, uint32_t* out_cell_size) {
   uint32_t estimated_len = 256;
   for (uint32_t i = 0; i < def->num_cols; i++) {
     if (!values[i].is_null) {
@@ -355,13 +355,13 @@ static void serialize_cell_for_leaf(TableDef* def, Value* values, uint64_t expir
     ser_buf = malloc(ser_cap);
   }
 
-  uint32_t total_size = serialize_row_with_ttl(def, values, expire_at, ser_buf);
+  uint32_t total_size = serialize_row_with_mvcc(def, values, expire_at, xmin, xmax, ser_buf);
   while (total_size > ser_cap) {
     ser_cap = total_size + 65536;
     uint8_t* new_buf = (ser_buf == stack_buf) ? malloc(ser_cap) : realloc(ser_buf, ser_cap);
     if (new_buf) {
       ser_buf = new_buf;
-      total_size = serialize_row_with_ttl(def, values, expire_at, ser_buf);
+      total_size = serialize_row_with_mvcc(def, values, expire_at, xmin, xmax, ser_buf);
     } else {
       break;
     }
@@ -720,7 +720,6 @@ void btree_start_out(Table* table, Cursor* out_cursor) {
   out_cursor->page_num = page_num;
   out_cursor->cell_num = 0;
   out_cursor->end_of_table = (*leaf_node_num_cells(node) == 0);
-  pager_journal_page(table->pager, page_num);
 }
 
 void btree_key_value(Cursor* cursor, Value* out_val) {
@@ -927,17 +926,17 @@ static void internal_node_split_and_insert(Table* table, uint32_t parent_page, u
 }
 
 /* ── Leaf Insert with Slotted Defrag ─────────────────────────────────────── */
-static void leaf_node_split_and_insert(Cursor* cursor, Value* values, uint64_t expire_at);
+static void leaf_node_split_and_insert(Cursor* cursor, Value* values, uint64_t expire_at, uint64_t xmin, uint64_t xmax);
 
-static void leaf_node_insert(Cursor* cursor, Value* values, uint64_t expire_at) {
-  void* node  = get_page(cursor->table->pager, cursor->page_num);
+static void leaf_node_insert(Cursor* cursor, Value* values, uint64_t expire_at, uint64_t xmin, uint64_t xmax) {
   pager_journal_page(cursor->table->pager, cursor->page_num);
+  void* node  = get_page(cursor->table->pager, cursor->page_num);
   uint32_t nc = *leaf_node_num_cells(node);
 
   /* Serialize the row into a cell (with overflow chain if oversized) */
   uint8_t temp_buf[BTREE_MAX_LOCAL_PAYLOAD];
   uint32_t size = 0;
-  serialize_cell_for_leaf(cursor->table->def, values, expire_at, cursor->table->pager, temp_buf, &size);
+  serialize_cell_for_leaf(cursor->table->def, values, expire_at, xmin, xmax, cursor->table->pager, temp_buf, &size);
 
   uint16_t free_space = *leaf_node_free_space(node);
   uint32_t slots_end = LEAF_NODE_HEADER_SIZE + nc * sizeof(PageSlot);
@@ -949,7 +948,7 @@ static void leaf_node_insert(Cursor* cursor, Value* values, uint64_t expire_at) 
     free_space = *leaf_node_free_space(node);
     /* If still full, split the node */
     if (free_space < slots_end || (free_space - slots_end) < needed) {
-      leaf_node_split_and_insert(cursor, values, expire_at);
+      leaf_node_split_and_insert(cursor, values, expire_at, xmin, xmax);
       return;
     }
   }
@@ -973,13 +972,15 @@ static void leaf_node_insert(Cursor* cursor, Value* values, uint64_t expire_at) 
 }
 
 /* ── Slotted Split ───────────────────────────────────────────────────────── */
-static void leaf_node_split_and_insert(Cursor* cursor, Value* values, uint64_t expire_at) {
+static void leaf_node_split_and_insert(Cursor* cursor, Value* values, uint64_t expire_at, uint64_t xmin, uint64_t xmax) {
+  pager_journal_page(cursor->table->pager, cursor->page_num);
   void* old_node   = get_page(cursor->table->pager, cursor->page_num);
   
   uint8_t old_max[INTERNAL_NODE_KEY_SIZE];
   get_node_max_key(cursor->table->pager, old_node, cursor->table->def, old_max);
 
   uint32_t new_page= get_unused_page_num(cursor->table->pager);
+  pager_journal_page(cursor->table->pager, new_page);
   void* new_node   = get_page(cursor->table->pager, new_page);
   initialize_leaf_node(new_node);
 
@@ -993,7 +994,7 @@ static void leaf_node_split_and_insert(Cursor* cursor, Value* values, uint64_t e
 
   uint8_t new_val_buf[BTREE_MAX_LOCAL_PAYLOAD];
   uint32_t new_val_size = 0;
-  serialize_cell_for_leaf(cursor->table->def, values, expire_at, cursor->table->pager, new_val_buf, &new_val_size);
+  serialize_cell_for_leaf(cursor->table->def, values, expire_at, xmin, xmax, cursor->table->pager, new_val_buf, &new_val_size);
 
   /* Build list of all cells (existing + new) */
   for (uint32_t i = 0; i < total_cells; i++) {
@@ -1056,6 +1057,7 @@ static void leaf_node_split_and_insert(Cursor* cursor, Value* values, uint64_t e
     create_new_root(cursor->table, new_page);
   } else {
     uint32_t pp = *node_parent(old_node);
+    pager_journal_page(cursor->table->pager, pp);
     void* parent = get_page(cursor->table->pager, pp);
     
     uint8_t new_old_max[INTERNAL_NODE_KEY_SIZE];
@@ -1065,12 +1067,16 @@ static void leaf_node_split_and_insert(Cursor* cursor, Value* values, uint64_t e
   }
 }
 
+void btree_insert_with_mvcc(Cursor* cursor, Value* values, uint64_t expire_at, uint64_t xmin, uint64_t xmax) {
+  leaf_node_insert(cursor, values, expire_at, xmin, xmax);
+}
+
 void btree_insert_with_ttl(Cursor* cursor, Value* values, uint64_t expire_at) {
-  leaf_node_insert(cursor, values, expire_at);
+  btree_insert_with_mvcc(cursor, values, expire_at, 0, 0);
 }
 
 void btree_insert(Cursor* cursor, Value* values) {
-  btree_insert_with_ttl(cursor, values, 0);
+  btree_insert_with_mvcc(cursor, values, 0, 0, 0);
 }
 
 /* ── Slotted Borrows & Merges ────────────────────────────────────────────── */
@@ -1383,9 +1389,15 @@ void handle_internal_underflow(Table* t, uint32_t page_num) {
 
 /* ── Slotted Leaf Node Delete ────────────────────────────────────────────── */
 void btree_delete(Cursor* cursor) {
+  pager_journal_page(cursor->table->pager, cursor->page_num);
   void* node  = get_page(cursor->table->pager, cursor->page_num);
   uint32_t nc = *leaf_node_num_cells(node);
   uint32_t ci = cursor->cell_num;
+
+  if (nc == 0 || ci >= nc) {
+    cursor->end_of_table = true;
+    return;
+  }
 
   PageSlot* slot = leaf_node_slot(node, ci);
   if (slot->size >= BTREE_MAX_LOCAL_PAYLOAD) {
@@ -1404,7 +1416,7 @@ void btree_delete(Cursor* cursor) {
   bool was_max = (ci == nc - 1);
 
   /* Shift slots left in the slot array */
-  for (uint32_t i = ci; i < nc-1; i++) {
+  for (uint32_t i = ci; i + 1 < nc; i++) {
     *leaf_node_slot(node, i) = *leaf_node_slot(node, i + 1);
   }
   (*leaf_node_num_cells(node))--;
@@ -1412,11 +1424,27 @@ void btree_delete(Cursor* cursor) {
   /* Update parent separator if max changed */
   if (was_max && !is_node_root(node) && *leaf_node_num_cells(node) > 0) {
     uint32_t pp  = *node_parent(node);
+    pager_journal_page(cursor->table->pager, pp);
     void* parent = get_page(cursor->table->pager, pp);
     if (cursor->page_num != *internal_node_right_child(parent)) {
       uint8_t new_max[INTERNAL_NODE_KEY_SIZE];
       get_node_max_key(cursor->table->pager, node, cursor->table->def, new_max);
       update_internal_node_key(parent, old_max, new_max, cursor->table->def);
+    }
+  }
+
+  /* Check if cursor has moved past end of cells on this page */
+  if (cursor->cell_num >= *leaf_node_num_cells(node)) {
+    uint32_t next = *leaf_node_next_leaf(node);
+    if (next == 0) {
+      cursor->end_of_table = true;
+    } else {
+      cursor->page_num = next;
+      cursor->cell_num = 0;
+      void* next_node = get_page(cursor->table->pager, next);
+      if (*leaf_node_num_cells(next_node) == 0) {
+        cursor->end_of_table = true;
+      }
     }
   }
 

@@ -56,6 +56,25 @@ Pager* pager_open(const char* filename) {
   pager->wal_frame_size = WAL_FRAME_SIZE_V2;
   pager->wal_lsn = 0;
 
+  off_t file_length = lseek(fd, 0, SEEK_END);
+  if (file_length % PAGE_SIZE != 0) {
+    fprintf(stderr, "DB file is not a whole number of pages. Corrupt file.\n");
+    exit(EXIT_FAILURE);
+  }
+
+  /* Load persisted LSN from page 0 */
+  if (file_length >= PAGE_SIZE) {
+    uint8_t p0_buf[PAGE_SIZE];
+    lseek(fd, 0, SEEK_SET);
+    if (read(fd, p0_buf, PAGE_SIZE) == PAGE_SIZE) {
+      uint64_t saved_lsn = 0;
+      memcpy(&saved_lsn, p0_buf + 4084, 8);
+      if (saved_lsn > pager->wal_lsn) {
+        pager->wal_lsn = saved_lsn;
+      }
+    }
+  }
+
   struct stat wal_st;
   if (stat(pager->wal_filename, &wal_st) == 0 && wal_st.st_size > 0) {
     pager->use_wal = true;
@@ -76,22 +95,17 @@ Pager* pager_open(const char* filename) {
             if (f_lsn > max_lsn) max_lsn = f_lsn;
           }
         }
-        pager->wal_lsn = max_lsn;
+        if (max_lsn > pager->wal_lsn) {
+          pager->wal_lsn = max_lsn;
+        }
       } else {
         pager->wal_frame_size = WAL_FRAME_SIZE_V1;
-        pager->wal_lsn = 0;
       }
     }
   }
 
   /* Check for uncommitted journal from crash and recover */
   check_and_recover_journal(pager);
-
-  off_t file_length = lseek(fd, 0, SEEK_END);
-  if (file_length % PAGE_SIZE != 0) {
-    fprintf(stderr, "DB file is not a whole number of pages. Corrupt file.\n");
-    exit(EXIT_FAILURE);
-  }
 
   pager->file_length = (uint32_t)file_length;
   pager->num_pages   = (uint32_t)(file_length / PAGE_SIZE);
@@ -106,6 +120,17 @@ Pager* pager_open(const char* filename) {
   pager->in_transaction = false;
   pager->journal_fd = -1;
   pager->page_is_journaled = NULL;
+
+  /* Initialize MVCC shadow paging & snapshot registry */
+  pager->shadow_pages = NULL;
+  pager->is_shadowed = NULL;
+  pager->shadow_capacity = 0;
+  pager->writer_tid = 0;
+  pager->retired_pages_head = NULL;
+  pthread_mutex_init(&pager->swap_mutex, NULL);
+  pthread_mutex_init(&pager->epoch_mutex, NULL);
+  pthread_mutex_init(&pager->writer_mutex, NULL);
+  memset(pager->active_snapshots, 0, sizeof(pager->active_snapshots));
 
   for (int t = 0; t < MAX_TABLES; t++) {
     pthread_rwlock_init(&pager->table_rwlocks[t], NULL);
@@ -263,52 +288,152 @@ void pager_unlock(Pager* pager) {
   pager->lock_state = NO_LOCK;
 }
 
+void pager_refresh_if_modified(Pager* pager) {
+  if (!pager || pager->in_transaction || pager->is_memory || pager->file_descriptor == -1) {
+    return;
+  }
+  off_t cur_len = lseek(pager->file_descriptor, 0, SEEK_END);
+  uint64_t disk_lsn = 0;
+  if (cur_len >= PAGE_SIZE) {
+    if (pread(pager->file_descriptor, &disk_lsn, 8, 4084) != 8) {
+      disk_lsn = 0;
+    }
+  }
+
+  uint64_t wal_max_lsn = 0;
+  struct stat wst;
+  if (pager->wal_filename[0] != '\0' && stat(pager->wal_filename, &wst) == 0 && wst.st_size > 0) {
+    if (!pager->use_wal) {
+      pager->use_wal = true;
+    }
+    if (pager->wal_fd == -1) {
+      pager->wal_fd = open(pager->wal_filename, O_RDWR | O_BINARY, S_IWUSR | S_IRUSR);
+    }
+    if (pager->wal_fd != -1) {
+      off_t wal_len = lseek(pager->wal_fd, 0, SEEK_END);
+      off_t frame_size = pager->wal_frame_size ? pager->wal_frame_size : WAL_FRAME_SIZE_V2;
+      off_t num_frames = (wal_len >= 4) ? (wal_len - 4) / frame_size : 0;
+      if (num_frames > 0) {
+        off_t last_offset = 4 + (num_frames - 1) * frame_size;
+        uint64_t f_lsn = 0;
+        if (pread(pager->wal_fd, &f_lsn, 8, last_offset + 16) == 8) {
+          wal_max_lsn = f_lsn;
+        }
+      }
+    }
+  }
+
+  uint64_t effective_lsn = (wal_max_lsn > disk_lsn) ? wal_max_lsn : disk_lsn;
+  bool modified = (effective_lsn > pager->wal_lsn || (uint32_t)cur_len != pager->file_length);
+  if (modified) {
+    for (uint32_t i = 0; i < pager->max_pages; i++) {
+      if (pager->pages[i]) {
+        free(pager->pages[i]);
+        pager->pages[i] = NULL;
+      }
+    }
+    pager->file_length = (uint32_t)cur_len;
+    pager->num_pages = pager->file_length / PAGE_SIZE;
+    if (effective_lsn > pager->wal_lsn) {
+      pager->wal_lsn = effective_lsn;
+    }
+  }
+}
+
+bool pager_ensure_write_lock(Pager* pager) {
+  if (!pager) return false;
+  if (!pager->is_memory && pager->lock_state < RESERVED_LOCK) {
+    /* Retry up to 500ms to acquire RESERVED lock */
+    int retries = 50;
+    while (!pager_lock(pager, RESERVED_LOCK)) {
+      usleep(10000);
+      if (--retries <= 0) {
+        pager->lock_error = true;
+        fprintf(stderr, "Error: Database is locked by another process.\n");
+        return false;
+      }
+    }
+    pager->lock_error = false;
+
+    /* In rollback mode, flush all cached pages to disk so on-disk state is clean baseline */
+    if (!pager->use_wal) {
+      for (uint32_t i = 0; i < pager->max_pages; i++) {
+        if (pager->pages[i] != NULL) {
+          pager_flush(pager, i);
+        }
+      }
+    }
+    pager->num_pages_at_tx_start = pager->num_pages;
+    pager->file_length = (uint32_t)lseek(pager->file_descriptor, 0, SEEK_END);
+  }
+
+  if (pager->journal_fd == -1 && !pager->is_memory) {
+    pager->journal_fd = open(pager->journal_filename, O_RDWR | O_CREAT | O_TRUNC | O_BINARY, S_IWUSR | S_IRUSR);
+  }
+  if (!pager->page_is_journaled) {
+    uint32_t track_size = pager->max_pages + 1024;
+    pager->page_is_journaled = calloc(track_size, sizeof(bool));
+  }
+  pager->writer_tid = pthread_self();
+  return true;
+}
+
 void pager_begin_transaction(Pager* pager) {
   if (pager->in_transaction) {
     return;
   }
-
-  /* Retry up to 500ms to acquire RESERVED lock */
-  int retries = 50;
-  while (!pager_lock(pager, RESERVED_LOCK)) {
-    usleep(10000);
-    if (--retries <= 0) {
-      /* Could not acquire lock — signal error, do NOT start transaction.
-       * This is the safe behaviour: refuse the operation rather than
-       * risk concurrent corruption (important for financial data). */
-      pager->lock_error = true;
-      fprintf(stderr, "Error: Database is locked by another process.\n");
-      return;
-    }
-  }
-  pager->lock_error = false;
-
-  /* In rollback mode, flush all cached pages to disk so on-disk state is clean baseline */
-  if (!pager->use_wal) {
-    for (uint32_t i = 0; i < pager->max_pages; i++) {
-      if (pager->pages[i] != NULL) {
-        pager_flush(pager, i);
-      }
-    }
-  }
-  pager->num_pages_at_tx_start = pager->num_pages;
-  pager->file_length = (uint32_t)lseek(pager->file_descriptor, 0, SEEK_END);
-
-  pager->journal_fd = open(pager->journal_filename, O_RDWR | O_CREAT | O_TRUNC | O_BINARY, S_IWUSR | S_IRUSR);
-  if (pager->journal_fd == -1) {
-    /* Journal open failed — continue without journaling (no crash) */
-    pager->in_transaction = true;
-    uint32_t track_size = pager->max_pages + 1024;
-    pager->page_is_journaled = calloc(track_size, sizeof(bool));
-    return;
-  }
-
+  pager_refresh_if_modified(pager);
   pager->in_transaction = true;
-  uint32_t track_size = pager->max_pages + 1024;
-  pager->page_is_journaled = calloc(track_size, sizeof(bool));
+  pager->writer_tid = pthread_self();
+  pager->num_pages_at_tx_start = pager->num_pages;
+  if (!pager->is_memory && pager->file_descriptor != -1) {
+    pager->file_length = (uint32_t)lseek(pager->file_descriptor, 0, SEEK_END);
+  }
+}
+
+void pager_shadow_page_write(Pager* pager, uint32_t page_num) {
+  if (!pager->in_transaction) return;
+  if (!pager_ensure_write_lock(pager)) return;
+  if (!pthread_equal(pager->writer_tid, pthread_self())) return;
+
+  if (!pager->is_dirty) {
+    pager->is_dirty = calloc(pager->max_pages + 1024, sizeof(bool));
+  }
+  if (page_num < pager->max_pages + 1024) {
+    pager->is_dirty[page_num] = true;
+  }
+
+  if (page_num >= pager->shadow_capacity) {
+    uint32_t old_cap = pager->shadow_capacity;
+    uint32_t new_cap = page_num + 1024;
+    pager->shadow_pages = realloc(pager->shadow_pages, sizeof(void*) * new_cap);
+    pager->is_shadowed = realloc(pager->is_shadowed, sizeof(bool) * new_cap);
+    for (uint32_t i = old_cap; i < new_cap; i++) {
+      pager->shadow_pages[i] = NULL;
+      pager->is_shadowed[i] = false;
+    }
+    pager->shadow_capacity = new_cap;
+  }
+
+  if (!pager->is_shadowed[page_num]) {
+    void* base = (page_num < pager->max_pages) ? pager->pages[page_num] : NULL;
+    if (!base) {
+      (void)get_page(pager, page_num);
+      base = (page_num < pager->max_pages) ? pager->pages[page_num] : NULL;
+    }
+    void* shadow = malloc(PAGE_SIZE);
+    if (base) {
+      memcpy(shadow, base, PAGE_SIZE);
+    } else {
+      memset(shadow, 0, PAGE_SIZE);
+    }
+    pager->shadow_pages[page_num] = shadow;
+    pager->is_shadowed[page_num] = true;
+  }
 }
 
 void pager_journal_page(Pager* pager, uint32_t page_num) {
+  pager_shadow_page_write(pager, page_num);
   if (!pager->in_transaction || pager->journal_fd == -1) return;
   if (pager->num_savepoints == 0 && pager->page_is_journaled && page_num < pager->max_pages + 1024 && pager->page_is_journaled[page_num]) return;
 
@@ -316,8 +441,11 @@ void pager_journal_page(Pager* pager, uint32_t page_num) {
   uint8_t journal_entry[4 + PAGE_SIZE];
   memcpy(journal_entry, &page_num, 4);
 
-  if (page_num < pager->max_pages && pager->pages[page_num] != NULL) {
-    memcpy(journal_entry + 4, pager->pages[page_num], PAGE_SIZE);
+  void* pre_buf = (pager->is_shadowed && page_num < pager->shadow_capacity && pager->is_shadowed[page_num])
+                  ? pager->shadow_pages[page_num]
+                  : ((page_num < pager->max_pages) ? pager->pages[page_num] : NULL);
+  if (pre_buf != NULL) {
+    memcpy(journal_entry + 4, pre_buf, PAGE_SIZE);
   } else {
     off_t file_pages = pager->file_length / PAGE_SIZE;
     if (page_num < (uint32_t)file_pages) {
@@ -356,6 +484,8 @@ void* get_page(Pager* pager, uint32_t page_num) {
     }
     pager->lock_error = false;
   }
+
+  pager_refresh_if_modified(pager);
 
   /* Dynamic page array resize */
   if (page_num >= pager->max_pages) {
@@ -430,13 +560,9 @@ void* get_page(Pager* pager, uint32_t page_num) {
     pager->cache_hits++;
   }
 
-  /* Mark dirty if transaction is active */
-  if (pager->in_transaction) {
-    if (!pager->is_dirty) {
-      pager->is_dirty = calloc(pager->max_pages + 1024, sizeof(bool));
-    }
-    if (page_num < pager->max_pages + 1024) {
-      pager->is_dirty[page_num] = true;
+  if (pager->in_transaction && pthread_equal(pager->writer_tid, pthread_self())) {
+    if (pager->is_shadowed && page_num < pager->shadow_capacity && pager->is_shadowed[page_num]) {
+      return pager->shadow_pages[page_num];
     }
   }
 
@@ -445,7 +571,10 @@ void* get_page(Pager* pager, uint32_t page_num) {
 
 void pager_flush(Pager* pager, uint32_t page_num) {
   if (pager->is_memory || pager->file_descriptor == -1) return;
-  if (page_num >= pager->max_pages || pager->pages[page_num] == NULL) return;
+  void* flush_buf = (pager->is_shadowed && page_num < pager->shadow_capacity && pager->is_shadowed[page_num])
+                    ? pager->shadow_pages[page_num]
+                    : ((page_num < pager->max_pages) ? pager->pages[page_num] : NULL);
+  if (flush_buf == NULL) return;
 
   if (pager->use_wal) {
     if (pager->wal_fd == -1) {
@@ -459,7 +588,6 @@ void pager_flush(Pager* pager, uint32_t page_num) {
           fprintf(stderr, "pager_flush: warning: write WAL magic failed\n");
         }
         pager->wal_frame_size = WAL_FRAME_SIZE_V2;
-        pager->wal_lsn = 0;
       } else if (pager->wal_frame_size == 0) {
         uint32_t magic = 0;
         lseek(pager->wal_fd, 0, SEEK_SET);
@@ -471,7 +599,7 @@ void pager_flush(Pager* pager, uint32_t page_num) {
         lseek(pager->wal_fd, 0, SEEK_END);
       }
 
-      uint32_t crc = calculate_crc32((const uint8_t*)pager->pages[page_num], PAGE_SIZE);
+      uint32_t crc = calculate_crc32((const uint8_t*)flush_buf, PAGE_SIZE);
       lseek(pager->wal_fd, 0, SEEK_END);
 
       if (pager->wal_frame_size == WAL_FRAME_SIZE_V2) {
@@ -482,7 +610,7 @@ void pager_flush(Pager* pager, uint32_t page_num) {
         memcpy(frame_buf + 4, &crc, 4);
         memcpy(frame_buf + 8, &commit_ts, 8);
         memcpy(frame_buf + 16, &lsn, 8);
-        memcpy(frame_buf + 24, pager->pages[page_num], PAGE_SIZE);
+        memcpy(frame_buf + 24, flush_buf, PAGE_SIZE);
         ssize_t w = write(pager->wal_fd, frame_buf, sizeof(frame_buf));
         if (w != (ssize_t)sizeof(frame_buf)) {
           fprintf(stderr, "pager_flush: warning: write to WAL failed\n");
@@ -491,7 +619,7 @@ void pager_flush(Pager* pager, uint32_t page_num) {
         uint8_t frame_buf[WAL_FRAME_SIZE_V1];
         memcpy(frame_buf, &page_num, 4);
         memcpy(frame_buf + 4, &crc, 4);
-        memcpy(frame_buf + 8, pager->pages[page_num], PAGE_SIZE);
+        memcpy(frame_buf + 8, flush_buf, PAGE_SIZE);
         ssize_t w = write(pager->wal_fd, frame_buf, sizeof(frame_buf));
         if (w != (ssize_t)sizeof(frame_buf)) {
           fprintf(stderr, "pager_flush: warning: write to WAL failed\n");
@@ -501,7 +629,7 @@ void pager_flush(Pager* pager, uint32_t page_num) {
     }
   }
 
-  ssize_t bytes = pwrite(pager->file_descriptor, pager->pages[page_num], PAGE_SIZE, (off_t)page_num * PAGE_SIZE);
+  ssize_t bytes = pwrite(pager->file_descriptor, flush_buf, PAGE_SIZE, (off_t)page_num * PAGE_SIZE);
   if (bytes != (ssize_t)PAGE_SIZE) {
     fprintf(stderr, "pager_flush: warning: pwrite failed for page %u\n", page_num);
     return;
@@ -552,13 +680,49 @@ void pager_commit(Pager* pager) {
     return;
   }
 
-  /* Upgrade lock to EXCLUSIVE before flushing dirty pages to disk */
-  int retries = 50;
-  while (!pager_lock(pager, EXCLUSIVE_LOCK)) {
-    usleep(10000);
-    if (--retries <= 0) {
-      fprintf(stderr, "Error: Database is locked (exclusive lock timeout for commit).\n");
-      exit(1);
+  bool has_writes = false;
+  if (pager->is_shadowed) {
+    for (uint32_t i = 0; i < pager->shadow_capacity; i++) {
+      if (pager->is_shadowed[i]) { has_writes = true; break; }
+    }
+  }
+  if (!has_writes && pager->is_dirty) {
+    for (uint32_t i = 0; i < pager->max_pages + 1024; i++) {
+      if (pager->is_dirty[i]) { has_writes = true; break; }
+    }
+  }
+
+  if (!has_writes) {
+    /* Read-only transaction: no pages dirtied, nothing to flush or swap */
+    if (pager->journal_fd != -1) {
+      close(pager->journal_fd);
+      pager->journal_fd = -1;
+      unlink(pager->journal_filename);
+    }
+    if (pager->page_is_journaled) {
+      free(pager->page_is_journaled);
+      pager->page_is_journaled = NULL;
+    }
+    if (pager->is_dirty) {
+      free(pager->is_dirty);
+      pager->is_dirty = NULL;
+    }
+    pager->in_transaction = false;
+    pager_unlock(pager);
+    printf("Transaction committed.\n");
+    return;
+  }
+
+  /* In rollback mode, upgrade lock to EXCLUSIVE before flushing dirty pages to disk.
+   * In WAL mode, writers write to WAL and only hold RESERVED lock, allowing non-blocking readers. */
+  if (!pager->use_wal) {
+    int retries = 50;
+    while (!pager_lock(pager, EXCLUSIVE_LOCK)) {
+      usleep(10000);
+      if (--retries <= 0) {
+        fprintf(stderr, "Error: Database is locked (exclusive lock timeout for commit).\n");
+        exit(1);
+      }
     }
   }
 
@@ -569,9 +733,16 @@ void pager_commit(Pager* pager) {
   /* Flush ONLY dirty cached pages to disk */
   pager->current_commit_ts = (uint64_t)time(NULL);
   pager->current_commit_lsn = ++pager->wal_lsn;
+
+  void* p0 = get_page(pager, 0);
+  if (p0) {
+    memcpy((uint8_t*)p0 + 4084, &pager->wal_lsn, 8);
+    if (pager->is_dirty) pager->is_dirty[0] = true;
+  }
+
   for (uint32_t i = 0; i < pager->num_pages; i++) {
     if (i < pager->max_pages && pager->pages[i]) {
-      if (pager->is_dirty == NULL || pager->is_dirty[i]) {
+      if ((pager->is_dirty && pager->is_dirty[i]) || (pager->is_shadowed && i < pager->shadow_capacity && pager->is_shadowed[i])) {
         pager_flush(pager, i);
       }
     }
@@ -584,6 +755,26 @@ void pager_commit(Pager* pager) {
   } else if (pager->file_descriptor != -1) {
     fdatasync(pager->file_descriptor);
   }
+
+  /* Atomic Multi-Page Pointer Swap under swap_mutex */
+  pthread_mutex_lock(&pager->swap_mutex);
+  if (pager->shadow_pages) {
+    for (uint32_t i = 0; i < pager->shadow_capacity; i++) {
+      if (pager->is_shadowed && pager->is_shadowed[i]) {
+        RetiredPage* ret = malloc(sizeof(RetiredPage));
+        ret->buffer = pager->pages[i];
+        ret->retired_lsn = pager->wal_lsn;
+        ret->next = pager->retired_pages_head;
+        pager->retired_pages_head = ret;
+
+        pager->pages[i] = pager->shadow_pages[i];
+        pager->shadow_pages[i] = NULL;
+        pager->is_shadowed[i] = false;
+      }
+    }
+  }
+  pthread_mutex_unlock(&pager->swap_mutex);
+  pager_reclaim_retired_pages(pager);
 
   if (pager->journal_fd != -1) {
     close(pager->journal_fd);
@@ -620,6 +811,19 @@ void pager_rollback(Pager* pager) {
       exit(1);
     }
   }
+
+  /* Discard all shadowed pages */
+  pthread_mutex_lock(&pager->swap_mutex);
+  if (pager->shadow_pages) {
+    for (uint32_t i = 0; i < pager->shadow_capacity; i++) {
+      if (pager->is_shadowed && pager->is_shadowed[i]) {
+        free(pager->shadow_pages[i]);
+        pager->shadow_pages[i] = NULL;
+        pager->is_shadowed[i] = false;
+      }
+    }
+  }
+  pthread_mutex_unlock(&pager->swap_mutex);
 
   if (pager->journal_fd != -1) {
     close(pager->journal_fd);
@@ -727,6 +931,9 @@ void pager_rollback_to_savepoint(Pager* pager, const char* name) {
           if (pnum < pager->max_pages && pager->pages[pnum]) {
             memcpy(pager->pages[pnum], page_buf, PAGE_SIZE);
           }
+          if (pager->shadow_pages && pnum < pager->shadow_capacity && pager->shadow_pages[pnum]) {
+            memcpy(pager->shadow_pages[pnum], page_buf, PAGE_SIZE);
+          }
           lseek(pager->file_descriptor, (off_t)pnum * PAGE_SIZE, SEEK_SET);
           ssize_t w = write(pager->file_descriptor, page_buf, PAGE_SIZE);
           if (w != (ssize_t)PAGE_SIZE) {
@@ -747,6 +954,11 @@ void pager_rollback_to_savepoint(Pager* pager, const char* name) {
       if (p < pager->max_pages && pager->pages[p]) {
         free(pager->pages[p]);
         pager->pages[p] = NULL;
+      }
+      if (pager->shadow_pages && p < pager->shadow_capacity && pager->shadow_pages[p]) {
+        free(pager->shadow_pages[p]);
+        pager->shadow_pages[p] = NULL;
+        if (pager->is_shadowed) pager->is_shadowed[p] = false;
       }
     }
     pager->num_pages = target_pages;
@@ -804,14 +1016,8 @@ void pager_close(Pager* pager) {
 
   for (uint32_t i = 0; i < pager->max_pages; i++) {
     if (pager->pages[i] != NULL) {
-      if (!pager->use_wal) {
-        if (pager->is_dirty == NULL || pager->is_dirty[i]) {
-          pager_flush(pager, i);
-        }
-      } else {
-        if (pager->is_dirty && pager->is_dirty[i]) {
-          pager_flush(pager, i);
-        }
+      if (pager->is_dirty && pager->is_dirty[i]) {
+        pager_flush(pager, i);
       }
       free(pager->pages[i]);
       pager->pages[i] = NULL;
@@ -821,6 +1027,28 @@ void pager_close(Pager* pager) {
   pager_unlock(pager);
   for (int t = 0; t < MAX_TABLES; t++) {
     pthread_rwlock_destroy(&pager->table_rwlocks[t]);
+  }
+  pthread_mutex_destroy(&pager->swap_mutex);
+  pthread_mutex_destroy(&pager->epoch_mutex);
+  pthread_mutex_destroy(&pager->writer_mutex);
+  RetiredPage* r_curr = pager->retired_pages_head;
+  while (r_curr) {
+    RetiredPage* next = r_curr->next;
+    free(r_curr->buffer);
+    free(r_curr);
+    r_curr = next;
+  }
+  pager->retired_pages_head = NULL;
+  if (pager->shadow_pages) {
+    for (uint32_t i = 0; i < pager->shadow_capacity; i++) {
+      if (pager->shadow_pages[i]) free(pager->shadow_pages[i]);
+    }
+    free(pager->shadow_pages);
+    pager->shadow_pages = NULL;
+  }
+  if (pager->is_shadowed) {
+    free(pager->is_shadowed);
+    pager->is_shadowed = NULL;
   }
   if (pager->page_is_journaled) {
     free(pager->page_is_journaled);
@@ -847,26 +1075,44 @@ void pager_set_wal_mode(Pager* pager, bool enable_wal) {
     if (pager->wal_fd == -1) {
       pager->wal_fd = open(pager->wal_filename, O_RDWR | O_CREAT | O_BINARY, S_IWUSR | S_IRUSR);
     }
+    if (pager->wal_fd != -1) {
+      off_t wal_len = lseek(pager->wal_fd, 0, SEEK_END);
+      if (wal_len == 0) {
+        uint32_t magic = WAL_MAGIC;
+        if (write(pager->wal_fd, &magic, 4) != 4) {
+          fprintf(stderr, "pager_set_wal_mode: warning: write WAL magic failed\n");
+        }
+      }
+    }
+    pager->wal_frame_size = WAL_FRAME_SIZE_V2;
     printf("[WAL] Journal mode set to WAL mode.\n");
   } else {
     if (pager->use_wal) {
       pager_checkpoint(pager);
+      pager->use_wal = false;
     }
     if (pager->wal_fd != -1) {
       close(pager->wal_fd);
       pager->wal_fd = -1;
     }
     unlink(pager->wal_filename);
-    pager->use_wal = false;
-    printf("[WAL] Journal mode set to Rollback (DELETE) mode.\n");
+    printf("[WAL] WAL mode disabled. Reverted to rollback journal.\n");
   }
 }
 
 void pager_checkpoint(Pager* pager) {
-  if (pager->wal_fd == -1) {
-    pager->wal_fd = open(pager->wal_filename, O_RDWR | O_CREAT | O_BINARY, S_IWUSR | S_IRUSR);
+  if (!pager->use_wal || pager->wal_fd == -1) {
+    return;
   }
-  if (pager->wal_fd == -1) return;
+
+  int retries = 50;
+  while (!pager_lock(pager, EXCLUSIVE_LOCK)) {
+    usleep(10000);
+    if (--retries <= 0) {
+      fprintf(stderr, "Error: Database is locked (exclusive lock timeout for checkpoint).\n");
+      exit(1);
+    }
+  }
 
   off_t wal_len = lseek(pager->wal_fd, 0, SEEK_END);
   off_t frame_size = pager->wal_frame_size ? pager->wal_frame_size : WAL_FRAME_SIZE_V1;
@@ -909,7 +1155,6 @@ void pager_checkpoint(Pager* pager) {
     }
     lseek(pager->wal_fd, 0, SEEK_SET);
     fsync(pager->wal_fd);
-    pager->wal_lsn = 0;
     pager->wal_frame_size = WAL_FRAME_SIZE_V2;
   }
 
@@ -1285,4 +1530,69 @@ bool pager_restore(const char* src_file, const char* dest_file,
     printf("Restored -> '%s'.\n", dest_file);
   }
   return true;
+}
+
+uint64_t pager_register_snapshot(Pager* pager) {
+  if (pager->in_transaction && pthread_equal(pager->writer_tid, pthread_self())) {
+    return pager->wal_lsn + 1;
+  }
+  pthread_mutex_lock(&pager->epoch_mutex);
+  uint64_t snap = pager->wal_lsn;
+  for (int i = 0; i < 64; i++) {
+    if (!pager->active_snapshots[i].active) {
+      pager->active_snapshots[i].snapshot_xid = snap;
+      pager->active_snapshots[i].active = true;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&pager->epoch_mutex);
+  return snap;
+}
+
+void pager_unregister_snapshot(Pager* pager, uint64_t snapshot_xid) {
+  if (pager->in_transaction && pthread_equal(pager->writer_tid, pthread_self())) {
+    return;
+  }
+  pthread_mutex_lock(&pager->epoch_mutex);
+  for (int i = 0; i < 64; i++) {
+    if (pager->active_snapshots[i].active && pager->active_snapshots[i].snapshot_xid == snapshot_xid) {
+      pager->active_snapshots[i].active = false;
+      break;
+    }
+  }
+  pthread_mutex_unlock(&pager->epoch_mutex);
+  pager_reclaim_retired_pages(pager);
+}
+
+uint64_t pager_get_min_active_snapshot_xid(Pager* pager) {
+  pthread_mutex_lock(&pager->epoch_mutex);
+  uint64_t min_xid = pager->wal_lsn;
+  bool found = false;
+  for (int i = 0; i < 64; i++) {
+    if (pager->active_snapshots[i].active) {
+      if (!found || pager->active_snapshots[i].snapshot_xid < min_xid) {
+        min_xid = pager->active_snapshots[i].snapshot_xid;
+        found = true;
+      }
+    }
+  }
+  pthread_mutex_unlock(&pager->epoch_mutex);
+  return min_xid;
+}
+
+void pager_reclaim_retired_pages(Pager* pager) {
+  uint64_t min_active = pager_get_min_active_snapshot_xid(pager);
+  pthread_mutex_lock(&pager->epoch_mutex);
+  RetiredPage** curr = &pager->retired_pages_head;
+  while (*curr) {
+    RetiredPage* entry = *curr;
+    if (entry->retired_lsn < min_active) {
+      *curr = entry->next;
+      free(entry->buffer);
+      free(entry);
+    } else {
+      curr = &entry->next;
+    }
+  }
+  pthread_mutex_unlock(&pager->epoch_mutex);
 }
