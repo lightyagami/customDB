@@ -72,6 +72,7 @@ typedef enum {
   EXECUTE_CONSTRAINT_CHECK,
   EXECUTE_CONSTRAINT_FOREIGN_KEY,
   EXECUTE_BUSY,
+  EXECUTE_ERROR,
 } ExecuteResult;
 
 typedef enum {

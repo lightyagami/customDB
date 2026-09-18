@@ -1823,6 +1823,77 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
     return PREPARE_SUCCESS;
   }
 
+  if (strncasecmp(p, "backup", 6) == 0 && (isspace((unsigned char)p[6]) || p[6] == '\0')) {
+    p += 6;
+    p = skip_whitespace(p);
+    if (strncasecmp(p, "database", 8) == 0 && (isspace((unsigned char)p[8]) || p[8] == '\0')) {
+      p += 8;
+      p = skip_whitespace(p);
+    }
+    if (strncasecmp(p, "to", 2) == 0 && (isspace((unsigned char)p[2]) || p[2] == '\0')) {
+      p += 2;
+      p = skip_whitespace(p);
+    } else {
+      return PREPARE_SYNTAX_ERROR;
+    }
+    out->type = STATEMENT_BACKUP;
+    p = parse_value_token(p, out->pitr_dest, sizeof(out->pitr_dest));
+    if (strlen(out->pitr_dest) == 0) return PREPARE_SYNTAX_ERROR;
+    return PREPARE_SUCCESS;
+  }
+
+  if (strncasecmp(p, "restore", 7) == 0 && (isspace((unsigned char)p[7]) || p[7] == '\0')) {
+    p += 7;
+    p = skip_whitespace(p);
+    if (strncasecmp(p, "database", 8) == 0 && (isspace((unsigned char)p[8]) || p[8] == '\0')) {
+      p += 8;
+      p = skip_whitespace(p);
+    }
+    if (strncasecmp(p, "from", 4) == 0 && (isspace((unsigned char)p[4]) || p[4] == '\0')) {
+      p += 4;
+      p = skip_whitespace(p);
+    } else {
+      return PREPARE_SYNTAX_ERROR;
+    }
+    out->type = STATEMENT_RESTORE;
+    p = parse_value_token(p, out->pitr_src, sizeof(out->pitr_src));
+    if (strlen(out->pitr_src) == 0) return PREPARE_SYNTAX_ERROR;
+    p = skip_whitespace(p);
+
+    if (strncasecmp(p, "until", 5) == 0 && (isspace((unsigned char)p[5]) || p[5] == '\0')) {
+      p += 5;
+      p = skip_whitespace(p);
+      if (strncasecmp(p, "timestamp", 9) == 0 && (isspace((unsigned char)p[9]) || p[9] == '\0')) {
+        p += 9;
+        p = skip_whitespace(p);
+        char ts_str[64] = {0};
+        p = parse_value_token(p, ts_str, sizeof(ts_str));
+        out->pitr_until_ts = (uint64_t)strtoull(ts_str, NULL, 10);
+        out->pitr_use_ts = true;
+      } else if (strncasecmp(p, "lsn", 3) == 0 && (isspace((unsigned char)p[3]) || p[3] == '\0')) {
+        p += 3;
+        p = skip_whitespace(p);
+        char lsn_str[64] = {0};
+        p = parse_value_token(p, lsn_str, sizeof(lsn_str));
+        out->pitr_until_lsn = (uint64_t)strtoull(lsn_str, NULL, 10);
+        out->pitr_use_lsn = true;
+      } else {
+        return PREPARE_SYNTAX_ERROR;
+      }
+      p = skip_whitespace(p);
+    }
+
+    if (strncasecmp(p, "to", 2) == 0 && (isspace((unsigned char)p[2]) || p[2] == '\0')) {
+      p += 2;
+      p = skip_whitespace(p);
+      p = parse_value_token(p, out->pitr_dest, sizeof(out->pitr_dest));
+      if (strlen(out->pitr_dest) == 0) return PREPARE_SYNTAX_ERROR;
+    } else {
+      snprintf(out->pitr_dest, sizeof(out->pitr_dest), "%.240s_restored.db", out->pitr_src);
+    }
+    return PREPARE_SUCCESS;
+  }
+
   if (strncasecmp(p, "analyze", 7) == 0) {
     p += 7;
     out->type = STATEMENT_ANALYZE;

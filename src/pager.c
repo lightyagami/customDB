@@ -53,11 +53,35 @@ Pager* pager_open(const char* filename) {
   snprintf(pager->wal_filename, sizeof(pager->wal_filename), "%s-wal", filename);
   pager->wal_fd = -1;
   pager->use_wal = false;
+  pager->wal_frame_size = WAL_FRAME_SIZE_V2;
+  pager->wal_lsn = 0;
 
   struct stat wal_st;
   if (stat(pager->wal_filename, &wal_st) == 0 && wal_st.st_size > 0) {
     pager->use_wal = true;
     pager->wal_fd = open(pager->wal_filename, O_RDWR | O_BINARY, S_IWUSR | S_IRUSR);
+    if (pager->wal_fd != -1) {
+      uint32_t magic = 0;
+      lseek(pager->wal_fd, 0, SEEK_SET);
+      if (read(pager->wal_fd, &magic, 4) == 4 && magic == WAL_MAGIC) {
+        pager->wal_frame_size = WAL_FRAME_SIZE_V2;
+        off_t wal_len = lseek(pager->wal_fd, 0, SEEK_END);
+        off_t num_frames = (wal_len >= 4) ? (wal_len - 4) / WAL_FRAME_SIZE_V2 : 0;
+        uint64_t max_lsn = 0;
+        for (off_t f = 0; f < num_frames; f++) {
+          off_t offset = 4 + f * WAL_FRAME_SIZE_V2;
+          uint64_t f_lsn = 0;
+          lseek(pager->wal_fd, offset + 4 + 4 + 8, SEEK_SET);
+          if (read(pager->wal_fd, &f_lsn, 8) == 8) {
+            if (f_lsn > max_lsn) max_lsn = f_lsn;
+          }
+        }
+        pager->wal_lsn = max_lsn;
+      } else {
+        pager->wal_frame_size = WAL_FRAME_SIZE_V1;
+        pager->wal_lsn = 0;
+      }
+    }
   }
 
   /* Check for uncommitted journal from crash and recover */
@@ -363,18 +387,25 @@ void* get_page(Pager* pager, uint32_t page_num) {
     bool read_from_wal = false;
     if (pager->use_wal && pager->wal_fd != -1) {
       off_t wal_len = lseek(pager->wal_fd, 0, SEEK_END);
-      off_t frame_size = 4 + 4 + PAGE_SIZE; /* pnum + crc32 + page_data */
-      off_t num_frames = wal_len / frame_size;
-      for (off_t f = num_frames - 1; f >= 0; f--) {
-        uint32_t f_pnum, stored_crc;
-        lseek(pager->wal_fd, f * frame_size, SEEK_SET);
-        if (read(pager->wal_fd, &f_pnum, 4) == 4 && read(pager->wal_fd, &stored_crc, 4) == 4 && f_pnum == page_num) {
-          if (read(pager->wal_fd, page, PAGE_SIZE) == PAGE_SIZE) {
-            /* Verify CRC32 checksum to reject corrupt or torn frame writes */
-            uint32_t computed_crc = calculate_crc32((const uint8_t*)page, PAGE_SIZE);
-            if (computed_crc == stored_crc) {
-              read_from_wal = true;
-              break;
+      off_t frame_size = pager->wal_frame_size ? pager->wal_frame_size : WAL_FRAME_SIZE_V1;
+      off_t header_offset = (frame_size == WAL_FRAME_SIZE_V2) ? 4 : 0;
+      if (wal_len >= header_offset) {
+        off_t num_frames = (wal_len - header_offset) / frame_size;
+        for (off_t f = num_frames - 1; f >= 0; f--) {
+          uint32_t f_pnum, stored_crc;
+          off_t offset = header_offset + f * frame_size;
+          lseek(pager->wal_fd, offset, SEEK_SET);
+          if (read(pager->wal_fd, &f_pnum, 4) == 4 && read(pager->wal_fd, &stored_crc, 4) == 4 && f_pnum == page_num) {
+            if (frame_size == WAL_FRAME_SIZE_V2) {
+              lseek(pager->wal_fd, 8 + 8, SEEK_CUR); /* skip commit_ts and lsn */
+            }
+            if (read(pager->wal_fd, page, PAGE_SIZE) == PAGE_SIZE) {
+              /* Verify CRC32 checksum to reject corrupt or torn frame writes */
+              uint32_t computed_crc = calculate_crc32((const uint8_t*)page, PAGE_SIZE);
+              if (computed_crc == stored_crc) {
+                read_from_wal = true;
+                break;
+              }
             }
           }
         }
@@ -419,20 +450,51 @@ void pager_flush(Pager* pager, uint32_t page_num) {
       pager->wal_fd = open(pager->wal_filename, O_RDWR | O_CREAT | O_BINARY, S_IWUSR | S_IRUSR);
     }
     if (pager->wal_fd != -1) {
-      uint32_t crc = calculate_crc32((const uint8_t*)pager->pages[page_num], PAGE_SIZE);
-      uint8_t frame_buf[4 + 4 + PAGE_SIZE];
-      memcpy(frame_buf, &page_num, 4);
-      memcpy(frame_buf + 4, &crc, 4);
-      memcpy(frame_buf + 8, pager->pages[page_num], PAGE_SIZE);
-      lseek(pager->wal_fd, 0, SEEK_END);
-      ssize_t w = write(pager->wal_fd, frame_buf, sizeof(frame_buf));
-      if (w != (ssize_t)sizeof(frame_buf)) {
-        fprintf(stderr, "pager_flush: warning: write to WAL failed\n");
+      off_t wal_len = lseek(pager->wal_fd, 0, SEEK_END);
+      if (wal_len == 0) {
+        uint32_t magic = WAL_MAGIC;
+        if (write(pager->wal_fd, &magic, 4) != 4) {
+          fprintf(stderr, "pager_flush: warning: write WAL magic failed\n");
+        }
+        pager->wal_frame_size = WAL_FRAME_SIZE_V2;
+        pager->wal_lsn = 0;
+      } else if (pager->wal_frame_size == 0) {
+        uint32_t magic = 0;
+        lseek(pager->wal_fd, 0, SEEK_SET);
+        if (read(pager->wal_fd, &magic, 4) == 4 && magic == WAL_MAGIC) {
+          pager->wal_frame_size = WAL_FRAME_SIZE_V2;
+        } else {
+          pager->wal_frame_size = WAL_FRAME_SIZE_V1;
+        }
+        lseek(pager->wal_fd, 0, SEEK_END);
       }
-      /* No fdatasync here — batched once per transaction by the caller
-       * (pager_commit), not once per page. Fsyncing every individual page
-       * flush turns an O(1)-syncs-per-transaction commit into O(pages),
-       * which measured as a 5x throughput regression on bulk inserts. */
+
+      uint32_t crc = calculate_crc32((const uint8_t*)pager->pages[page_num], PAGE_SIZE);
+      lseek(pager->wal_fd, 0, SEEK_END);
+
+      if (pager->wal_frame_size == WAL_FRAME_SIZE_V2) {
+        uint64_t commit_ts = pager->current_commit_ts ? pager->current_commit_ts : (uint64_t)time(NULL);
+        uint64_t lsn = ++pager->wal_lsn;
+        uint8_t frame_buf[WAL_FRAME_SIZE_V2];
+        memcpy(frame_buf, &page_num, 4);
+        memcpy(frame_buf + 4, &crc, 4);
+        memcpy(frame_buf + 8, &commit_ts, 8);
+        memcpy(frame_buf + 16, &lsn, 8);
+        memcpy(frame_buf + 24, pager->pages[page_num], PAGE_SIZE);
+        ssize_t w = write(pager->wal_fd, frame_buf, sizeof(frame_buf));
+        if (w != (ssize_t)sizeof(frame_buf)) {
+          fprintf(stderr, "pager_flush: warning: write to WAL failed\n");
+        }
+      } else {
+        uint8_t frame_buf[WAL_FRAME_SIZE_V1];
+        memcpy(frame_buf, &page_num, 4);
+        memcpy(frame_buf + 4, &crc, 4);
+        memcpy(frame_buf + 8, pager->pages[page_num], PAGE_SIZE);
+        ssize_t w = write(pager->wal_fd, frame_buf, sizeof(frame_buf));
+        if (w != (ssize_t)sizeof(frame_buf)) {
+          fprintf(stderr, "pager_flush: warning: write to WAL failed\n");
+        }
+      }
       return;
     }
   }
@@ -503,6 +565,7 @@ void pager_commit(Pager* pager) {
   }
 
   /* Flush ONLY dirty cached pages to disk */
+  pager->current_commit_ts = (uint64_t)time(NULL);
   for (uint32_t i = 0; i < pager->num_pages; i++) {
     if (i < pager->max_pages && pager->pages[i]) {
       if (pager->is_dirty == NULL || pager->is_dirty[i]) {
@@ -510,6 +573,7 @@ void pager_commit(Pager* pager) {
       }
     }
   }
+  pager->current_commit_ts = 0;
 
   if (pager->use_wal && pager->wal_fd != -1) {
     fdatasync(pager->wal_fd);
@@ -736,8 +800,14 @@ void pager_close(Pager* pager) {
 
   for (uint32_t i = 0; i < pager->max_pages; i++) {
     if (pager->pages[i] != NULL) {
-      if (pager->is_dirty == NULL || pager->is_dirty[i]) {
-        pager_flush(pager, i);
+      if (!pager->use_wal) {
+        if (pager->is_dirty == NULL || pager->is_dirty[i]) {
+          pager_flush(pager, i);
+        }
+      } else {
+        if (pager->is_dirty && pager->is_dirty[i]) {
+          pager_flush(pager, i);
+        }
       }
       free(pager->pages[i]);
       pager->pages[i] = NULL;
@@ -790,26 +860,37 @@ void pager_set_wal_mode(Pager* pager, bool enable_wal) {
 
 void pager_checkpoint(Pager* pager) {
   if (pager->wal_fd == -1) {
-    pager->wal_fd = open(pager->wal_filename, O_RDWR | O_CREAT, S_IWUSR | S_IRUSR);
+    pager->wal_fd = open(pager->wal_filename, O_RDWR | O_CREAT | O_BINARY, S_IWUSR | S_IRUSR);
   }
   if (pager->wal_fd == -1) return;
 
   off_t wal_len = lseek(pager->wal_fd, 0, SEEK_END);
-  off_t frame_size = 4 + 4 + PAGE_SIZE; /* pnum + crc32 + page_data */
-  off_t num_frames = wal_len / frame_size;
+  off_t frame_size = pager->wal_frame_size ? pager->wal_frame_size : WAL_FRAME_SIZE_V1;
+  off_t header_offset = (frame_size == WAL_FRAME_SIZE_V2) ? 4 : 0;
+  off_t num_frames = (wal_len >= header_offset) ? (wal_len - header_offset) / frame_size : 0;
 
   if (num_frames > 0) {
     uint8_t page_buf[PAGE_SIZE];
     for (off_t f = 0; f < num_frames; f++) {
       uint32_t f_pnum, stored_crc;
-      lseek(pager->wal_fd, f * frame_size, SEEK_SET);
+      off_t offset = header_offset + f * frame_size;
+      lseek(pager->wal_fd, offset, SEEK_SET);
       if (read(pager->wal_fd, &f_pnum, 4) == 4 && read(pager->wal_fd, &stored_crc, 4) == 4) {
+        if (frame_size == WAL_FRAME_SIZE_V2) {
+          lseek(pager->wal_fd, 8 + 8, SEEK_CUR); /* skip commit_ts and lsn */
+        }
         if (read(pager->wal_fd, page_buf, PAGE_SIZE) == PAGE_SIZE) {
           uint32_t computed_crc = calculate_crc32(page_buf, PAGE_SIZE);
           if (computed_crc == stored_crc) {
             ssize_t bytes = pwrite(pager->file_descriptor, page_buf, PAGE_SIZE, (off_t)f_pnum * PAGE_SIZE);
             if (bytes != (ssize_t)PAGE_SIZE) {
               fprintf(stderr, "pager_checkpoint: warning: pwrite failed for frame page %u\n", f_pnum);
+            }
+            if ((f_pnum + 1) * PAGE_SIZE > pager->file_length) {
+              pager->file_length = (f_pnum + 1) * PAGE_SIZE;
+            }
+            if (f_pnum >= pager->num_pages) {
+              pager->num_pages = f_pnum + 1;
             }
             if (f_pnum < pager->max_pages && pager->pages[f_pnum]) {
               memcpy(pager->pages[f_pnum], page_buf, PAGE_SIZE);
@@ -824,6 +905,8 @@ void pager_checkpoint(Pager* pager) {
     }
     lseek(pager->wal_fd, 0, SEEK_SET);
     fsync(pager->wal_fd);
+    pager->wal_lsn = 0;
+    pager->wal_frame_size = WAL_FRAME_SIZE_V2;
   }
 
   for (uint32_t i = 0; i < pager->num_pages; i++) {
@@ -834,4 +917,368 @@ void pager_checkpoint(Pager* pager) {
   }
 
   printf("[WAL] Checkpoint completed. All frames written to main database file.\n");
+}
+
+void pager_backup(Pager* pager, const char* dest_filename) {
+  if (pager->is_memory) {
+    fprintf(stderr, "Error: Cannot backup in-memory database.\n");
+    return;
+  }
+
+  /* 1. Acquire EXCLUSIVE lock on pager (blocks all writers for the duration) */
+  int retries = 50;
+  while (!pager_lock(pager, EXCLUSIVE_LOCK)) {
+    usleep(10000);
+    if (--retries <= 0) {
+      fprintf(stderr, "Error: Database is locked (exclusive lock timeout for backup).\n");
+      return;
+    }
+  }
+
+  /* 2. Write all dirty in-memory pages to WAL (or main file if not WAL) so on-disk state is current.
+   * Do NOT checkpoint! */
+  if (pager->is_dirty) {
+    for (uint32_t i = 0; i < pager->num_pages; i++) {
+      if (i < pager->max_pages && pager->pages[i]) {
+        if (pager->is_dirty[i]) {
+          pager_flush(pager, i);
+        }
+      }
+    }
+  } else if (!pager->use_wal) {
+    for (uint32_t i = 0; i < pager->num_pages; i++) {
+      if (i < pager->max_pages && pager->pages[i]) {
+        pager_flush(pager, i);
+      }
+    }
+  }
+
+  /* 3. fdatasync to ensure durable state */
+  if (pager->use_wal && pager->wal_fd != -1) {
+    fdatasync(pager->wal_fd);
+  } else if (pager->file_descriptor != -1) {
+    fdatasync(pager->file_descriptor);
+  }
+
+  char dest_tmp[600];
+  char dest_wal[600];
+  char dest_wal_tmp[600];
+  snprintf(dest_tmp, sizeof(dest_tmp), "%s.tmp", dest_filename);
+  snprintf(dest_wal, sizeof(dest_wal), "%s-wal", dest_filename);
+  snprintf(dest_wal_tmp, sizeof(dest_wal_tmp), "%s-wal.tmp", dest_filename);
+
+  /* 4. Open dest.tmp */
+  int dest_fd = open(dest_tmp, O_RDWR | O_CREAT | O_TRUNC | O_BINARY, S_IWUSR | S_IRUSR);
+  if (dest_fd == -1) {
+    fprintf(stderr, "Error: Unable to create backup file '%s': %s\n", dest_tmp, strerror(errno));
+    pager_unlock(pager);
+    return;
+  }
+
+  /* 5. Copy main file page-by-page into dest.tmp */
+  off_t file_len = lseek(pager->file_descriptor, 0, SEEK_END);
+  off_t total_pages = file_len / PAGE_SIZE;
+  uint8_t page_buf[PAGE_SIZE];
+  bool copy_failed = false;
+
+  for (off_t p = 0; p < total_pages; p++) {
+    lseek(pager->file_descriptor, p * PAGE_SIZE, SEEK_SET);
+    if (read(pager->file_descriptor, page_buf, PAGE_SIZE) == PAGE_SIZE) {
+      if (write(dest_fd, page_buf, PAGE_SIZE) != PAGE_SIZE) {
+        copy_failed = true;
+        break;
+      }
+    } else {
+      copy_failed = true;
+      break;
+    }
+  }
+
+  fdatasync(dest_fd);
+  close(dest_fd);
+
+  if (copy_failed) {
+    fprintf(stderr, "Error: Failed copying main database file to backup.\n");
+    unlink(dest_tmp);
+    pager_unlock(pager);
+    return;
+  }
+
+  if (rename(dest_tmp, dest_filename) != 0) {
+    fprintf(stderr, "Error: Failed to rename backup file '%s': %s\n", dest_filename, strerror(errno));
+    unlink(dest_tmp);
+    pager_unlock(pager);
+    return;
+  }
+
+  /* 8. Copy WAL verbatim if WAL mode is active and has data */
+  uint32_t captured_frames = 0;
+  if (pager->use_wal && pager->wal_fd != -1) {
+    off_t wal_len = lseek(pager->wal_fd, 0, SEEK_END);
+    if (wal_len > 0) {
+      int dest_wal_fd = open(dest_wal_tmp, O_RDWR | O_CREAT | O_TRUNC | O_BINARY, S_IWUSR | S_IRUSR);
+      if (dest_wal_fd != -1) {
+        lseek(pager->wal_fd, 0, SEEK_SET);
+        char copy_buf[4096];
+        ssize_t nread;
+        bool wal_copy_failed = false;
+        while ((nread = read(pager->wal_fd, copy_buf, sizeof(copy_buf))) > 0) {
+          if (write(dest_wal_fd, copy_buf, (size_t)nread) != nread) {
+            wal_copy_failed = true;
+            break;
+          }
+        }
+        fdatasync(dest_wal_fd);
+        close(dest_wal_fd);
+
+        if (!wal_copy_failed) {
+          rename(dest_wal_tmp, dest_wal);
+          off_t frame_size = pager->wal_frame_size ? pager->wal_frame_size : WAL_FRAME_SIZE_V1;
+          off_t header_offset = (frame_size == WAL_FRAME_SIZE_V2) ? 4 : 0;
+          if (wal_len >= header_offset) {
+            captured_frames = (uint32_t)((wal_len - header_offset) / frame_size);
+          }
+        } else {
+          unlink(dest_wal_tmp);
+        }
+      }
+    } else {
+      unlink(dest_wal);
+    }
+  } else {
+    unlink(dest_wal);
+  }
+
+  pager_unlock(pager);
+  printf("Backup completed to '%s' (%u WAL frames captured).\n", dest_filename, captured_frames);
+}
+
+bool pager_restore(const char* src_file, const char* dest_file,
+                   uint64_t until_ts, bool use_ts,
+                   uint64_t until_lsn, bool use_lsn) {
+  struct stat st;
+  if (stat(dest_file, &st) == 0) {
+    printf("Error: '%s' already exists. Remove it first or choose a different output path.\n", dest_file);
+    return false;
+  }
+
+  int src_fd = open(src_file, O_RDONLY | O_BINARY);
+  if (src_fd == -1) {
+    fprintf(stderr, "Error: Unable to open source backup file '%s': %s\n", src_file, strerror(errno));
+    return false;
+  }
+
+  char src_wal[600];
+  snprintf(src_wal, sizeof(src_wal), "%s-wal", src_file);
+  int wal_fd = open(src_wal, O_RDONLY | O_BINARY);
+  off_t wal_len = (wal_fd != -1) ? lseek(wal_fd, 0, SEEK_END) : 0;
+
+  if (use_ts || use_lsn) {
+    if (wal_fd == -1 || wal_len == 0) {
+      printf("Error: backup WAL is empty or missing; UNTIL is not supported. Omit UNTIL to perform a full restore.\n");
+      if (wal_fd != -1) close(wal_fd);
+      close(src_fd);
+      return false;
+    }
+  }
+
+  bool is_v2 = false;
+  uint32_t magic = 0;
+  if (wal_fd != -1 && wal_len >= 4) {
+    lseek(wal_fd, 0, SEEK_SET);
+    if (read(wal_fd, &magic, 4) == 4 && magic == WAL_MAGIC) {
+      is_v2 = true;
+    }
+  }
+
+  if ((use_ts || use_lsn) && !is_v2) {
+    printf("Error: backup WAL is v1 format; UNTIL is not supported. Omit UNTIL to perform a full restore.\n");
+    if (wal_fd != -1) close(wal_fd);
+    close(src_fd);
+    return false;
+  }
+
+  off_t frame_size = is_v2 ? WAL_FRAME_SIZE_V2 : WAL_FRAME_SIZE_V1;
+  off_t header_offset = is_v2 ? 4 : 0;
+  off_t num_frames = (wal_fd != -1 && wal_len >= header_offset) ? (wal_len - header_offset) / frame_size : 0;
+
+  if ((use_ts || use_lsn) && num_frames == 0) {
+    printf("Error: backup WAL has no frames; UNTIL is not supported.\n");
+    if (wal_fd != -1) close(wal_fd);
+    close(src_fd);
+    return false;
+  }
+
+  if (is_v2 && num_frames > 0 && (use_ts || use_lsn)) {
+    uint64_t earliest_ts = 0, earliest_lsn = 0;
+    lseek(wal_fd, header_offset + 4 + 4, SEEK_SET);
+    if (read(wal_fd, &earliest_ts, 8) == 8 && read(wal_fd, &earliest_lsn, 8) == 8) {
+      if (use_ts && until_ts < earliest_ts) {
+        printf("Error: requested UNTIL timestamp %lu predates the earliest WAL frame in this backup (earliest: ts=%lu, lsn=%lu). No partial restore possible — consider restoring without UNTIL for the base snapshot.\n",
+               (unsigned long)until_ts, (unsigned long)earliest_ts, (unsigned long)earliest_lsn);
+        close(wal_fd);
+        close(src_fd);
+        return false;
+      }
+      if (use_lsn && until_lsn < earliest_lsn) {
+        printf("Error: requested UNTIL LSN %lu predates the earliest WAL frame in this backup (earliest: ts=%lu, lsn=%lu). No partial restore possible — consider restoring without UNTIL for the base snapshot.\n",
+               (unsigned long)until_lsn, (unsigned long)earliest_ts, (unsigned long)earliest_lsn);
+        close(wal_fd);
+        close(src_fd);
+        return false;
+      }
+    }
+  }
+
+  typedef struct PageMapNode {
+    uint32_t pnum;
+    off_t    data_offset;
+    struct PageMapNode* next;
+  } PageMapNode;
+
+  #define PAGE_MAP_BUCKETS 1024
+  PageMapNode* buckets[PAGE_MAP_BUCKETS];
+  memset(buckets, 0, sizeof(buckets));
+
+  uint64_t max_applied_ts = 0;
+  uint64_t max_applied_lsn = 0;
+  uint8_t page_buf[PAGE_SIZE];
+
+  for (off_t f = 0; f < num_frames; f++) {
+    off_t frame_offset = header_offset + f * frame_size;
+    uint32_t f_pnum, stored_crc;
+    uint64_t frame_ts = 0, frame_lsn = 0;
+
+    lseek(wal_fd, frame_offset, SEEK_SET);
+    if (read(wal_fd, &f_pnum, 4) != 4 || read(wal_fd, &stored_crc, 4) != 4) {
+      break;
+    }
+    if (is_v2) {
+      if (read(wal_fd, &frame_ts, 8) != 8 || read(wal_fd, &frame_lsn, 8) != 8) {
+        break;
+      }
+      if (use_ts && frame_ts > until_ts) {
+        break;
+      }
+      if (use_lsn && frame_lsn > until_lsn) {
+        break;
+      }
+    }
+    off_t data_offset = frame_offset + (is_v2 ? (4 + 4 + 8 + 8) : (4 + 4));
+    if (read(wal_fd, page_buf, PAGE_SIZE) != PAGE_SIZE) {
+      break;
+    }
+    uint32_t computed_crc = calculate_crc32(page_buf, PAGE_SIZE);
+    if (computed_crc != stored_crc) {
+      continue;
+    }
+
+    if (is_v2) {
+      if (frame_ts > max_applied_ts) max_applied_ts = frame_ts;
+      if (frame_lsn > max_applied_lsn) max_applied_lsn = frame_lsn;
+    }
+
+    uint32_t b = f_pnum % PAGE_MAP_BUCKETS;
+    PageMapNode* node = buckets[b];
+    while (node) {
+      if (node->pnum == f_pnum) {
+        node->data_offset = data_offset;
+        break;
+      }
+      node = node->next;
+    }
+    if (!node) {
+      node = malloc(sizeof(PageMapNode));
+      node->pnum = f_pnum;
+      node->data_offset = data_offset;
+      node->next = buckets[b];
+      buckets[b] = node;
+    }
+  }
+
+  char dest_tmp[600];
+  snprintf(dest_tmp, sizeof(dest_tmp), "%s.tmp", dest_file);
+  int dest_fd = open(dest_tmp, O_RDWR | O_CREAT | O_TRUNC | O_BINARY, S_IWUSR | S_IRUSR);
+  if (dest_fd == -1) {
+    fprintf(stderr, "Error: Unable to create restored file '%s': %s\n", dest_tmp, strerror(errno));
+    for (int b = 0; b < PAGE_MAP_BUCKETS; b++) {
+      PageMapNode* node = buckets[b];
+      while (node) {
+        PageMapNode* tmp = node->next;
+        free(node);
+        node = tmp;
+      }
+    }
+    if (wal_fd != -1) close(wal_fd);
+    close(src_fd);
+    return false;
+  }
+
+  off_t src_len = lseek(src_fd, 0, SEEK_END);
+  off_t total_src_pages = src_len / PAGE_SIZE;
+  bool copy_failed = false;
+
+  for (off_t p = 0; p < total_src_pages; p++) {
+    lseek(src_fd, p * PAGE_SIZE, SEEK_SET);
+    if (read(src_fd, page_buf, PAGE_SIZE) == PAGE_SIZE) {
+      if (write(dest_fd, page_buf, PAGE_SIZE) != PAGE_SIZE) {
+        copy_failed = true;
+        break;
+      }
+    } else {
+      copy_failed = true;
+      break;
+    }
+  }
+
+  if (!copy_failed) {
+    for (int b = 0; b < PAGE_MAP_BUCKETS; b++) {
+      PageMapNode* node = buckets[b];
+      while (node) {
+        lseek(wal_fd, node->data_offset, SEEK_SET);
+        if (read(wal_fd, page_buf, PAGE_SIZE) == PAGE_SIZE) {
+          lseek(dest_fd, (off_t)node->pnum * PAGE_SIZE, SEEK_SET);
+          if (write(dest_fd, page_buf, PAGE_SIZE) != PAGE_SIZE) {
+            copy_failed = true;
+            break;
+          }
+        }
+        node = node->next;
+      }
+      if (copy_failed) break;
+    }
+  }
+
+  for (int b = 0; b < PAGE_MAP_BUCKETS; b++) {
+    PageMapNode* node = buckets[b];
+    while (node) {
+      PageMapNode* tmp = node->next;
+      free(node);
+      node = tmp;
+    }
+  }
+
+  fdatasync(dest_fd);
+  close(dest_fd);
+  if (wal_fd != -1) close(wal_fd);
+  close(src_fd);
+
+  if (copy_failed) {
+    fprintf(stderr, "Error: Failed writing restored database.\n");
+    unlink(dest_tmp);
+    return false;
+  }
+
+  if (rename(dest_tmp, dest_file) != 0) {
+    fprintf(stderr, "Error: Failed to rename restored file to '%s': %s\n", dest_file, strerror(errno));
+    unlink(dest_tmp);
+    return false;
+  }
+
+  if (is_v2) {
+    printf("Restored to LSN %lu (timestamp %lu) -> '%s'.\n", (unsigned long)max_applied_lsn, (unsigned long)max_applied_ts, dest_file);
+  } else {
+    printf("Restored -> '%s'.\n", dest_file);
+  }
+  return true;
 }

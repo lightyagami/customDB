@@ -5408,6 +5408,16 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
     }
     return execute_vacuum(catalog, pager);
   }
+  if (stmt->type == STATEMENT_BACKUP) {
+    pager_backup(pager, stmt->pitr_dest);
+    return EXECUTE_SUCCESS;
+  }
+  if (stmt->type == STATEMENT_RESTORE) {
+    bool ok = pager_restore(stmt->pitr_src, stmt->pitr_dest,
+                            stmt->pitr_until_ts, stmt->pitr_use_ts,
+                            stmt->pitr_until_lsn, stmt->pitr_use_lsn);
+    return ok ? EXECUTE_SUCCESS : EXECUTE_ERROR;
+  }
   if (stmt->type == STATEMENT_PRAGMA) {
     return execute_pragma(stmt, catalog, pager);
   }

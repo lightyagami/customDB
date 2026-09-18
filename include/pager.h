@@ -28,10 +28,17 @@ typedef struct {
   /* Concurrency Lock State */
   PagerLockState lock_state;
 
+#define WAL_MAGIC          0x574C3200u   /* "WL2\0" */
+#define WAL_FRAME_SIZE_V1  (4 + 4 + PAGE_SIZE)          /* 4104 */
+#define WAL_FRAME_SIZE_V2  (4 + 4 + 8 + 8 + PAGE_SIZE)  /* 4120 */
+
   /* Write-Ahead Logging (WAL Mode) */
   bool     use_wal;
   int      wal_fd;
   char     wal_filename[512];
+  uint32_t wal_frame_size;
+  uint64_t wal_lsn;
+  uint64_t current_commit_ts;
 
   /* Savepoints */
   uint32_t num_savepoints;
@@ -89,6 +96,10 @@ void     pager_savepoint(Pager* pager, const char* name);
 void     pager_rollback_to_savepoint(Pager* pager, const char* name);
 void     pager_release_savepoint(Pager* pager, const char* name);
 
-/* Write-Ahead Logging (WAL) */
+/* Write-Ahead Logging (WAL) & PITR */
 void     pager_set_wal_mode(Pager* pager, bool enable_wal);
 void     pager_checkpoint(Pager* pager);
+void     pager_backup(Pager* pager, const char* dest_filename);
+bool     pager_restore(const char* src_file, const char* dest_file,
+                       uint64_t until_ts, bool use_ts,
+                       uint64_t until_lsn, bool use_lsn);

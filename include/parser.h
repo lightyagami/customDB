@@ -28,6 +28,8 @@ typedef enum {
   STATEMENT_ANALYZE,
   STATEMENT_CREATE_VTABLE,
   STATEMENT_ALTER_TABLE,
+  STATEMENT_BACKUP,
+  STATEMENT_RESTORE,
   STATEMENT_HELP,
 } StatementType;
 
@@ -319,6 +321,14 @@ struct Statement {
 
   /* INSERT conflict resolution */
   ConflictAction conflict_action;
+
+  /* BACKUP / RESTORE (PITR) */
+  char     pitr_src[256];      /* RESTORE: source backup file */
+  char     pitr_dest[256];     /* BACKUP: dest file; RESTORE: TO '<file>' */
+  uint64_t pitr_until_ts;      /* UNTIL TIMESTAMP value */
+  uint64_t pitr_until_lsn;     /* UNTIL LSN value */
+  bool     pitr_use_ts;
+  bool     pitr_use_lsn;
 };
 
 PrepareResult prepare_statement(const char* input, Statement* out);

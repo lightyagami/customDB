@@ -179,6 +179,8 @@ int main(int argc, char* argv[]) {
       case EXECUTE_BUSY:
         printf("Error: Database is locked.\n");
         break;
+      case EXECUTE_ERROR:
+        break;
     }
 
     statement_free_children(statement);
