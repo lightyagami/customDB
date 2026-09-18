@@ -43,3 +43,25 @@ def test_temporal_history_tables():
     # Clean up
     if os.path.exists(db_file):
         os.remove(db_file)
+
+def test_history_combined_with_ttl_ordering():
+    db_file = "test_history_ttl.db"
+    if os.path.exists(db_file):
+        os.remove(db_file)
+
+    # Test WITH TTL first, then WITH HISTORY
+    cmds = [
+        "create table s1 (id INT, note TEXT) WITH TTL = 60 WITH HISTORY",
+        "create table s2 (id INT, note TEXT) WITH HISTORY WITH TTL = 60",
+        "insert into s1 values (1, 'active')",
+        "insert into s2 values (2, 'active')",
+        "select history_action, id from _history_s1",
+        "select history_action, id from _history_s2",
+        ".exit"
+    ]
+    out = "\n".join(run_db(db_file, cmds))
+    assert "(INSERT, 1)" in out, f"Expected _history_s1 to record insert: {out}"
+    assert "(INSERT, 2)" in out, f"Expected _history_s2 to record insert: {out}"
+
+    if os.path.exists(db_file):
+        os.remove(db_file)

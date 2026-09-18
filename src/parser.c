@@ -1707,14 +1707,28 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
           post++;
         }
       }
-      post = skip_whitespace(post);
-      if (strncasecmp(post, "with ttl", 8) == 0) {
-        post += 8;
+      while (*post) {
         post = skip_whitespace(post);
-        if (*post == '=') { post++; post = skip_whitespace(post); }
-        out->new_table.default_ttl = (uint32_t)atoi(post);
-      } else if (strncasecmp(post, "with history", 12) == 0) {
-        out->new_table.with_history = true;
+        if (*post == ';' || *post == '\0') break;
+        if (*post == ',') { post++; post = skip_whitespace(post); }
+
+        if (strncasecmp(post, "with", 4) == 0 && isspace((unsigned char)post[4])) {
+          post += 4;
+          post = skip_whitespace(post);
+        }
+
+        if (strncasecmp(post, "ttl", 3) == 0 && (isspace((unsigned char)post[3]) || post[3] == '=')) {
+          post += 3;
+          post = skip_whitespace(post);
+          if (*post == '=') { post++; post = skip_whitespace(post); }
+          out->new_table.default_ttl = (uint32_t)atoi(post);
+          while (isdigit((unsigned char)*post)) post++;
+        } else if (strncasecmp(post, "history", 7) == 0 && (isspace((unsigned char)post[7]) || post[7] == ';' || post[7] == ',' || post[7] == '\0')) {
+          out->new_table.with_history = true;
+          post += 7;
+        } else {
+          break;
+        }
       }
 
       return PREPARE_SUCCESS;
