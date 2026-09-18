@@ -80,6 +80,21 @@ def test_vector_type_and_distance():
     assert len(result_rows) == 1, f"Expected exactly 1 row returned with LIMIT 1, got: {result_rows}"
     assert result_rows[0] == "(1)" or result_rows[0] == "(3)", f"Expected nearest row, got: {result_rows[0]}"
 
+    # 7. Test mixed whole/decimal distance KNN ordering
+    knn_mixed = [
+        "insert into items values (4, '[10.0, 10.0, 10.0]')",
+        "select id from items order by l2_distance(embedding, '[1.0, 2.0, 3.0]') asc limit 2",
+        ".exit"
+    ]
+    lines_mixed = run_db(db_file, knn_mixed)
+    rows_mixed = []
+    for l in lines_mixed:
+        s = l.replace("db >", "").strip()
+        if s.startswith("(") and s.endswith(")"):
+            rows_mixed.append(s)
+    assert len(rows_mixed) == 2, f"Expected exactly 2 rows returned with LIMIT 2, got: {rows_mixed}"
+    assert "(4)" not in rows_mixed, f"Row 4 (distance ~13.9) should not be in top 2: {rows_mixed}"
+
     # Clean up
     if os.path.exists(db_file):
         os.remove(db_file)

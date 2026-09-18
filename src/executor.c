@@ -237,26 +237,28 @@ static int compare_row_sort_entries(const void* a, const void* b) {
   const RowSortEntry* rb = (const RowSortEntry*)b;
   uint32_t n_keys = (ra->num_sort_keys < rb->num_sort_keys) ? ra->num_sort_keys : rb->num_sort_keys;
   for (uint32_t k = 0; k < n_keys; k++) {
-    ColumnType type = ra->sort_types[k];
+    ColumnType type_a = ra->sort_types[k];
+    ColumnType type_b = rb->sort_types[k];
     int cmp = 0;
     if (ra->sort_keys[k].is_null || rb->sort_keys[k].is_null) {
       if (ra->sort_keys[k].is_null && rb->sort_keys[k].is_null) cmp = 0;
       else if (ra->sort_keys[k].is_null) cmp = -1;
       else cmp = 1;
-    } else if (type == COL_INT) {
-      int32_t va = ra->sort_keys[k].int_val;
-      int32_t vb = rb->sort_keys[k].int_val;
+    } else if ((type_a == COL_INT || type_a == COL_DOUBLE || type_a == COL_FLOAT || type_a == COL_NUMERIC || type_a == COL_DECIMAL) &&
+               (type_b == COL_INT || type_b == COL_DOUBLE || type_b == COL_FLOAT || type_b == COL_NUMERIC || type_b == COL_DECIMAL)) {
+      double va = (type_a == COL_INT) ? (double)ra->sort_keys[k].int_val :
+                  ((type_a == COL_FLOAT) ? (double)ra->sort_keys[k].float_val : ra->sort_keys[k].double_val);
+      double vb = (type_b == COL_INT) ? (double)rb->sort_keys[k].int_val :
+                  ((type_b == COL_FLOAT) ? (double)rb->sort_keys[k].float_val : rb->sort_keys[k].double_val);
       cmp = (va > vb) - (va < vb);
-    } else if (type == COL_DOUBLE || type == COL_FLOAT) {
-      double va = (type == COL_DOUBLE) ? ra->sort_keys[k].double_val : ra->sort_keys[k].float_val;
-      double vb = (type == COL_DOUBLE) ? rb->sort_keys[k].double_val : rb->sort_keys[k].float_val;
-      cmp = (va > vb) - (va < vb);
-    } else if (type == COL_BOOL) {
+    } else if (type_a == COL_BOOL && type_b == COL_BOOL) {
       bool va = ra->sort_keys[k].bool_val;
       bool vb = rb->sort_keys[k].bool_val;
       cmp = (va > vb) - (va < vb);
     } else {
-      cmp = compare_strings_collated(ra->sort_keys[k].text_val, rb->sort_keys[k].text_val, ra->sort_colls[k]);
+      const char* sa = (type_a == COL_TEXT || type_a == COL_VARCHAR || type_a == COL_BLOB || type_a == COL_VECTOR) ? (ra->sort_keys[k].text_val ? ra->sort_keys[k].text_val : "") : "";
+      const char* sb = (type_b == COL_TEXT || type_b == COL_VARCHAR || type_b == COL_BLOB || type_b == COL_VECTOR) ? (rb->sort_keys[k].text_val ? rb->sort_keys[k].text_val : "") : "";
+      cmp = compare_strings_collated(sa, sb, ra->sort_colls[k]);
     }
     if (cmp != 0) {
       if (ra->sort_descs[k]) return -cmp;
@@ -2182,17 +2184,12 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
                 if (strcasecmp(expr_out, "null") == 0) {
                   entries[count].sort_types[sk_idx] = COL_INT;
                   entries[count].sort_keys[sk_idx].is_null = true;
-                } else if (strchr(expr_out, '.') != NULL || strchr(expr_out, 'e') != NULL || strchr(expr_out, 'E') != NULL) {
-                  entries[count].sort_types[sk_idx] = COL_DOUBLE;
-                  entries[count].sort_keys[sk_idx].double_val = atof(expr_out);
                 } else {
-                  bool is_num = (strlen(expr_out) > 0);
-                  for (size_t s = (expr_out[0] == '-' ? 1 : 0); expr_out[s]; s++) {
-                    if (!isdigit((unsigned char)expr_out[s])) { is_num = false; break; }
-                  }
-                  if (is_num) {
-                    entries[count].sort_types[sk_idx] = COL_INT;
-                    entries[count].sort_keys[sk_idx].int_val = atoi(expr_out);
+                  char* endptr = NULL;
+                  double dval = strtod(expr_out, &endptr);
+                  if (endptr != expr_out && (*endptr == '\0' || isspace((unsigned char)*endptr))) {
+                    entries[count].sort_types[sk_idx] = COL_DOUBLE;
+                    entries[count].sort_keys[sk_idx].double_val = dval;
                   } else {
                     entries[count].sort_types[sk_idx] = COL_TEXT;
                     value_set_text(&entries[count].sort_keys[sk_idx], expr_out);
@@ -3018,17 +3015,15 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
             char expr_out[256] = {0};
             eval_expr_string(stmt->order_by_items[k].col_name, &combined_def, stream[i].vals, expr_out, sizeof(expr_out));
             if (expr_out[0] != '\0') {
-              if (strchr(expr_out, '.') != NULL || strchr(expr_out, 'e') != NULL || strchr(expr_out, 'E') != NULL) {
-                e->sort_types[k] = COL_DOUBLE;
-                e->sort_keys[k].double_val = atof(expr_out);
+              if (strcasecmp(expr_out, "null") == 0) {
+                e->sort_types[k] = COL_INT;
+                e->sort_keys[k].is_null = true;
               } else {
-                bool is_num = (strlen(expr_out) > 0);
-                for (size_t s = (expr_out[0] == '-' ? 1 : 0); expr_out[s]; s++) {
-                  if (!isdigit((unsigned char)expr_out[s])) { is_num = false; break; }
-                }
-                if (is_num) {
-                  e->sort_types[k] = COL_INT;
-                  e->sort_keys[k].int_val = atoi(expr_out);
+                char* endptr = NULL;
+                double dval = strtod(expr_out, &endptr);
+                if (endptr != expr_out && (*endptr == '\0' || isspace((unsigned char)*endptr))) {
+                  e->sort_types[k] = COL_DOUBLE;
+                  e->sort_keys[k].double_val = dval;
                 } else {
                   e->sort_types[k] = COL_TEXT;
                   value_set_text(&e->sort_keys[k], expr_out);
@@ -3048,17 +3043,15 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
           char expr_out[256] = {0};
           eval_expr_string(stmt->order_by_col, &combined_def, stream[i].vals, expr_out, sizeof(expr_out));
           if (expr_out[0] != '\0') {
-            if (strchr(expr_out, '.') != NULL || strchr(expr_out, 'e') != NULL || strchr(expr_out, 'E') != NULL) {
-              e->sort_types[0] = COL_DOUBLE;
-              e->sort_keys[0].double_val = atof(expr_out);
+            if (strcasecmp(expr_out, "null") == 0) {
+              e->sort_types[0] = COL_INT;
+              e->sort_keys[0].is_null = true;
             } else {
-              bool is_num = (strlen(expr_out) > 0);
-              for (size_t s = (expr_out[0] == '-' ? 1 : 0); expr_out[s]; s++) {
-                if (!isdigit((unsigned char)expr_out[s])) { is_num = false; break; }
-              }
-              if (is_num) {
-                e->sort_types[0] = COL_INT;
-                e->sort_keys[0].int_val = atoi(expr_out);
+              char* endptr = NULL;
+              double dval = strtod(expr_out, &endptr);
+              if (endptr != expr_out && (*endptr == '\0' || isspace((unsigned char)*endptr))) {
+                e->sort_types[0] = COL_DOUBLE;
+                e->sort_keys[0].double_val = dval;
               } else {
                 e->sort_types[0] = COL_TEXT;
                 value_set_text(&e->sort_keys[0], expr_out);
