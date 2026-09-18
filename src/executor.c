@@ -1883,6 +1883,107 @@ static ExecuteResult execute_set_operation(Statement* stmt, Catalog* catalog, Pa
   return EXECUTE_SUCCESS;
 }
 
+typedef enum {
+  ACCESS_SCAN,
+  ACCESS_PK_SEEK,
+  ACCESS_INDEX_SEEK
+} AccessPathType;
+
+static void value_from_raw(ColumnType type, const char* raw, bool is_null, Value* out_val) {
+  value_init(out_val);
+  if (is_null || raw == NULL || strlen(raw) == 0) {
+    out_val->is_null = true;
+    return;
+  }
+  out_val->is_null = false;
+  switch (type) {
+    case COL_INT:       out_val->int_val = atoi(raw); break;
+    case COL_FLOAT:     out_val->float_val = (float)atof(raw); out_val->double_val = atof(raw); break;
+    case COL_DOUBLE:
+    case COL_NUMERIC:
+    case COL_DECIMAL:   out_val->double_val = atof(raw); break;
+    case COL_BOOL:      out_val->bool_val = (strcasecmp(raw, "true") == 0 || strcmp(raw, "1") == 0); break;
+    case COL_BLOB:
+    case COL_DATETIME:
+    case COL_DATE:
+    case COL_TIME:
+    case COL_TIMESTAMP:
+    case COL_TEXT:
+    case COL_VARCHAR:
+    case COL_VECTOR:    value_set_text(out_val, raw); break;
+  }
+}
+
+static void add_selected_row(RowSortEntry** p_entries, uint32_t* p_count, uint32_t* p_capacity,
+                             Statement* stmt, TableDef* def, Value* row_vals) {
+  if (*p_count >= *p_capacity) {
+    *p_capacity *= 2;
+    *p_entries = realloc(*p_entries, sizeof(RowSortEntry) * (*p_capacity));
+  }
+  uint32_t idx = *p_count;
+  memset(&(*p_entries)[idx], 0, sizeof(RowSortEntry));
+  for (uint32_t c = 0; c < def->num_cols; c++) {
+    value_copy(&(*p_entries)[idx].row[c], &row_vals[c]);
+  }
+  (*p_entries)[idx].num_sort_keys = 0;
+  if (stmt->has_order_by) {
+    uint32_t num_items = (stmt->num_order_by > 0) ? stmt->num_order_by : 1;
+    for (uint32_t k = 0; k < num_items; k++) {
+      const char* target_col = (stmt->num_order_by > 0) ? stmt->order_by_items[k].col_name : stmt->order_by_col;
+      bool target_desc = (stmt->num_order_by > 0) ? stmt->order_by_items[k].is_desc : stmt->order_by_desc;
+      CollationType target_coll = (stmt->num_order_by > 0) ? stmt->order_by_items[k].collation : stmt->order_by_collation;
+
+      char resolved_expr[256];
+      snprintf(resolved_expr, sizeof(resolved_expr), "%s", target_col);
+      if (isdigit((unsigned char)target_col[0]) && stmt->num_select_cols > 0) {
+        int pos = atoi(target_col);
+        if (pos >= 1 && pos <= (int)stmt->num_select_cols) {
+          snprintf(resolved_expr, sizeof(resolved_expr), "%s", stmt->select_cols[pos - 1].col_name);
+        }
+      }
+
+      bool found_col = false;
+      for (uint32_t c = 0; c < def->num_cols; c++) {
+        if (strcasecmp(def->columns[c].name, resolved_expr) == 0) {
+          if ((*p_entries)[idx].num_sort_keys < 4) {
+            uint32_t sk_idx = (*p_entries)[idx].num_sort_keys++;
+            value_copy(&(*p_entries)[idx].sort_keys[sk_idx], &row_vals[c]);
+            (*p_entries)[idx].sort_types[sk_idx] = def->columns[c].type;
+            (*p_entries)[idx].sort_colls[sk_idx] = target_coll;
+            (*p_entries)[idx].sort_descs[sk_idx] = target_desc;
+          }
+          found_col = true;
+          break;
+        }
+      }
+
+      if (!found_col) {
+        char expr_out[256] = {0};
+        eval_expr_string(resolved_expr, def, row_vals, expr_out, sizeof(expr_out));
+        if (expr_out[0] != '\0' && (*p_entries)[idx].num_sort_keys < 4) {
+          uint32_t sk_idx = (*p_entries)[idx].num_sort_keys++;
+          (*p_entries)[idx].sort_colls[sk_idx] = target_coll;
+          (*p_entries)[idx].sort_descs[sk_idx] = target_desc;
+          if (strcasecmp(expr_out, "null") == 0) {
+            (*p_entries)[idx].sort_types[sk_idx] = COL_INT;
+            (*p_entries)[idx].sort_keys[sk_idx].is_null = true;
+          } else {
+            char* endptr = NULL;
+            double dval = strtod(expr_out, &endptr);
+            if (endptr != expr_out && (*endptr == '\0' || isspace((unsigned char)*endptr))) {
+              (*p_entries)[idx].sort_types[sk_idx] = COL_DOUBLE;
+              (*p_entries)[idx].sort_keys[sk_idx].double_val = dval;
+            } else {
+              (*p_entries)[idx].sort_types[sk_idx] = COL_TEXT;
+              value_set_text(&(*p_entries)[idx].sort_keys[sk_idx], expr_out);
+            }
+          }
+        }
+      }
+    }
+  }
+  (*p_count)++;
+}
 
 /* Compile and run SELECT statement on VDBE */
 static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* catalog, Pager* pager) {
@@ -2117,94 +2218,179 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
       clock_gettime(CLOCK_MONOTONIC, &start_time);
     }
     uint64_t rows_scanned = 0;
-    Table table = { pager, def };
-    Cursor* cursor = btree_start(&table);
+    AccessPathType path_type = ACCESS_SCAN;
+    uint32_t seek_col_idx = 0;
+    SingleCond* seek_cond = NULL;
+
+    if (wc->has_where && wc->num_conds > 0) {
+      bool all_and = true;
+      for (uint32_t i = 0; i + 1 < wc->num_conds; i++) {
+        if (wc->logic_ops[i] != LOGIC_AND) {
+          all_and = false;
+          break;
+        }
+      }
+
+      if (all_and) {
+        /* Primary Key seek check */
+        for (uint32_t i = 0; i < wc->num_conds; i++) {
+          SingleCond* c = &wc->conds[i];
+          if (!c->is_subquery && strlen(c->raw_val) > 0 && strcasecmp(c->raw_val, "null") != 0 &&
+              c->op != OP_IS_NULL && c->op != OP_IS_NOT_NULL &&
+              strcmp(def->columns[0].name, c->col_name) == 0) {
+            if (c->op == OP_EQ || c->op == OP_GT || c->op == OP_GTE) {
+              path_type = ACCESS_PK_SEEK;
+              seek_col_idx = 0;
+              seek_cond = c;
+              break;
+            }
+          }
+        }
+
+        /* Secondary index seek check */
+        if (path_type == ACCESS_SCAN) {
+          for (uint32_t i = 0; i < wc->num_conds; i++) {
+            SingleCond* c = &wc->conds[i];
+            if (!c->is_subquery && strlen(c->raw_val) > 0 && strcasecmp(c->raw_val, "null") != 0 &&
+                c->op != OP_IS_NULL && c->op != OP_IS_NOT_NULL) {
+              for (uint32_t col_idx = 1; col_idx < def->num_cols; col_idx++) {
+                Column* col = &def->columns[col_idx];
+                if (col->has_index && col->index_root_page != 0 &&
+                    !col->idx_is_partial && !col->idx_is_expr &&
+                    strcmp(col->name, c->col_name) == 0) {
+                  if (c->op == OP_EQ || c->op == OP_GT || c->op == OP_GTE) {
+                    path_type = ACCESS_INDEX_SEEK;
+                    seek_col_idx = col_idx;
+                    seek_cond = c;
+                    break;
+                  }
+                }
+              }
+              if (path_type == ACCESS_INDEX_SEEK) break;
+            }
+          }
+        }
+      }
+    }
 
     uint32_t capacity = 16;
     uint32_t count = 0;
     RowSortEntry* entries = malloc(sizeof(RowSortEntry) * capacity);
-
     time_t now_ts = time(NULL);
-    while (!cursor->end_of_table) {
-      rows_scanned++;
-      Value row_vals[MAX_COLUMNS];
-      uint64_t row_expire_at = 0;
-      deserialize_row_with_ttl(def, cursor_value(cursor), row_vals, &row_expire_at);
-      if (row_expire_at > 0 && (time_t)row_expire_at < now_ts) {
-        value_free_row(row_vals, def->num_cols);
-        cursor_advance(cursor);
-        continue;
-      }
-      if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
-        if (count >= capacity) {
-          capacity *= 2;
-          entries = realloc(entries, sizeof(RowSortEntry) * capacity);
-        }
-        memset(&entries[count], 0, sizeof(RowSortEntry));
-        for (uint32_t c = 0; c < def->num_cols; c++) {
-          value_copy(&entries[count].row[c], &row_vals[c]);
-        }
-        entries[count].num_sort_keys = 0;
-        if (stmt->has_order_by) {
-          uint32_t num_items = (stmt->num_order_by > 0) ? stmt->num_order_by : 1;
-          for (uint32_t k = 0; k < num_items; k++) {
-            const char* target_col = (stmt->num_order_by > 0) ? stmt->order_by_items[k].col_name : stmt->order_by_col;
-            bool target_desc = (stmt->num_order_by > 0) ? stmt->order_by_items[k].is_desc : stmt->order_by_desc;
-            CollationType target_coll = (stmt->num_order_by > 0) ? stmt->order_by_items[k].collation : stmt->order_by_collation;
 
-            char resolved_expr[256];
-            snprintf(resolved_expr, sizeof(resolved_expr), "%s", target_col);
-            if (isdigit((unsigned char)target_col[0]) && stmt->num_select_cols > 0) {
-              int pos = atoi(target_col);
-              if (pos >= 1 && pos <= (int)stmt->num_select_cols) {
-                snprintf(resolved_expr, sizeof(resolved_expr), "%s", stmt->select_cols[pos - 1].col_name);
-              }
-            }
+    if (path_type == ACCESS_PK_SEEK) {
+      Table table = { pager, def };
+      Value target_pk;
+      value_from_raw(def->columns[0].type, seek_cond->raw_val, false, &target_pk);
 
-            bool found_col = false;
-            for (uint32_t c = 0; c < def->num_cols; c++) {
-              if (strcasecmp(def->columns[c].name, resolved_expr) == 0) {
-                uint32_t sk_idx = entries[count].num_sort_keys++;
-                value_copy(&entries[count].sort_keys[sk_idx], &row_vals[c]);
-                entries[count].sort_types[sk_idx] = def->columns[c].type;
-                entries[count].sort_colls[sk_idx] = target_coll;
-                entries[count].sort_descs[sk_idx] = target_desc;
-                found_col = true;
-                break;
-              }
-            }
-
-            if (!found_col) {
-              char expr_out[256] = {0};
-              eval_expr_string(resolved_expr, def, row_vals, expr_out, sizeof(expr_out));
-              if (expr_out[0] != '\0') {
-                uint32_t sk_idx = entries[count].num_sort_keys++;
-                entries[count].sort_colls[sk_idx] = target_coll;
-                entries[count].sort_descs[sk_idx] = target_desc;
-                if (strcasecmp(expr_out, "null") == 0) {
-                  entries[count].sort_types[sk_idx] = COL_INT;
-                  entries[count].sort_keys[sk_idx].is_null = true;
-                } else {
-                  char* endptr = NULL;
-                  double dval = strtod(expr_out, &endptr);
-                  if (endptr != expr_out && (*endptr == '\0' || isspace((unsigned char)*endptr))) {
-                    entries[count].sort_types[sk_idx] = COL_DOUBLE;
-                    entries[count].sort_keys[sk_idx].double_val = dval;
-                  } else {
-                    entries[count].sort_types[sk_idx] = COL_TEXT;
-                    value_set_text(&entries[count].sort_keys[sk_idx], expr_out);
-                  }
-                }
+      Cursor* cursor = btree_find(&table, &target_pk);
+      if (seek_cond->op == OP_EQ) {
+        if (!cursor->end_of_table) {
+          rows_scanned++;
+          Value row_vals[MAX_COLUMNS];
+          uint64_t row_expire_at = 0;
+          deserialize_row_with_ttl(def, cursor_value(cursor), row_vals, &row_expire_at);
+          if (compare_values(def->columns[0].type, &row_vals[0], &target_pk) == 0) {
+            if (row_expire_at == 0 || (time_t)row_expire_at >= now_ts) {
+              if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
+                add_selected_row(&entries, &count, &capacity, stmt, def, row_vals);
               }
             }
           }
+          value_free_row(row_vals, def->num_cols);
         }
-        count++;
+      } else { /* OP_GT or OP_GTE */
+        while (!cursor->end_of_table) {
+          rows_scanned++;
+          Value row_vals[MAX_COLUMNS];
+          uint64_t row_expire_at = 0;
+          deserialize_row_with_ttl(def, cursor_value(cursor), row_vals, &row_expire_at);
+          if (row_expire_at == 0 || (time_t)row_expire_at >= now_ts) {
+            if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
+              add_selected_row(&entries, &count, &capacity, stmt, def, row_vals);
+            }
+          }
+          value_free_row(row_vals, def->num_cols);
+          cursor_advance(cursor);
+        }
       }
-      value_free_row(row_vals, def->num_cols);
-      cursor_advance(cursor);
+      free(cursor);
+      value_free(&target_pk);
+
+    } else if (path_type == ACCESS_INDEX_SEEK) {
+      TableDef idx_def;
+      memset(&idx_def, 0, sizeof(TableDef));
+      make_idx_name(idx_def.name, def->name, def->columns[seek_col_idx].name);
+      idx_def.root_page_num = def->columns[seek_col_idx].index_root_page;
+      idx_def.num_cols = 2;
+      memcpy(&idx_def.columns[0], &def->columns[seek_col_idx], sizeof(Column));
+      strcpy(idx_def.columns[1].name, "id");
+      idx_def.columns[1].type = COL_INT;
+      idx_def.columns[1].size = 4;
+      tabledef_compute(&idx_def);
+
+      Table idx_table = { pager, &idx_def };
+      Value target_val;
+      value_from_raw(def->columns[seek_col_idx].type, seek_cond->raw_val, false, &target_val);
+
+      Table main_table = { pager, def };
+      Cursor* idx_cur = btree_find(&idx_table, &target_val);
+
+      while (!idx_cur->end_of_table) {
+        Value cur_idx_vals[2];
+        deserialize_row(&idx_def, cursor_value(idx_cur), cur_idx_vals);
+
+        if (seek_cond->op == OP_EQ) {
+          if (compare_values(def->columns[seek_col_idx].type, &cur_idx_vals[0], &target_val) != 0) {
+            value_free_row(cur_idx_vals, 2);
+            break;
+          }
+        }
+
+        rows_scanned++;
+
+        Cursor* main_cur = btree_find(&main_table, &cur_idx_vals[1]);
+        if (!main_cur->end_of_table) {
+          Value row_vals[MAX_COLUMNS];
+          uint64_t row_expire_at = 0;
+          deserialize_row_with_ttl(def, cursor_value(main_cur), row_vals, &row_expire_at);
+          if (compare_values(def->columns[0].type, &row_vals[0], &cur_idx_vals[1]) == 0) {
+            if (row_expire_at == 0 || (time_t)row_expire_at >= now_ts) {
+              if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
+                add_selected_row(&entries, &count, &capacity, stmt, def, row_vals);
+              }
+            }
+          }
+          value_free_row(row_vals, def->num_cols);
+        }
+        free(main_cur);
+        value_free_row(cur_idx_vals, 2);
+        cursor_advance(idx_cur);
+      }
+      free(idx_cur);
+      value_free(&target_val);
+
+    } else {
+      Table table = { pager, def };
+      Cursor* cursor = btree_start(&table);
+      while (!cursor->end_of_table) {
+        rows_scanned++;
+        Value row_vals[MAX_COLUMNS];
+        uint64_t row_expire_at = 0;
+        deserialize_row_with_ttl(def, cursor_value(cursor), row_vals, &row_expire_at);
+        if (row_expire_at > 0 && (time_t)row_expire_at < now_ts) {
+          value_free_row(row_vals, def->num_cols);
+          cursor_advance(cursor);
+          continue;
+        }
+        if (eval_where_clause(def, row_vals, wc, catalog, pager)) {
+          add_selected_row(&entries, &count, &capacity, stmt, def, row_vals);
+        }
+        value_free_row(row_vals, def->num_cols);
+        cursor_advance(cursor);
+      }
+      free(cursor);
     }
-    free(cursor);
 
     if (stmt->has_order_by && count > 1) {
       qsort(entries, count, sizeof(RowSortEntry), compare_row_sort_entries);
@@ -2281,39 +2467,27 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
       clock_gettime(CLOCK_MONOTONIC, &end_time);
       double elapsed_ms = (end_time.tv_sec - start_time.tv_sec) * 1000.0 +
                           (end_time.tv_nsec - start_time.tv_nsec) / 1000000.0;
-      bool use_index = false;
-      uint32_t idx_col_idx = 0;
-      if (wc->has_where && wc->num_conds > 0) {
-        for (uint32_t c = 1; c < def->num_cols; c++) {
-          if (strcmp(def->columns[c].name, wc->conds[0].col_name) == 0 && def->columns[c].has_index) {
-            use_index = true;
-            idx_col_idx = c;
-            break;
-          }
-        }
-      }
-      bool pk_seek = (!use_index && wc->has_where && wc->num_conds > 0 &&
-                      strcmp(wc->conds[0].col_name, "id") == 0 &&
-                      (wc->conds[0].op == OP_EQ || wc->conds[0].op == OP_GT || wc->conds[0].op == OP_GTE));
-
       printf("QUERY PLAN & EXECUTION METRICS:\n");
-      if (use_index) {
+      if (path_type == ACCESS_INDEX_SEEK) {
         const char* op_str = "=";
-        if (wc->conds[0].op == OP_GT) op_str = ">";
-        else if (wc->conds[0].op == OP_GTE) op_str = ">=";
-        else if (wc->conds[0].op == OP_LT) op_str = "<";
-        else if (wc->conds[0].op == OP_LTE) op_str = "<=";
+        if (seek_cond->op == OP_GT) op_str = ">";
+        else if (seek_cond->op == OP_GTE) op_str = ">=";
+        else if (seek_cond->op == OP_LT) op_str = "<";
+        else if (seek_cond->op == OP_LTE) op_str = "<=";
         printf("  Plan: SEARCH TABLE %s USING INDEX _idx_%s_%s (%s %s %s)\n",
-               def->name, def->name, def->columns[idx_col_idx].name,
-               def->columns[idx_col_idx].name, op_str, wc->conds[0].raw_val);
-      } else if (pk_seek) {
-        printf("  Plan: SEARCH TABLE %s USING PRIMARY KEY (id = %s)\n",
-               def->name, wc->conds[0].raw_val);
+               def->name, def->name, def->columns[seek_col_idx].name,
+               def->columns[seek_col_idx].name, op_str, seek_cond->raw_val);
+      } else if (path_type == ACCESS_PK_SEEK) {
+        const char* op_str = "=";
+        if (seek_cond->op == OP_GT) op_str = ">";
+        else if (seek_cond->op == OP_GTE) op_str = ">=";
+        printf("  Plan: SEARCH TABLE %s USING PRIMARY KEY (%s %s %s)\n",
+               def->name, def->columns[0].name, op_str, seek_cond->raw_val);
       } else {
         printf("  Plan: SCAN TABLE %s\n", def->name);
       }
 
-      uint32_t depth = btree_depth(pager, def->root_page_num);
+      uint32_t depth = btree_depth(pager, (path_type == ACCESS_INDEX_SEEK) ? def->columns[seek_col_idx].index_root_page : def->root_page_num);
       printf("  B-Tree Traversal Depth: %u levels\n", depth);
       printf("  Buffer Cache Hits: %lu pages\n", (unsigned long)pager->cache_hits);
       printf("  Disk I/O Reads: %lu pages\n", (unsigned long)pager->disk_reads);
