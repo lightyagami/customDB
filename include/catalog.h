@@ -15,7 +15,8 @@ typedef enum {
   COL_TIME,
   COL_TIMESTAMP,
   COL_NUMERIC,
-  COL_DECIMAL
+  COL_DECIMAL,
+  COL_VECTOR
 } ColumnType;
 
 typedef enum {
@@ -116,6 +117,8 @@ typedef struct {
   char     vtab_args[256];
   /* Row-level Time-To-Live (TTL in seconds; 0 = no TTL) */
   uint32_t default_ttl;
+  /* WITH HISTORY temporal shadow table flag */
+  bool     with_history;
 } TableDef;
 
 typedef struct {

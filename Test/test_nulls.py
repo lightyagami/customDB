@@ -51,6 +51,22 @@ def test_null_system():
     out_coal = "\n".join(lines_coal)
     assert "(0)" in out_coal, f"Expected COALESCE default (0), got:\n{out_coal}"
 
+    # 5. Test literal string 'NULL' vs SQL NULL
+    str_null_cmds = [
+        "create table str_test (id INT, txt VARCHAR(50))",
+        "insert into str_test values (1, 'NULL'), (2, NULL)",
+        ".exit"
+    ]
+    run_db(db_file, str_null_cmds)
+
+    out1 = "\n".join(run_db(db_file, ["select * from str_test where txt is null", ".exit"]))
+    assert "(2, NULL)" in out1, f"Row 2 should match IS NULL: {out1}"
+    assert "(1, NULL)" not in out1, f"Row 1 should NOT match IS NULL: {out1}"
+
+    out2 = "\n".join(run_db(db_file, ["select * from str_test where txt = 'NULL'", ".exit"]))
+    assert "(1, NULL)" in out2, f"Row 1 should match txt = 'NULL': {out2}"
+    assert "(2, NULL)" not in out2, f"Row 2 should NOT match txt = 'NULL': {out2}"
+
     # Clean up
     if os.path.exists(db_file):
         os.remove(db_file)

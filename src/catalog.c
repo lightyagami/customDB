@@ -82,8 +82,9 @@ void value_move(Value* dst, Value* src) {
 /* ── On-disk catalog entry layout ────────────────────────────────────────── */
 #define DISK_COL_SIZE    200u
 #define VTAB_BASE_OFFSET (IDX_NAME_SIZE + 4u + 4u + MAX_COLUMNS * DISK_COL_SIZE)
-#define DISK_TTL_OFFSET  (VTAB_BASE_OFFSET + 1u + 64u + 256u)
-#define DISK_ENTRY_SIZE  (DISK_TTL_OFFSET + 4u)
+#define DISK_TTL_OFFSET     (VTAB_BASE_OFFSET + 1u + 64u + 256u)
+#define DISK_HISTORY_OFFSET (DISK_TTL_OFFSET + 4u)
+#define DISK_ENTRY_SIZE     (DISK_HISTORY_OFFSET + 1u)
 
 /* ── Computed fields ─────────────────────────────────────────────────────── */
 void tabledef_compute(TableDef* def) {
@@ -169,6 +170,9 @@ void catalog_load(Catalog* catalog, Pager* pager) {
     memcpy(def->vtab_module, base + VTAB_BASE_OFFSET + 1, 64); def->vtab_module[63] = '\0';
     memcpy(def->vtab_args, base + VTAB_BASE_OFFSET + 65, 256); def->vtab_args[255] = '\0';
     memcpy(&def->default_ttl, base + DISK_TTL_OFFSET, 4);
+    uint8_t is_h = 0;
+    memcpy(&is_h, base + DISK_HISTORY_OFFSET, 1);
+    def->with_history = (is_h == 1);
     tabledef_compute(def);
   }
 
@@ -249,6 +253,8 @@ void catalog_save(Catalog* catalog, Pager* pager) {
     memcpy(base + VTAB_BASE_OFFSET + 1, def->vtab_module, 64);
     memcpy(base + VTAB_BASE_OFFSET + 65, def->vtab_args, 256);
     memcpy(base + DISK_TTL_OFFSET, &def->default_ttl, 4);
+    uint8_t is_h = def->with_history ? 1 : 0;
+    memcpy(base + DISK_HISTORY_OFFSET, &is_h, 1);
   }
 
   uint8_t* vt_page_ptr = (uint8_t*)get_page(pager, 15);
@@ -421,7 +427,8 @@ uint32_t serialize_row_with_ttl(TableDef* def, Value* values, uint64_t expire_at
         case COL_TIME:
         case COL_TIMESTAMP:
         case COL_TEXT:
-        case COL_VARCHAR: {
+        case COL_VARCHAR:
+        case COL_VECTOR: {
           const char* str = values[i].text_val ? values[i].text_val : "";
           uint32_t len = values[i].text_len > 0 ? values[i].text_len : (uint32_t)strlen(str);
           serial_type = (col->type == COL_BLOB) ? (12 + 2 * (uint64_t)len) : (13 + 2 * (uint64_t)len);
@@ -616,7 +623,8 @@ void print_row(TableDef* def, Value* values) {
         case COL_TIME:
         case COL_TIMESTAMP:
         case COL_TEXT:
-        case COL_VARCHAR:   printf("%s",  values[i].text_val);  break;
+        case COL_VARCHAR:
+        case COL_VECTOR:    printf("%s",  values[i].text_val);  break;
       }
     }
   }
@@ -642,10 +650,14 @@ void print_schema(TableDef* def) {
       case COL_DECIMAL:   printf("DECIMAL");      break;
       case COL_TEXT:      printf("TEXT(%u)", col->size); break;
       case COL_VARCHAR:   printf("VARCHAR(%u)", col->size); break;
+      case COL_VECTOR:    printf("VECTOR(%u)", col->size / 16 > 0 ? col->size / 16 : col->size); break;
     }
     if (col->has_index) printf(" [INDEX root=%u]", col->index_root_page);
     if (i < def->num_cols - 1) printf(",");
     printf("\n");
   }
-  printf(");\n");
+  printf(")");
+  if (def->default_ttl > 0) printf(" WITH TTL %u", def->default_ttl);
+  if (def->with_history) printf(" WITH HISTORY");
+  printf(";\n");
 }

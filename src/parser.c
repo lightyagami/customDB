@@ -19,11 +19,15 @@ static const char* parse_identifier(const char* p, char* dest, uint32_t max_len)
   return p;
 }
 
-/* Helper to parse a string value (handles single/double quotes or unquoted strings) */
-static const char* parse_value_token(const char* p, char* dest, uint32_t max_len) {
+/* Helper to parse a string value (handles single/double quotes, vector brackets, or unquoted strings) */
+static const char* parse_value_token_ex(const char* p, char* dest, uint32_t max_len, bool* out_is_null, bool* out_was_quoted) {
   p = skip_whitespace(p);
   uint32_t len = 0;
+  bool was_quoted = false;
+  bool is_null = false;
+
   if ((*p == 'x' || *p == 'X') && (p[1] == '\'' || p[1] == '"')) {
+    was_quoted = true;
     char quote = p[1];
     if (len < max_len - 1) dest[len++] = *p;
     p++;
@@ -38,6 +42,7 @@ static const char* parse_value_token(const char* p, char* dest, uint32_t max_len
       p++;
     }
   } else if (*p == '\'' || *p == '"') {
+    was_quoted = true;
     char quote = *p++;
     while (*p) {
       if (*p == quote) {
@@ -54,6 +59,21 @@ static const char* parse_value_token(const char* p, char* dest, uint32_t max_len
       }
       p++;
     }
+  } else if (*p == '[') {
+    /* Vector literal or JSON array: [1.0, 2.0, 3.0] */
+    int bdepth = 0;
+    while (*p) {
+      if (*p == '[') bdepth++;
+      else if (*p == ']') {
+        bdepth--;
+        if (len < max_len - 1) dest[len++] = *p;
+        p++;
+        if (bdepth <= 0) break;
+        continue;
+      }
+      if (len < max_len - 1) dest[len++] = *p;
+      p++;
+    }
   } else {
     while (*p && !isspace((unsigned char)*p) && *p != ',' && *p != ')' && *p != '=' && *p != ';') {
       if (len < max_len - 1) {
@@ -61,9 +81,18 @@ static const char* parse_value_token(const char* p, char* dest, uint32_t max_len
       }
       p++;
     }
+    if (len == 4 && strcasecmp(dest, "null") == 0) {
+      is_null = true;
+    }
   }
   dest[len] = '\0';
+  if (out_is_null) *out_is_null = is_null;
+  if (out_was_quoted) *out_was_quoted = was_quoted;
   return p;
+}
+
+static const char* parse_value_token(const char* p, char* dest, uint32_t max_len) {
+  return parse_value_token_ex(p, dest, max_len, NULL, NULL);
 }
 
 static const char* parse_where_clause(const char* p, WhereClause* wc) {
@@ -379,6 +408,22 @@ static PrepareResult parse_create_cols(const char* p, TableDef* def) {
         if (*p == ')') p++;
       } else {
         col->size = MAX_TEXT_SIZE; /* default size for TEXT / unsized VARCHAR */
+      }
+    } else if (strcasecmp(type_name, "VECTOR") == 0) {
+      col->type = COL_VECTOR;
+      p = skip_whitespace(p);
+      if (*p == '(') {
+        p++;
+        char dim_str[16];
+        p = parse_value_token(p, dim_str, sizeof(dim_str));
+        uint32_t dim = (uint32_t)atoi(dim_str);
+        if (dim == 0 || dim > 1024) dim = 128;
+        col->size = dim * 16; /* allow ample text size for array string [x, y, z...] */
+        if (col->size > MAX_TEXT_SIZE) col->size = MAX_TEXT_SIZE;
+        p = skip_whitespace(p);
+        if (*p == ')') p++;
+      } else {
+        col->size = 512;
       }
     } else {
       return PREPARE_BAD_SCHEMA;
@@ -765,7 +810,8 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
         if (col_idx >= MAX_COLUMNS) return PREPARE_SYNTAX_ERROR;
 
         char tmp_val[MAX_RAW_VAL];
-        p = parse_value_token(p, tmp_val, MAX_RAW_VAL);
+        bool val_is_null = false;
+        p = parse_value_token_ex(p, tmp_val, MAX_RAW_VAL, &val_is_null, NULL);
 
         /* Map to column position via col_list if provided */
         uint32_t dest = col_idx;
@@ -773,8 +819,10 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
           dest = col_idx; /* store in order; executor maps by col_list later */
         }
         snprintf(out->multi_raw_values[out->num_multi_rows][dest], MAX_RAW_VAL, "%s", tmp_val);
+        out->multi_raw_is_null[out->num_multi_rows][dest] = val_is_null;
         if (out->num_multi_rows == 0) {
           snprintf(out->raw_values[dest], MAX_RAW_VAL, "%s", tmp_val);
+          out->raw_is_null[dest] = val_is_null;
         }
         col_idx++;
 
@@ -822,7 +870,7 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
             p = skip_whitespace(p);
             if (*p != '=') break;
             p++;
-            p = parse_value_token(p, pair->str_val, MAX_RAW_VAL);
+            p = parse_value_token_ex(p, pair->str_val, MAX_RAW_VAL, &pair->is_null, NULL);
             out->num_set_pairs++;
             p = skip_whitespace(p);
             if (*p == ',') p++;
@@ -1341,7 +1389,8 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       p = skip_whitespace(p);
 
       if (*p == '\'' || *p == '"') {
-        p = parse_value_token(p, pair->str_val, MAX_RAW_VAL);
+        p = parse_value_token_ex(p, pair->str_val, MAX_RAW_VAL, &pair->is_null, NULL);
+        pair->is_null = false; /* explicitly quoted, cannot be SQL NULL */
       } else {
         uint32_t s_idx = 0;
         int depth = 0;
@@ -1356,6 +1405,11 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
         pair->str_val[s_idx] = '\0';
         while (s_idx > 0 && isspace((unsigned char)pair->str_val[s_idx - 1])) {
           pair->str_val[--s_idx] = '\0';
+        }
+        if (strcasecmp(pair->str_val, "null") == 0) {
+          pair->is_null = true;
+        } else {
+          pair->is_null = false;
         }
       }
       out->num_set_pairs++;
@@ -1602,6 +1656,8 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
         post = skip_whitespace(post);
         if (*post == '=') { post++; post = skip_whitespace(post); }
         out->new_table.default_ttl = (uint32_t)atoi(post);
+      } else if (strncasecmp(post, "with history", 12) == 0) {
+        out->new_table.with_history = true;
       }
 
       return PREPARE_SUCCESS;

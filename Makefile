@@ -11,13 +11,13 @@ LIB_TARGET = libdbms.so
 all: $(TARGET) $(SERVER_TARGET) $(LIB_TARGET)
 
 $(TARGET): $(OBJS) $(MAIN_OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ -lpthread
+	$(CC) $(CFLAGS) -o $@ $^ -lpthread -lm
 
 $(SERVER_TARGET): $(OBJS) $(SERVER_OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ -lpthread
+	$(CC) $(CFLAGS) -o $@ $^ -lpthread -lm
 
 $(LIB_TARGET): $(OBJS)
-	$(CC) -shared -fPIC $(CFLAGS) -o $@ $^ -lpthread
+	$(CC) -shared -fPIC $(CFLAGS) -o $@ $^ -lpthread -lm
 
 src/%.o: src/%.c
 	$(CC) $(CFLAGS) -c -o $@ $<

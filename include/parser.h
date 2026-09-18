@@ -119,6 +119,7 @@ typedef struct WhereClause WhereClause;
 typedef struct {
   char col_name[COL_NAME_SIZE];
   char str_val[MAX_RAW_VAL];
+  bool is_null;
 } SetPair;
 
 typedef enum {
@@ -203,12 +204,14 @@ struct Statement {
 
   /* INSERT */
   char     raw_values[MAX_COLUMNS][MAX_RAW_VAL];
+  bool     raw_is_null[MAX_COLUMNS];
   uint32_t num_values;
   Value    bound_values[MAX_COLUMNS];
   bool     has_bound_values;
   bool     is_multi_insert;
   uint32_t num_multi_rows;
   char     multi_raw_values[MAX_MULTI_ROWS][MAX_COLUMNS][MAX_RAW_VAL];
+  bool     multi_raw_is_null[MAX_MULTI_ROWS][MAX_COLUMNS];
   bool     is_insert_select;
   Statement* insert_select_stmt;
   uint32_t expires_sec;   /* INSERT ... EXPIRES <seconds> (0 = default/none) */

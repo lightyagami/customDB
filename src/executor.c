@@ -10,6 +10,7 @@ static void make_idx_name(char dst[IDX_NAME_SIZE],
 
 bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog* catalog, Pager* pager);
 static ExecuteResult execute_vacuum(Catalog* catalog, Pager* pager);
+static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* catalog, Pager* pager);
 static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* catalog, Pager* pager);
 static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* catalog, Pager* pager);
 static void print_returning_row(Statement* stmt, TableDef* def, Value* row_vals);
@@ -118,6 +119,7 @@ static void expand_trigger_sql(const char* action_sql, TableDef* def,
             case COL_TIME:
             case COL_DATETIME:
             case COL_TIMESTAMP:
+            case COL_VECTOR:
               snprintf(val_str, sizeof(val_str), "'%s'", v->text_val ? v->text_val : "");
               break;
             default:
@@ -161,6 +163,60 @@ static void fire_triggers(Catalog* catalog, Pager* pager, TableDef* def,
         }
         free(tr_stmt);
       }
+    }
+  }
+
+  /* Automated temporal audit snapshot for WITH HISTORY tables */
+  if (def->with_history && timing == TRIGGER_AFTER) {
+    char hist_tbl_name[TBL_NAME_SIZE];
+    snprintf(hist_tbl_name, sizeof(hist_tbl_name), "_history_%.50s", def->name);
+    TableDef* hist_def = catalog_find(catalog, hist_tbl_name);
+    if (hist_def) {
+      Statement hist_ins;
+      memset(&hist_ins, 0, sizeof(Statement));
+      hist_ins.type = STATEMENT_INSERT;
+      snprintf(hist_ins.table_name, sizeof(hist_ins.table_name), "%s", hist_tbl_name);
+      hist_ins.num_values = hist_def->num_cols;
+
+      /* Column 0: history_id (0 for autoincrement) */
+      snprintf(hist_ins.raw_values[0], MAX_RAW_VAL, "0");
+      /* Column 1: history_action */
+      const char* act_str = (event == TRIGGER_INSERT) ? "INSERT" : ((event == TRIGGER_UPDATE) ? "UPDATE" : "DELETE");
+      snprintf(hist_ins.raw_values[1], MAX_RAW_VAL, "%s", act_str);
+      /* Column 2: history_time */
+      snprintf(hist_ins.raw_values[2], MAX_RAW_VAL, "%ld", (long)time(NULL));
+
+      /* Snapshot values: new_vals for INSERT/UPDATE, old_vals for DELETE */
+      Value* snap_vals = (event == TRIGGER_DELETE) ? old_vals : new_vals;
+      for (uint32_t c = 0; c < def->num_cols && (3 + c) < hist_def->num_cols; c++) {
+        uint32_t dest = 3 + c;
+        if (!snap_vals || snap_vals[c].is_null) {
+          hist_ins.raw_is_null[dest] = true;
+          hist_ins.raw_values[dest][0] = '\0';
+        } else {
+          hist_ins.raw_is_null[dest] = false;
+          switch (def->columns[c].type) {
+            case COL_INT:
+              snprintf(hist_ins.raw_values[dest], MAX_RAW_VAL, "%d", snap_vals[c].int_val);
+              break;
+            case COL_FLOAT:
+              snprintf(hist_ins.raw_values[dest], MAX_RAW_VAL, "%.8g", (double)snap_vals[c].float_val);
+              break;
+            case COL_DOUBLE:
+            case COL_NUMERIC:
+            case COL_DECIMAL:
+              snprintf(hist_ins.raw_values[dest], MAX_RAW_VAL, "%.8g", snap_vals[c].double_val);
+              break;
+            case COL_BOOL:
+              snprintf(hist_ins.raw_values[dest], MAX_RAW_VAL, "%s", snap_vals[c].bool_val ? "true" : "false");
+              break;
+            default:
+              snprintf(hist_ins.raw_values[dest], MAX_RAW_VAL, "%s", snap_vals[c].text_val ? snap_vals[c].text_val : "");
+              break;
+          }
+        }
+      }
+      run_insert_vm(&hist_ins, hist_def, catalog, pager);
     }
   }
 
@@ -333,20 +389,23 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     Value v;
     value_init(&v);
 
+    bool is_val_null = (raw == NULL || strlen(raw) == 0 || (i < stmt->num_values && stmt->raw_is_null[i]));
+
     /* DEFAULT constraint */
-    if ((raw == NULL || strlen(raw) == 0 || strcasecmp(raw, "null") == 0) && col->has_default) {
+    if (is_val_null && col->has_default) {
       raw = col->default_val;
+      is_val_null = false;
     }
 
     /* NOT NULL constraint */
-    if ((raw == NULL || strlen(raw) == 0 || strcasecmp(raw, "null") == 0) && col->is_not_null) {
+    if (is_val_null && col->is_not_null) {
       vdbe_free(vm);
       if (auto_tx && pager->in_transaction) pager_rollback(pager);
       return EXECUTE_CONSTRAINT_NOT_NULL;
     }
 
     /* CHECK constraint validation */
-    if (col->has_check && raw != NULL && strlen(raw) > 0 && strcasecmp(raw, "null") != 0) {
+    if (col->has_check && raw != NULL && strlen(raw) > 0 && !is_val_null) {
       Value val_check, filter_check;
       value_init(&val_check);
       value_init(&filter_check);
@@ -395,7 +454,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     }
 
     /* FOREIGN KEY parent presence check */
-    if (col->has_fk && raw != NULL && strlen(raw) > 0 && strcasecmp(raw, "null") != 0) {
+    if (col->has_fk && raw != NULL && strlen(raw) > 0 && !is_val_null) {
       TableDef* target_def = catalog_find(catalog, col->fk_target_table);
       if (target_def == NULL) {
         vdbe_free(vm);
@@ -466,7 +525,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
             break;
         }
       }
-    } else if (raw == NULL || strlen(raw) == 0 || strcasecmp(raw, "null") == 0) {
+    } else if (is_val_null) {
       vdbe_add_inst(vm, OP_Null, i + 1, 0, 0, (Value){0});
     } else {
       switch (col->type) {
@@ -491,7 +550,8 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
         case COL_TIMESTAMP:
         case COL_TEXT:
         case COL_VARCHAR:
-          if (col->type != COL_BLOB && col->type != COL_TEXT && strlen(raw) > col->size) {
+        case COL_VECTOR:
+          if (col->type != COL_BLOB && col->type != COL_TEXT && col->type != COL_VECTOR && strlen(raw) > col->size) {
             vdbe_free(vm);
             if (auto_tx && pager->in_transaction) pager_rollback(pager);
             return EXECUTE_BAD_SCHEMA;
@@ -705,7 +765,8 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
       value_copy(&values[i], &stmt->bound_values[i]);
     } else {
       char* raw = stmt->raw_values[i];
-      if (raw == NULL || strlen(raw) == 0 || strcasecmp(raw, "null") == 0) {
+      bool is_val_null = (raw == NULL || strlen(raw) == 0 || (i < stmt->num_values && stmt->raw_is_null[i]));
+      if (is_val_null) {
         values[i].is_null = true;
       } else {
         values[i].is_null = false;
@@ -722,7 +783,8 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
           case COL_TIME:
           case COL_TIMESTAMP:
           case COL_TEXT:
-          case COL_VARCHAR:   value_set_text(&values[i], raw); break;
+          case COL_VARCHAR:
+          case COL_VECTOR:    value_set_text(&values[i], raw); break;
         }
       }
     }
@@ -816,6 +878,7 @@ static void load_const_reg(Vdbe* vm, int const_reg, ColumnType type, const char*
     case COL_TIMESTAMP:
     case COL_TEXT:
     case COL_VARCHAR:
+    case COL_VECTOR:
       value_set_text(&v, raw_val);
       vdbe_add_inst(vm, OP_String, 0, 0, const_reg, v);
       value_free(&v);
@@ -878,6 +941,43 @@ static void eval_json_extract(const char* json_str, const char* path, char* out_
       out_buf[o_idx] = '\0';
     }
   }
+}
+
+/* Parse a vector string "[1.0, 2.0, 3.5]" into an array of floats */
+static int parse_vector_string(const char* str, float* out, int max_dim) {
+  if (!str) return 0;
+  const char* p = str;
+  while (*p && (*p == ' ' || *p == '[' || *p == '\'' || *p == '"')) p++;
+  int count = 0;
+  while (*p && *p != ']' && *p != '\'' && *p != '"' && count < max_dim) {
+    char* next_p = NULL;
+    float val = strtof(p, &next_p);
+    if (next_p == p) break;
+    out[count++] = val;
+    p = next_p;
+    while (*p && (*p == ' ' || *p == ',')) p++;
+  }
+  return count;
+}
+
+static double compute_l2_distance(const float* v1, const float* v2, int dim) {
+  double sum = 0.0;
+  for (int i = 0; i < dim; i++) {
+    double diff = (double)v1[i] - (double)v2[i];
+    sum += diff * diff;
+  }
+  return sqrt(sum);
+}
+
+static double compute_cosine_similarity(const float* v1, const float* v2, int dim) {
+  double dot = 0.0, norm1 = 0.0, norm2 = 0.0;
+  for (int i = 0; i < dim; i++) {
+    dot += (double)v1[i] * (double)v2[i];
+    norm1 += (double)v1[i] * (double)v1[i];
+    norm2 += (double)v2[i] * (double)v2[i];
+  }
+  if (norm1 <= 0.0 || norm2 <= 0.0) return 0.0;
+  return dot / (sqrt(norm1) * sqrt(norm2));
 }
 
 void eval_expr_string(const char* expr, TableDef* def, Value* row_vals, char* out_buf, size_t out_size) {
@@ -1098,6 +1198,100 @@ void eval_expr_string(const char* expr, TableDef* def, Value* row_vals, char* ou
     snprintf(out_buf, out_size, "{%s}", expr + 12);
     char* end_paren = strrchr(out_buf, ')');
     if (end_paren) *end_paren = '}';
+    return;
+  }
+
+  /* l2_distance(v1, v2) and cosine_similarity(v1, v2) */
+  if (strncasecmp(expr, "l2_distance(", 12) == 0 || strncasecmp(expr, "cosine_similarity(", 18) == 0) {
+    bool is_l2 = (strncasecmp(expr, "l2_distance(", 12) == 0);
+    const char* p = expr + (is_l2 ? 12 : 18);
+    p = skip_space(p);
+
+    char arg1_str[MAX_RAW_VAL] = {0};
+    char arg2_str[MAX_RAW_VAL] = {0};
+
+    /* Parse first argument (could be column name or literal '[1, 2, ...]') */
+    if (*p == '\'' || *p == '"') {
+      char q = *p++;
+      uint32_t a_idx = 0;
+      while (*p && *p != q && a_idx < sizeof(arg1_str) - 1) arg1_str[a_idx++] = *p++;
+      if (*p == q) p++;
+    } else if (*p == '[') {
+      int depth = 0;
+      uint32_t a_idx = 0;
+      while (*p && a_idx < sizeof(arg1_str) - 1) {
+        if (*p == '[') depth++;
+        else if (*p == ']') {
+          depth--;
+          arg1_str[a_idx++] = *p++;
+          if (depth <= 0) break;
+          continue;
+        }
+        arg1_str[a_idx++] = *p++;
+      }
+    } else {
+      uint32_t a_idx = 0;
+      while (*p && *p != ',' && a_idx < sizeof(arg1_str) - 1) arg1_str[a_idx++] = *p++;
+      while (a_idx > 0 && isspace((unsigned char)arg1_str[a_idx - 1])) arg1_str[--a_idx] = '\0';
+      if (def && row_vals) {
+        for (uint32_t c = 0; c < def->num_cols; c++) {
+          if (strcasecmp(def->columns[c].name, arg1_str) == 0) {
+            snprintf(arg1_str, sizeof(arg1_str), "%s", row_vals[c].text_val ? row_vals[c].text_val : "");
+            break;
+          }
+        }
+      }
+    }
+
+    p = skip_space(p);
+    if (*p == ',') p++;
+    p = skip_space(p);
+
+    /* Parse second argument */
+    if (*p == '\'' || *p == '"') {
+      char q = *p++;
+      uint32_t a_idx = 0;
+      while (*p && *p != q && a_idx < sizeof(arg2_str) - 1) arg2_str[a_idx++] = *p++;
+      if (*p == q) p++;
+    } else if (*p == '[') {
+      int depth = 0;
+      uint32_t a_idx = 0;
+      while (*p && a_idx < sizeof(arg2_str) - 1) {
+        if (*p == '[') depth++;
+        else if (*p == ']') {
+          depth--;
+          arg2_str[a_idx++] = *p++;
+          if (depth <= 0) break;
+          continue;
+        }
+        arg2_str[a_idx++] = *p++;
+      }
+    } else {
+      uint32_t a_idx = 0;
+      while (*p && *p != ')' && a_idx < sizeof(arg2_str) - 1) arg2_str[a_idx++] = *p++;
+      while (a_idx > 0 && isspace((unsigned char)arg2_str[a_idx - 1])) arg2_str[--a_idx] = '\0';
+      if (def && row_vals) {
+        for (uint32_t c = 0; c < def->num_cols; c++) {
+          if (strcasecmp(def->columns[c].name, arg2_str) == 0) {
+            snprintf(arg2_str, sizeof(arg2_str), "%s", row_vals[c].text_val ? row_vals[c].text_val : "");
+            break;
+          }
+        }
+      }
+    }
+
+    float vec1[1024];
+    float vec2[1024];
+    int dim1 = parse_vector_string(arg1_str, vec1, 1024);
+    int dim2 = parse_vector_string(arg2_str, vec2, 1024);
+    int dim = (dim1 < dim2) ? dim1 : dim2;
+
+    if (dim > 0) {
+      double res = is_l2 ? compute_l2_distance(vec1, vec2, dim) : compute_cosine_similarity(vec1, vec2, dim);
+      snprintf(out_buf, out_size, "%.6g", res);
+    } else {
+      snprintf(out_buf, out_size, "0");
+    }
     return;
   }
 
@@ -1335,7 +1529,8 @@ static void print_projected_row(Statement* stmt, TableDef* def, Value* row_vals)
           case COL_TIME:
           case COL_TIMESTAMP:
           case COL_TEXT:
-          case COL_VARCHAR:   printf("%s",  val.text_val);  break;
+          case COL_VARCHAR:
+          case COL_VECTOR:    printf("%s",  val.text_val);  break;
         }
       }
     }
@@ -3374,7 +3569,8 @@ static bool eval_where_clause_cols(const char* tbl_name, uint32_t num_cols, Colu
       case COL_TIME:
       case COL_TIMESTAMP:
       case COL_TEXT:
-      case COL_VARCHAR:   value_set_text(&filter_val, cond->raw_val); break;
+      case COL_VARCHAR:
+      case COL_VECTOR:    value_set_text(&filter_val, cond->raw_val); break;
     }
     
     /* Compare */
@@ -3392,7 +3588,8 @@ static bool eval_where_clause_cols(const char* tbl_name, uint32_t num_cols, Colu
       case COL_TIME:
       case COL_TIMESTAMP:
       case COL_TEXT:
-      case COL_VARCHAR: {
+      case COL_VARCHAR:
+      case COL_VECTOR: {
         CollationType coll = cond->collation;
         if (coll == COLL_NOT_SET && col != NULL) {
           coll = col->collation;
@@ -3713,7 +3910,7 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
           }
 
           Column* col = &def->columns[col_idx];
-          if (strcasecmp(pair->str_val, "null") == 0) {
+          if (pair->is_null) {
             values[col_idx].is_null = true;
           } else {
             char expr_res[256] = {0};
@@ -3734,7 +3931,8 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
               case COL_TIME:
               case COL_TIMESTAMP:
               case COL_TEXT:
-              case COL_VARCHAR:   value_set_text(&values[col_idx], final_val); break;
+              case COL_VARCHAR:
+              case COL_VECTOR:    value_set_text(&values[col_idx], final_val); break;
             }
           }
         }
@@ -3890,6 +4088,47 @@ static ExecuteResult execute_create_table(Statement* stmt, Catalog* catalog, Pag
   catalog_save(catalog, pager);
 
   printf("Table '%s' created with root page %u.\n", def->name, root_page);
+
+  /* If WITH HISTORY is enabled, create shadow table _history_<table> */
+  if (def->with_history) {
+    char hist_tbl_name[TBL_NAME_SIZE];
+    snprintf(hist_tbl_name, sizeof(hist_tbl_name), "_history_%.50s", def->name);
+    if (catalog->num_tables < MAX_TABLES && catalog_find(catalog, hist_tbl_name) == NULL) {
+      Statement hist_stmt;
+      memset(&hist_stmt, 0, sizeof(Statement));
+      hist_stmt.type = STATEMENT_CREATE_TABLE;
+      snprintf(hist_stmt.new_table.name, sizeof(hist_stmt.new_table.name), "%s", hist_tbl_name);
+      hist_stmt.new_table.num_cols = 3 + def->num_cols;
+      if (hist_stmt.new_table.num_cols > MAX_COLUMNS) hist_stmt.new_table.num_cols = MAX_COLUMNS;
+
+      /* Column 0: history_id INT */
+      strcpy(hist_stmt.new_table.columns[0].name, "history_id");
+      hist_stmt.new_table.columns[0].type = COL_INT;
+      hist_stmt.new_table.columns[0].size = 4;
+      hist_stmt.new_table.columns[0].is_autoincrement = true;
+
+      /* Column 1: history_action TEXT */
+      strcpy(hist_stmt.new_table.columns[1].name, "history_action");
+      hist_stmt.new_table.columns[1].type = COL_TEXT;
+      hist_stmt.new_table.columns[1].size = 32;
+
+      /* Column 2: history_time INT */
+      strcpy(hist_stmt.new_table.columns[2].name, "history_time");
+      hist_stmt.new_table.columns[2].type = COL_INT;
+      hist_stmt.new_table.columns[2].size = 4;
+
+      /* Columns 3..N: copy original table columns */
+      for (uint32_t c = 0; c < def->num_cols && (3 + c) < MAX_COLUMNS; c++) {
+        hist_stmt.new_table.columns[3 + c] = def->columns[c];
+        /* Secondary index not copied to history table */
+        hist_stmt.new_table.columns[3 + c].has_index = false;
+        hist_stmt.new_table.columns[3 + c].index_root_page = 0;
+        hist_stmt.new_table.columns[3 + c].is_autoincrement = false;
+      }
+      execute_create_table(&hist_stmt, catalog, pager);
+    }
+  }
+
   return EXECUTE_SUCCESS;
 }
 
@@ -5106,6 +5345,7 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
             single_ins->num_values = stmt->num_values;
             for (uint32_t c = 0; c < stmt->num_values; c++) {
               strncpy(single_ins->raw_values[c], stmt->multi_raw_values[r][c], MAX_RAW_VAL - 1);
+              single_ins->raw_is_null[c] = stmt->multi_raw_is_null[r][c];
             }
             result = run_insert_vm(single_ins, def, effective_catalog, effective_pager);
             if (result != EXECUTE_SUCCESS) break;

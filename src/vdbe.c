@@ -343,7 +343,8 @@ void vdbe_run(Vdbe* vm) {
               case COL_TIME:
               case COL_TIMESTAMP:
               case COL_TEXT:
-              case COL_VARCHAR:   printf("%s",  reg->val.text_val); break;
+              case COL_VARCHAR:
+              case COL_VECTOR:    printf("%s",  reg->val.text_val); break;
             }
           }
         }

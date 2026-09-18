@@ -143,6 +143,7 @@ int compare_keys(ColumnType type, const void* k1, const void* k2) {
     case COL_TIME:
     case COL_TIMESTAMP:
     case COL_TEXT:
+    case COL_VECTOR:
       return strcmp((const char*)k1, (const char*)k2);
     case COL_VARCHAR: {
       uint16_t len1, len2;
@@ -184,6 +185,7 @@ int compare_values(ColumnType type, const Value* v1, const Value* v2) {
     case COL_TIMESTAMP:
     case COL_TEXT:
     case COL_VARCHAR:
+    case COL_VECTOR:
       return strcmp(v1->text_val, v2->text_val);
   }
   return 0;
@@ -206,7 +208,8 @@ static void serialize_col0_key(TableDef* def, Value* key_val, uint8_t* out_buf) 
     case COL_DATE:
     case COL_TIME:
     case COL_TIMESTAMP:
-    case COL_TEXT:   snprintf((char*)out_buf, INTERNAL_NODE_KEY_SIZE, "%.*s",
+    case COL_TEXT:
+    case COL_VECTOR: snprintf((char*)out_buf, INTERNAL_NODE_KEY_SIZE, "%.*s",
                               INTERNAL_NODE_KEY_SIZE - 1, key_val->text_val); break;
     case COL_VARCHAR: {
       uint16_t len = (uint16_t)strlen(key_val->text_val);
