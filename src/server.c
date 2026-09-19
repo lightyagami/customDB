@@ -210,14 +210,26 @@ static void handle_http_request(int fd, dbms* db, const char* initial_data, ssiz
           val_start = strchr(val_start, '"');
           if (val_start) {
             val_start++;
-            char* val_end = strchr(val_start, '"');
-            if (val_end) {
-              size_t slen = val_end - val_start;
-              if (slen < sizeof(sql) - 1) {
-                memcpy(sql, val_start, slen);
-                sql[slen] = '\0';
+            size_t out_idx = 0;
+            char* p = val_start;
+            while (*p && out_idx < sizeof(sql) - 1) {
+              if (*p == '\\') {
+                p++;
+                if (!*p) break;
+                if (*p == '"') sql[out_idx++] = '"';
+                else if (*p == '\\') sql[out_idx++] = '\\';
+                else if (*p == 'n') sql[out_idx++] = '\n';
+                else if (*p == 'r') sql[out_idx++] = '\r';
+                else if (*p == 't') sql[out_idx++] = '\t';
+                else sql[out_idx++] = *p;
+                p++;
+              } else if (*p == '"') {
+                break;
+              } else {
+                sql[out_idx++] = *p++;
               }
             }
+            sql[out_idx] = '\0';
           }
         }
       } else {
