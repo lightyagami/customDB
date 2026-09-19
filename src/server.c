@@ -253,7 +253,8 @@ static void handle_http_request(int fd, dbms* db, const char* initial_data, ssiz
       }
 
       int col_count = dbms_column_count(stmt);
-      char* resp = malloc(BUFFER_SIZE * 2);
+      size_t resp_cap = BUFFER_SIZE * 4;
+      char* resp = malloc(resp_cap);
       if (!resp) {
         dbms_finalize(stmt);
         send_http_response(fd, 500, "Internal Server Error", "{\"error\": \"Out of memory\"}");
@@ -261,31 +262,37 @@ static void handle_http_request(int fd, dbms* db, const char* initial_data, ssiz
       }
 
       size_t roff = 0;
-      roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, "{\"columns\": [");
+      roff += snprintf(resp + roff, resp_cap - roff, "{\"columns\": [");
       for (int c = 0; c < col_count; c++) {
         char esc_col[128];
         escape_json_string(dbms_column_name(stmt, c), esc_col, sizeof(esc_col));
-        roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, "%s\"%s\"", (c > 0 ? ", " : ""), esc_col);
+        roff += snprintf(resp + roff, resp_cap - roff, "%s\"%s\"", (c > 0 ? ", " : ""), esc_col);
       }
-      roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, "], \"rows\": [");
+      roff += snprintf(resp + roff, resp_cap - roff, "], \"rows\": [");
 
       int row_idx = 0;
       int step_res = DBMS_DONE;
-      while ((step_res = dbms_step(stmt)) == DBMS_ROW && roff + 1024 < BUFFER_SIZE * 2) {
-        if (row_idx > 0) roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, ", ");
-        roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, "[");
+      while ((step_res = dbms_step(stmt)) == DBMS_ROW && roff + 4096 < resp_cap) {
+        if (row_idx > 0) roff += snprintf(resp + roff, resp_cap - roff, ", ");
+        roff += snprintf(resp + roff, resp_cap - roff, "[");
         for (int c = 0; c < col_count; c++) {
-          if (c > 0) roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, ", ");
+          if (c > 0) roff += snprintf(resp + roff, resp_cap - roff, ", ");
           if (dbms_column_is_null(stmt, c)) {
-            roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, "null");
+            roff += snprintf(resp + roff, resp_cap - roff, "null");
           } else {
             const char* txt = dbms_column_text(stmt, c);
-            char esc_val[512];
-            escape_json_string(txt ? txt : "", esc_val, sizeof(esc_val));
-            roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, "\"%s\"", esc_val);
+            size_t req_esc = txt ? (strlen(txt) * 2 + 16) : 16;
+            char* esc_val = malloc(req_esc);
+            if (esc_val) {
+              escape_json_string(txt ? txt : "", esc_val, req_esc);
+              roff += snprintf(resp + roff, resp_cap - roff, "\"%s\"", esc_val);
+              free(esc_val);
+            } else {
+              roff += snprintf(resp + roff, resp_cap - roff, "\"\"");
+            }
           }
         }
-        roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, "]");
+        roff += snprintf(resp + roff, resp_cap - roff, "]");
         row_idx++;
       }
       if (step_res != DBMS_DONE && step_res != DBMS_ROW) {
