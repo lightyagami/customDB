@@ -278,16 +278,7 @@ static void fire_triggers(Catalog* catalog, Pager* pager, TableDef* def,
   s_trigger_depth--;
 }
 
-typedef struct {
-  Value row[MAX_COLUMNS];
-  Value sort_keys[4];
-  ColumnType sort_types[4];
-  CollationType sort_colls[4];
-  bool sort_descs[4];
-  uint32_t num_sort_keys;
-} RowSortEntry;
-
-static int compare_row_sort_entries(const void* a, const void* b) {
+int compare_row_sort_entries(const void* a, const void* b) {
   const RowSortEntry* ra = (const RowSortEntry*)a;
   const RowSortEntry* rb = (const RowSortEntry*)b;
   uint32_t n_keys = (ra->num_sort_keys < rb->num_sort_keys) ? ra->num_sort_keys : rb->num_sort_keys;
@@ -321,6 +312,65 @@ static int compare_row_sort_entries(const void* a, const void* b) {
     }
   }
   return 0;
+}
+
+void free_row_sort_entries(RowSortEntry* entries, uint32_t count, TableDef* def) {
+  if (!entries) return;
+  for (uint32_t i = 0; i < count; i++) {
+    value_free_row(entries[i].row, def ? def->num_cols : MAX_COLUMNS);
+    value_free_row(entries[i].sort_keys, entries[i].num_sort_keys);
+  }
+  free(entries);
+}
+
+uint32_t deduplicate_distinct_entries(RowSortEntry* entries, uint32_t count, Statement* stmt, TableDef* def) {
+  if (!stmt->is_distinct || count == 0 || !entries) return count;
+  uint32_t write_idx = 0;
+  for (uint32_t i = 0; i < count; i++) {
+    bool dup = false;
+    for (uint32_t j = 0; j < write_idx; j++) {
+      bool same = true;
+      if (stmt->num_select_cols > 0) {
+        for (uint32_t sc = 0; sc < stmt->num_select_cols; sc++) {
+          int col_idx = -1;
+          for (uint32_t c = 0; c < def->num_cols; c++) {
+            if (strcmp(def->columns[c].name, stmt->select_cols[sc].col_name) == 0) {
+              col_idx = (int)c;
+              break;
+            }
+          }
+          if (col_idx >= 0) {
+            if (compare_values(def->columns[col_idx].type, &entries[i].row[col_idx], &entries[j].row[col_idx]) != 0) {
+              same = false;
+              break;
+            }
+          }
+        }
+      } else {
+        for (uint32_t c = 0; c < def->num_cols; c++) {
+          if (compare_values(def->columns[c].type, &entries[i].row[c], &entries[j].row[c]) != 0) {
+            same = false;
+            break;
+          }
+        }
+      }
+      if (same) { dup = true; break; }
+    }
+    if (!dup) {
+      if (write_idx != i) {
+        value_free_row(entries[write_idx].row, def->num_cols);
+        value_free_row(entries[write_idx].sort_keys, entries[write_idx].num_sort_keys);
+        entries[write_idx] = entries[i];
+        memset(&entries[i], 0, sizeof(RowSortEntry));
+      }
+      write_idx++;
+    } else {
+      value_free_row(entries[i].row, def->num_cols);
+      value_free_row(entries[i].sort_keys, entries[i].num_sort_keys);
+      memset(&entries[i], 0, sizeof(RowSortEntry));
+    }
+  }
+  return write_idx;
 }
 
 static bool sql_like_match(const char* pattern, const char* str, CollationType coll) {
@@ -451,7 +501,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
   /* Load insert values into registers 1 to N */
   for (uint32_t i = 0; i < def->num_cols; i++) {
     Column* col = &def->columns[i];
-    char* raw = (i < stmt->num_values) ? stmt->raw_values[i] : NULL;
+    char* raw = (i < stmt->num_values) ? (stmt->dyn_raw_values[i] ? stmt->dyn_raw_values[i] : stmt->raw_values[i]) : NULL;
     Value v;
     value_init(&v);
 
@@ -635,7 +685,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
   /* Validate UNIQUE constraint across existing rows */
   for (uint32_t c = 1; c < def->num_cols; c++) {
     if (def->columns[c].is_unique) {
-      char* raw_u = stmt->raw_values[c];
+      char* raw_u = stmt->dyn_raw_values[c] ? stmt->dyn_raw_values[c] : stmt->raw_values[c];
       if (raw_u != NULL && strlen(raw_u) > 0) {
         Table main_tbl = { pager, def };
         Cursor* u_cur = btree_start(&main_tbl);
@@ -704,10 +754,11 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
         if (pk_col_idx >= 0 && pk_col_idx < (int)stmt->num_values) {
           Value new_val;
           value_init(&new_val);
-          if (def->columns[pk_col_idx].type == COL_INT) new_val.int_val = atoi(stmt->raw_values[pk_col_idx]);
-          else if (def->columns[pk_col_idx].type == COL_FLOAT) new_val.float_val = (float)atof(stmt->raw_values[pk_col_idx]);
-          else if (def->columns[pk_col_idx].type == COL_DOUBLE) new_val.double_val = atof(stmt->raw_values[pk_col_idx]);
-          else value_set_text(&new_val, stmt->raw_values[pk_col_idx]);
+          const char* raw_pk_i = stmt->dyn_raw_values[pk_col_idx] ? stmt->dyn_raw_values[pk_col_idx] : stmt->raw_values[pk_col_idx];
+          if (def->columns[pk_col_idx].type == COL_INT) new_val.int_val = atoi(raw_pk_i);
+          else if (def->columns[pk_col_idx].type == COL_FLOAT) new_val.float_val = (float)atof(raw_pk_i);
+          else if (def->columns[pk_col_idx].type == COL_DOUBLE) new_val.double_val = atof(raw_pk_i);
+          else value_set_text(&new_val, raw_pk_i);
 
           if (compare_values(def->columns[pk_col_idx].type, &r_vals[pk_col_idx], &new_val) != 0) {
             all_pk_match = false;
@@ -734,13 +785,14 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     /* Single Column 0 Primary Key duplicate check */
     Value target_pk;
     value_init(&target_pk);
+    const char* raw_pk0 = stmt->dyn_raw_values[0] ? stmt->dyn_raw_values[0] : stmt->raw_values[0];
     if (stmt->has_bound_values) {
       value_copy(&target_pk, &stmt->bound_values[0]);
-    } else if (stmt->num_values > 0 && strlen(stmt->raw_values[0]) > 0) {
-      if (def->columns[0].type == COL_INT) target_pk.int_val = atoi(stmt->raw_values[0]);
-      else if (def->columns[0].type == COL_FLOAT) target_pk.float_val = (float)atof(stmt->raw_values[0]);
-      else if (def->columns[0].type == COL_DOUBLE) target_pk.double_val = atof(stmt->raw_values[0]);
-      else value_set_text(&target_pk, stmt->raw_values[0]);
+    } else if (stmt->num_values > 0 && raw_pk0 != NULL && strlen(raw_pk0) > 0) {
+      if (def->columns[0].type == COL_INT) target_pk.int_val = atoi(raw_pk0);
+      else if (def->columns[0].type == COL_FLOAT) target_pk.float_val = (float)atof(raw_pk0);
+      else if (def->columns[0].type == COL_DOUBLE) target_pk.double_val = atof(raw_pk0);
+      else value_set_text(&target_pk, raw_pk0);
     }
 
     Table main_tbl = { pager, def };
@@ -856,7 +908,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
     if (stmt->has_bound_values) {
       value_copy(&values[i], &stmt->bound_values[i]);
     } else {
-      char* raw = stmt->raw_values[i];
+      char* raw = stmt->dyn_raw_values[i] ? stmt->dyn_raw_values[i] : stmt->raw_values[i];
       bool is_val_null = (raw == NULL || strlen(raw) == 0 || (i < stmt->num_values && stmt->raw_is_null[i]));
       if (is_val_null) {
         values[i].is_null = true;
@@ -1351,36 +1403,36 @@ void eval_expr_string(const char* expr, TableDef* def, Value* row_vals, char* ou
     const char* p = expr + (is_l2 ? 12 : 18);
     p = skip_space(p);
 
-    char arg1_str[MAX_RAW_VAL] = {0};
-    char arg2_str[MAX_RAW_VAL] = {0};
+    const char* arg1_ptr = NULL;
+    char col_tok1[64] = {0};
 
     /* Parse first argument (could be column name or literal '[1, 2, ...]') */
     if (*p == '\'' || *p == '"') {
       char q = *p++;
-      uint32_t a_idx = 0;
-      while (*p && *p != q && a_idx < sizeof(arg1_str) - 1) arg1_str[a_idx++] = *p++;
+      arg1_ptr = p;
+      while (*p && *p != q) p++;
       if (*p == q) p++;
     } else if (*p == '[') {
       int depth = 0;
-      uint32_t a_idx = 0;
-      while (*p && a_idx < sizeof(arg1_str) - 1) {
+      arg1_ptr = p;
+      while (*p) {
         if (*p == '[') depth++;
         else if (*p == ']') {
           depth--;
-          arg1_str[a_idx++] = *p++;
+          p++;
           if (depth <= 0) break;
           continue;
         }
-        arg1_str[a_idx++] = *p++;
+        p++;
       }
     } else {
       uint32_t a_idx = 0;
-      while (*p && *p != ',' && a_idx < sizeof(arg1_str) - 1) arg1_str[a_idx++] = *p++;
-      while (a_idx > 0 && isspace((unsigned char)arg1_str[a_idx - 1])) arg1_str[--a_idx] = '\0';
+      while (*p && *p != ',' && a_idx < sizeof(col_tok1) - 1) col_tok1[a_idx++] = *p++;
+      while (a_idx > 0 && isspace((unsigned char)col_tok1[a_idx - 1])) col_tok1[--a_idx] = '\0';
       if (def && row_vals) {
         for (uint32_t c = 0; c < def->num_cols; c++) {
-          if (strcasecmp(def->columns[c].name, arg1_str) == 0) {
-            snprintf(arg1_str, sizeof(arg1_str), "%s", row_vals[c].text_val ? row_vals[c].text_val : "");
+          if (strcasecmp(def->columns[c].name, col_tok1) == 0) {
+            arg1_ptr = row_vals[c].text_val ? row_vals[c].text_val : "";
             break;
           }
         }
@@ -1391,33 +1443,36 @@ void eval_expr_string(const char* expr, TableDef* def, Value* row_vals, char* ou
     if (*p == ',') p++;
     p = skip_space(p);
 
+    const char* arg2_ptr = NULL;
+    char col_tok2[64] = {0};
+
     /* Parse second argument */
     if (*p == '\'' || *p == '"') {
       char q = *p++;
-      uint32_t a_idx = 0;
-      while (*p && *p != q && a_idx < sizeof(arg2_str) - 1) arg2_str[a_idx++] = *p++;
+      arg2_ptr = p;
+      while (*p && *p != q) p++;
       if (*p == q) p++;
     } else if (*p == '[') {
       int depth = 0;
-      uint32_t a_idx = 0;
-      while (*p && a_idx < sizeof(arg2_str) - 1) {
+      arg2_ptr = p;
+      while (*p) {
         if (*p == '[') depth++;
         else if (*p == ']') {
           depth--;
-          arg2_str[a_idx++] = *p++;
+          p++;
           if (depth <= 0) break;
           continue;
         }
-        arg2_str[a_idx++] = *p++;
+        p++;
       }
     } else {
       uint32_t a_idx = 0;
-      while (*p && *p != ')' && a_idx < sizeof(arg2_str) - 1) arg2_str[a_idx++] = *p++;
-      while (a_idx > 0 && isspace((unsigned char)arg2_str[a_idx - 1])) arg2_str[--a_idx] = '\0';
+      while (*p && *p != ')' && a_idx < sizeof(col_tok2) - 1) col_tok2[a_idx++] = *p++;
+      while (a_idx > 0 && isspace((unsigned char)col_tok2[a_idx - 1])) col_tok2[--a_idx] = '\0';
       if (def && row_vals) {
         for (uint32_t c = 0; c < def->num_cols; c++) {
-          if (strcasecmp(def->columns[c].name, arg2_str) == 0) {
-            snprintf(arg2_str, sizeof(arg2_str), "%s", row_vals[c].text_val ? row_vals[c].text_val : "");
+          if (strcasecmp(def->columns[c].name, col_tok2) == 0) {
+            arg2_ptr = row_vals[c].text_val ? row_vals[c].text_val : "";
             break;
           }
         }
@@ -1426,8 +1481,8 @@ void eval_expr_string(const char* expr, TableDef* def, Value* row_vals, char* ou
 
     float vec1[1024];
     float vec2[1024];
-    int dim1 = parse_vector_string(arg1_str, vec1, 1024);
-    int dim2 = parse_vector_string(arg2_str, vec2, 1024);
+    int dim1 = parse_vector_string(arg1_ptr, vec1, 1024);
+    int dim2 = parse_vector_string(arg2_ptr, vec2, 1024);
     int dim = (dim1 < dim2) ? dim1 : dim2;
 
     if (dim > 0) {
@@ -1999,7 +2054,7 @@ static void value_from_raw(ColumnType type, const char* raw, bool is_null, Value
   }
 }
 
-static void add_selected_row(RowSortEntry** p_entries, uint32_t* p_count, uint32_t* p_capacity,
+void add_selected_row(RowSortEntry** p_entries, uint32_t* p_count, uint32_t* p_capacity,
                              Statement* stmt, TableDef* def, Value* row_vals) {
   if (*p_count >= *p_capacity) {
     *p_capacity *= 2;
@@ -2014,16 +2069,17 @@ static void add_selected_row(RowSortEntry** p_entries, uint32_t* p_count, uint32
   if (stmt->has_order_by) {
     uint32_t num_items = (stmt->num_order_by > 0) ? stmt->num_order_by : 1;
     for (uint32_t k = 0; k < num_items; k++) {
-      const char* target_col = (stmt->num_order_by > 0) ? stmt->order_by_items[k].col_name : stmt->order_by_col;
+      const char* target_col = (stmt->num_order_by > 0) ? 
+        (stmt->order_by_items[k].dyn_col_name ? stmt->order_by_items[k].dyn_col_name : stmt->order_by_items[k].col_name) : 
+        (stmt->dyn_order_by_col ? stmt->dyn_order_by_col : stmt->order_by_col);
       bool target_desc = (stmt->num_order_by > 0) ? stmt->order_by_items[k].is_desc : stmt->order_by_desc;
       CollationType target_coll = (stmt->num_order_by > 0) ? stmt->order_by_items[k].collation : stmt->order_by_collation;
 
-      char resolved_expr[256];
-      snprintf(resolved_expr, sizeof(resolved_expr), "%s", target_col);
+      const char* resolved_expr = target_col;
       if (isdigit((unsigned char)target_col[0]) && stmt->num_select_cols > 0) {
         int pos = atoi(target_col);
         if (pos >= 1 && pos <= (int)stmt->num_select_cols) {
-          snprintf(resolved_expr, sizeof(resolved_expr), "%s", stmt->select_cols[pos - 1].col_name);
+          resolved_expr = stmt->select_cols[pos - 1].col_name;
         }
       }
 
@@ -2482,54 +2538,7 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
     }
 
     /* Deduplication for DISTINCT */
-    if (stmt->is_distinct && count > 0) {
-      uint32_t write_idx = 0;
-      for (uint32_t i = 0; i < count; i++) {
-        bool dup = false;
-        for (uint32_t j = 0; j < write_idx; j++) {
-          bool same = true;
-          if (stmt->num_select_cols > 0) {
-            for (uint32_t sc = 0; sc < stmt->num_select_cols; sc++) {
-              int col_idx = -1;
-              for (uint32_t c = 0; c < def->num_cols; c++) {
-                if (strcmp(def->columns[c].name, stmt->select_cols[sc].col_name) == 0) {
-                  col_idx = (int)c;
-                  break;
-                }
-              }
-              if (col_idx >= 0) {
-                if (compare_values(def->columns[col_idx].type, &entries[i].row[col_idx], &entries[j].row[col_idx]) != 0) {
-                  same = false;
-                  break;
-                }
-              }
-            }
-          } else {
-            for (uint32_t c = 0; c < def->num_cols; c++) {
-              if (compare_values(def->columns[c].type, &entries[i].row[c], &entries[j].row[c]) != 0) {
-                same = false;
-                break;
-              }
-            }
-          }
-          if (same) { dup = true; break; }
-        }
-        if (!dup) {
-          if (write_idx != i) {
-            value_free_row(entries[write_idx].row, def->num_cols);
-            value_free_row(entries[write_idx].sort_keys, entries[write_idx].num_sort_keys);
-            entries[write_idx] = entries[i];
-            memset(&entries[i], 0, sizeof(RowSortEntry));
-          }
-          write_idx++;
-        } else {
-          value_free_row(entries[i].row, def->num_cols);
-          value_free_row(entries[i].sort_keys, entries[i].num_sort_keys);
-          memset(&entries[i], 0, sizeof(RowSortEntry));
-        }
-      }
-      count = write_idx;
-    }
+    count = deduplicate_distinct_entries(entries, count, stmt, def);
 
     /* LIMIT & OFFSET */
     uint32_t offset = (stmt->has_offset && stmt->offset_val > 0) ? (uint32_t)stmt->offset_val : 0;
@@ -2580,11 +2589,7 @@ static ExecuteResult run_select_vm(Statement* stmt, TableDef* def, Catalog* cata
       printf("  Rows Yielded: %u\n", yielded_count);
       printf("  Execution Time: %.3f ms\n", elapsed_ms);
     }
-    for (uint32_t i = 0; i < count; i++) {
-      value_free_row(entries[i].row, def->num_cols);
-      value_free_row(entries[i].sort_keys, entries[i].num_sort_keys);
-    }
-    free(entries);
+    free_row_sort_entries(entries, count, def);
     return EXECUTE_SUCCESS;
   }
 
@@ -3255,9 +3260,10 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
       if (stmt->num_order_by > 0) {
         e->num_sort_keys = stmt->num_order_by;
         for (uint32_t k = 0; k < stmt->num_order_by; k++) {
+          const char* col_name_k = stmt->order_by_items[k].dyn_col_name ? stmt->order_by_items[k].dyn_col_name : stmt->order_by_items[k].col_name;
           int k_idx = -1;
           for (uint32_t c = 0; c < combined_def.num_cols; c++) {
-            if (strcasecmp(combined_def.columns[c].name, stmt->order_by_items[k].col_name) == 0) {
+            if (strcasecmp(combined_def.columns[c].name, col_name_k) == 0) {
               k_idx = (int)c;
               break;
             }
@@ -3267,7 +3273,7 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
             e->sort_types[k] = combined_def.columns[k_idx].type;
           } else {
             char expr_out[256] = {0};
-            eval_expr_string(stmt->order_by_items[k].col_name, &combined_def, stream[i].vals, expr_out, sizeof(expr_out));
+            eval_expr_string(col_name_k, &combined_def, stream[i].vals, expr_out, sizeof(expr_out));
             if (expr_out[0] != '\0') {
               if (strcasecmp(expr_out, "null") == 0) {
                 e->sort_types[k] = COL_INT;
@@ -3295,7 +3301,8 @@ static ExecuteResult run_join_select_vm(Statement* stmt, TableDef* left_def, Cat
           e->sort_types[0] = combined_def.columns[order_by_idx].type;
         } else {
           char expr_out[256] = {0};
-          eval_expr_string(stmt->order_by_col, &combined_def, stream[i].vals, expr_out, sizeof(expr_out));
+          const char* col_name_0 = stmt->dyn_order_by_col ? stmt->dyn_order_by_col : stmt->order_by_col;
+          eval_expr_string(col_name_0, &combined_def, stream[i].vals, expr_out, sizeof(expr_out));
           if (expr_out[0] != '\0') {
             if (strcasecmp(expr_out, "null") == 0) {
               e->sort_types[0] = COL_INT;
@@ -4297,9 +4304,10 @@ static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* cata
           if (pair->is_null) {
             values[col_idx].is_null = true;
           } else {
+            const char* pair_val = pair->dyn_str_val ? pair->dyn_str_val : pair->str_val;
             char expr_res[256] = {0};
-            eval_expr_string(pair->str_val, def, old_values, expr_res, sizeof(expr_res));
-            const char* final_val = (strlen(expr_res) > 0) ? expr_res : pair->str_val;
+            eval_expr_string(pair_val, def, old_values, expr_res, sizeof(expr_res));
+            const char* final_val = (strlen(expr_res) > 0) ? expr_res : pair_val;
 
             values[col_idx].is_null = false;
             switch (col->type) {
@@ -5937,7 +5945,15 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
             view_stmt->has_order_by = true;
             view_stmt->num_order_by = stmt->num_order_by;
             memcpy(view_stmt->order_by_items, stmt->order_by_items, sizeof(stmt->order_by_items));
+            for (uint32_t k = 0; k < stmt->num_order_by; k++) {
+              if (stmt->order_by_items[k].dyn_col_name) {
+                view_stmt->order_by_items[k].dyn_col_name = strdup(stmt->order_by_items[k].dyn_col_name);
+              }
+            }
             strcpy(view_stmt->order_by_col, stmt->order_by_col);
+            if (stmt->dyn_order_by_col) {
+              view_stmt->dyn_order_by_col = strdup(stmt->dyn_order_by_col);
+            }
             view_stmt->order_by_desc = stmt->order_by_desc;
             view_stmt->order_by_collation = stmt->order_by_collation;
           }
@@ -5953,11 +5969,14 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
             view_stmt->is_distinct = true;
           }
           ExecuteResult res = execute_statement(view_stmt, catalog, pager);
+          statement_free_children(view_stmt);
           free(view_stmt);
           return res;
         }
+        statement_free_children(view_stmt);
         free(view_stmt);
       }
+      return EXECUTE_SUCCESS;
     }
     if (stmt->num_ctes > 0) {
       for (uint32_t c = 0; c < stmt->num_ctes; c++) {
@@ -5981,11 +6000,21 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
             *single_ins = *stmt;
             single_ins->is_multi_insert = false;
             single_ins->num_values = stmt->num_values;
+            memset(single_ins->dyn_raw_values, 0, sizeof(single_ins->dyn_raw_values));
             for (uint32_t c = 0; c < stmt->num_values; c++) {
               strncpy(single_ins->raw_values[c], stmt->multi_raw_values[r][c], MAX_RAW_VAL - 1);
+              if (stmt->dyn_multi_raw_values[r][c]) {
+                single_ins->dyn_raw_values[c] = strdup(stmt->dyn_multi_raw_values[r][c]);
+              }
               single_ins->raw_is_null[c] = stmt->multi_raw_is_null[r][c];
             }
             result = run_insert_vm(single_ins, def, effective_catalog, effective_pager);
+            for (uint32_t c = 0; c < stmt->num_values; c++) {
+              if (single_ins->dyn_raw_values[c]) {
+                free(single_ins->dyn_raw_values[c]);
+                single_ins->dyn_raw_values[c] = NULL;
+              }
+            }
             if (result != EXECUTE_SUCCESS) break;
           }
           free(single_ins);

@@ -115,6 +115,13 @@ struct dbms_stmt {
   /* MVCC Snapshot isolation */
   uint64_t snapshot_xid;
   bool has_snapshot;
+
+  /* Buffered rows for ORDER BY / LIMIT / OFFSET / DISTINCT */
+  RowSortEntry* buffered_rows;
+  uint32_t num_buffered_rows;
+  uint32_t current_buffered_idx;
+  uint32_t buffered_limit;
+  bool use_buffered_rows;
 };
 
 int dbms_open(const char* filename, dbms** ppDb) {
@@ -400,9 +407,88 @@ int dbms_step(dbms_stmt* pStmt) {
       pStmt->snapshot_xid = pager_register_snapshot(pStmt->db->pager);
       pStmt->has_snapshot = true;
 
-      pStmt->target_table = (Table){ pStmt->db->pager, pStmt->target_def };
-      pStmt->btree_cur = btree_start(&pStmt->target_table);
-      pStmt->executed = true;
+      bool need_buffering = pStmt->stmt.has_order_by || pStmt->stmt.has_limit || pStmt->stmt.has_offset || pStmt->stmt.is_distinct;
+      if (need_buffering) {
+        pStmt->use_buffered_rows = true;
+        pStmt->target_table = (Table){ pStmt->db->pager, pStmt->target_def };
+        Cursor* cur = btree_start(&pStmt->target_table);
+        uint32_t capacity = 16;
+        pStmt->buffered_rows = malloc(sizeof(RowSortEntry) * capacity);
+        pStmt->num_buffered_rows = 0;
+        time_t now_ts = time(NULL);
+
+        uint32_t needed_count = UINT32_MAX;
+        if (!pStmt->stmt.has_order_by && !pStmt->stmt.is_distinct && pStmt->stmt.has_limit) {
+          uint32_t off = (pStmt->stmt.has_offset && pStmt->stmt.offset_val > 0) ? (uint32_t)pStmt->stmt.offset_val : 0;
+          needed_count = off + (uint32_t)pStmt->stmt.limit_val;
+        }
+
+        while (cur && !cur->end_of_table) {
+          Value row_vals[MAX_COLUMNS];
+          if (row_is_visible_and_active(pStmt->target_def, cursor_value(cur), pStmt->snapshot_xid, row_vals, (uint64_t)now_ts)) {
+            if (!pStmt->stmt.where_clause.has_where || eval_where_clause(pStmt->target_def, row_vals, &pStmt->stmt.where_clause, &pStmt->db->catalog, pStmt->db->pager)) {
+              add_selected_row(&pStmt->buffered_rows, &pStmt->num_buffered_rows, &capacity, &pStmt->stmt, pStmt->target_def, row_vals);
+              if (pStmt->num_buffered_rows >= needed_count) {
+                value_free_row(row_vals, pStmt->target_def->num_cols);
+                break;
+              }
+            }
+            value_free_row(row_vals, pStmt->target_def->num_cols);
+          }
+          cursor_advance(cur);
+        }
+        if (cur) free(cur);
+
+        if (pStmt->stmt.has_order_by && pStmt->num_buffered_rows > 1) {
+          qsort(pStmt->buffered_rows, pStmt->num_buffered_rows, sizeof(RowSortEntry), compare_row_sort_entries);
+        }
+
+        if (pStmt->stmt.is_distinct && pStmt->num_buffered_rows > 0) {
+          pStmt->num_buffered_rows = deduplicate_distinct_entries(pStmt->buffered_rows, pStmt->num_buffered_rows, &pStmt->stmt, pStmt->target_def);
+        }
+
+        uint32_t offset = (pStmt->stmt.has_offset && pStmt->stmt.offset_val > 0) ? (uint32_t)pStmt->stmt.offset_val : 0;
+        uint32_t limit = pStmt->num_buffered_rows;
+        if (pStmt->stmt.has_limit && pStmt->stmt.limit_val >= 0) {
+          limit = offset + (uint32_t)pStmt->stmt.limit_val;
+        }
+        if (limit > pStmt->num_buffered_rows) limit = pStmt->num_buffered_rows;
+        pStmt->current_buffered_idx = offset;
+        pStmt->buffered_limit = limit;
+        pStmt->executed = true;
+      } else {
+        pStmt->use_buffered_rows = false;
+        pStmt->target_table = (Table){ pStmt->db->pager, pStmt->target_def };
+        pStmt->btree_cur = btree_start(&pStmt->target_table);
+        pStmt->executed = true;
+      }
+    }
+
+    if (pStmt->use_buffered_rows) {
+      if (pStmt->current_buffered_idx < pStmt->buffered_limit) {
+        value_free_row(pStmt->current_row_vals, MAX_COLUMNS);
+        for (uint32_t c = 0; c < pStmt->target_def->num_cols; c++) {
+          value_copy(&pStmt->current_row_vals[c], &pStmt->buffered_rows[pStmt->current_buffered_idx].row[c]);
+        }
+        pStmt->current_buffered_idx++;
+        pStmt->has_current_row = true;
+        pthread_mutex_unlock(&pStmt->db->mutex);
+        return DBMS_ROW;
+      }
+
+      pStmt->has_current_row = false;
+      value_free_row(pStmt->current_row_vals, MAX_COLUMNS);
+      if (pStmt->buffered_rows) {
+        free_row_sort_entries(pStmt->buffered_rows, pStmt->num_buffered_rows, pStmt->target_def);
+        pStmt->buffered_rows = NULL;
+        pStmt->num_buffered_rows = 0;
+      }
+      if (pStmt->has_snapshot) {
+        pager_unregister_snapshot(pStmt->db->pager, pStmt->snapshot_xid);
+        pStmt->has_snapshot = false;
+      }
+      pthread_mutex_unlock(&pStmt->db->mutex);
+      return DBMS_DONE;
     }
 
     time_t now_ts = time(NULL);
@@ -489,6 +575,14 @@ int dbms_reset(dbms_stmt* pStmt) {
     free(pStmt->btree_cur);
     pStmt->btree_cur = NULL;
   }
+  if (pStmt->buffered_rows) {
+    free_row_sort_entries(pStmt->buffered_rows, pStmt->num_buffered_rows, pStmt->target_def);
+    pStmt->buffered_rows = NULL;
+    pStmt->num_buffered_rows = 0;
+  }
+  pStmt->current_buffered_idx = 0;
+  pStmt->buffered_limit = 0;
+  pStmt->use_buffered_rows = false;
   if (pStmt->has_snapshot && pStmt->db && pStmt->db->pager) {
     pager_unregister_snapshot(pStmt->db->pager, pStmt->snapshot_xid);
     pStmt->has_snapshot = false;

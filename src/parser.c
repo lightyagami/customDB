@@ -19,26 +19,28 @@ static const char* parse_identifier(const char* p, char* dest, uint32_t max_len)
   return p;
 }
 
-static const char* parse_order_by_expr(const char* p, char* dest, uint32_t max_len) {
+static const char* parse_order_by_expr_alloc(const char* p, char* dest, uint32_t max_len, char** out_dyn) {
+  if (out_dyn) *out_dyn = NULL;
   p = skip_whitespace(p);
-  uint32_t len = 0;
+  const char* start = p;
   int paren_depth = 0;
   int bracket_depth = 0;
   bool in_single_quote = false;
   bool in_double_quote = false;
+  const char* scan = p;
 
-  while (*p) {
+  while (*scan) {
     if (!in_single_quote && !in_double_quote) {
-      if (*p == '\'') { in_single_quote = true; }
-      else if (*p == '"') { in_double_quote = true; }
-      else if (*p == '(') { paren_depth++; }
-      else if (*p == ')') { if (paren_depth > 0) paren_depth--; }
-      else if (*p == '[') { bracket_depth++; }
-      else if (*p == ']') { if (bracket_depth > 0) bracket_depth--; }
+      if (*scan == '\'') { in_single_quote = true; }
+      else if (*scan == '"') { in_double_quote = true; }
+      else if (*scan == '(') { paren_depth++; }
+      else if (*scan == ')') { if (paren_depth > 0) paren_depth--; }
+      else if (*scan == '[') { bracket_depth++; }
+      else if (*scan == ']') { if (bracket_depth > 0) bracket_depth--; }
       else if (paren_depth == 0 && bracket_depth == 0) {
-        if (*p == ',' || *p == ';') break;
-        if (isspace((unsigned char)*p)) {
-          const char* la = skip_whitespace(p);
+        if (*scan == ',' || *scan == ';') break;
+        if (isspace((unsigned char)*scan)) {
+          const char* la = skip_whitespace(scan);
           if (strncasecmp(la, "asc", 3) == 0 && (isspace((unsigned char)la[3]) || la[3] == ',' || la[3] == ';' || la[3] == '\0')) {
             break;
           }
@@ -57,98 +59,163 @@ static const char* parse_order_by_expr(const char* p, char* dest, uint32_t max_l
         }
       }
     } else if (in_single_quote) {
-      if (*p == '\'') in_single_quote = false;
+      if (*scan == '\'') in_single_quote = false;
     } else if (in_double_quote) {
-      if (*p == '"') in_double_quote = false;
+      if (*scan == '"') in_double_quote = false;
     }
+    scan++;
+  }
 
-    if (len < max_len - 1) {
-      dest[len++] = *p;
+  const char* end = scan;
+  while (end > start && isspace((unsigned char)*(end - 1))) {
+    end--;
+  }
+  size_t expr_len = (size_t)(end - start);
+  if (expr_len < max_len - 1) {
+    memcpy(dest, start, expr_len);
+    dest[expr_len] = '\0';
+  } else {
+    memcpy(dest, start, max_len - 1);
+    dest[max_len - 1] = '\0';
+    if (out_dyn) {
+      *out_dyn = malloc(expr_len + 1);
+      if (*out_dyn) {
+        memcpy(*out_dyn, start, expr_len);
+        (*out_dyn)[expr_len] = '\0';
+      }
     }
-    p++;
   }
-  while (len > 0 && isspace((unsigned char)dest[len - 1])) {
-    len--;
-  }
-  dest[len] = '\0';
-  return p;
+  return scan;
 }
 
+__attribute__((unused)) static const char* parse_order_by_expr(const char* p, char* dest, uint32_t max_len) {
+  return parse_order_by_expr_alloc(p, dest, max_len, NULL);
+}
 
-/* Helper to parse a string value (handles single/double quotes, vector brackets, or unquoted strings) */
-static const char* parse_value_token_ex(const char* p, char* dest, uint32_t max_len, bool* out_is_null, bool* out_was_quoted) {
+/* Helper to parse a string value with two-phase scanning (zero-copy scan first, allocate if > max_len) */
+static const char* parse_value_token_alloc(const char* p, char* dest, uint32_t max_len, char** out_dyn, bool* out_is_null, bool* out_was_quoted) {
+  if (out_dyn) *out_dyn = NULL;
   p = skip_whitespace(p);
-  uint32_t len = 0;
+  const char* start = p;
   bool was_quoted = false;
   bool is_null = false;
 
-  if ((*p == 'x' || *p == 'X') && (p[1] == '\'' || p[1] == '"')) {
+  /* Phase 1: scan forward without copying to compute exact boundaries and token length */
+  const char* scan = p;
+  if ((*scan == 'x' || *scan == 'X') && (scan[1] == '\'' || scan[1] == '"')) {
     was_quoted = true;
-    char quote = p[1];
-    if (len < max_len - 1) dest[len++] = *p;
-    p++;
-    if (len < max_len - 1) dest[len++] = *p;
-    p++;
-    while (*p && *p != quote) {
-      if (len < max_len - 1) dest[len++] = *p;
-      p++;
-    }
-    if (*p == quote) {
-      if (len < max_len - 1) dest[len++] = *p;
-      p++;
-    }
-  } else if (*p == '\'' || *p == '"') {
+    char quote = scan[1];
+    scan += 2;
+    while (*scan && *scan != quote) scan++;
+    if (*scan == quote) scan++;
+  } else if (*scan == '\'' || *scan == '"') {
     was_quoted = true;
-    char quote = *p++;
-    while (*p) {
-      if (*p == quote) {
-        if (p[1] == quote) {
-          if (len < max_len - 1) dest[len++] = quote;
-          p += 2;
-          continue;
-        }
-        p++;
+    char quote = *scan++;
+    while (*scan) {
+      if (*scan == quote) {
+        if (scan[1] == quote) { scan += 2; continue; }
+        scan++;
         break;
       }
-      if (len < max_len - 1) {
-        dest[len++] = *p;
-      }
-      p++;
+      scan++;
     }
-  } else if (*p == '[') {
-    /* Vector literal or JSON array: [1.0, 2.0, 3.0] */
+  } else if (*scan == '[') {
     int bdepth = 0;
-    while (*p) {
-      if (*p == '[') bdepth++;
-      else if (*p == ']') {
+    while (*scan) {
+      if (*scan == '[') bdepth++;
+      else if (*scan == ']') {
         bdepth--;
-        if (len < max_len - 1) dest[len++] = *p;
-        p++;
+        scan++;
         if (bdepth <= 0) break;
         continue;
       }
-      if (len < max_len - 1) dest[len++] = *p;
-      p++;
+      scan++;
     }
   } else {
-    while (*p && !isspace((unsigned char)*p) && *p != ',' && *p != ')' && *p != '=' && *p != ';') {
-      if (len < max_len - 1) {
-        dest[len++] = *p;
-      }
-      p++;
-    }
-    if (len == 4 && strcasecmp(dest, "null") == 0) {
-      is_null = true;
+    while (*scan && !isspace((unsigned char)*scan) && *scan != ',' && *scan != ')' && *scan != '=' && *scan != ';') {
+      scan++;
     }
   }
-  dest[len] = '\0';
+
+  size_t raw_span = (size_t)(scan - start);
+  char* target = dest;
+  uint32_t target_cap = max_len;
+
+  if (out_dyn && raw_span >= max_len - 1) {
+    char* dyn = malloc(raw_span + 1);
+    if (dyn) {
+      *out_dyn = dyn;
+      target = dyn;
+      target_cap = (uint32_t)(raw_span + 1);
+    }
+  }
+
+  /* Phase 2: Copy and unescape into target */
+  uint32_t len = 0;
+  const char* src = start;
+  if ((*src == 'x' || *src == 'X') && (src[1] == '\'' || src[1] == '"')) {
+    char quote = src[1];
+    if (len < target_cap - 1) target[len++] = *src;
+    src++;
+    if (len < target_cap - 1) target[len++] = *src;
+    src++;
+    while (src < scan && *src != quote) {
+      if (len < target_cap - 1) target[len++] = *src;
+      src++;
+    }
+    if (src < scan && *src == quote) {
+      if (len < target_cap - 1) target[len++] = *src;
+      src++;
+    }
+  } else if (*src == '\'' || *src == '"') {
+    char quote = *src++;
+    while (src < scan) {
+      if (*src == quote) {
+        if (src + 1 < scan && src[1] == quote) {
+          if (len < target_cap - 1) target[len++] = quote;
+          src += 2;
+          continue;
+        }
+        src++;
+        break;
+      }
+      if (len < target_cap - 1) target[len++] = *src;
+      src++;
+    }
+  } else if (*src == '[') {
+    while (src < scan) {
+      if (len < target_cap - 1) target[len++] = *src;
+      src++;
+    }
+  } else {
+    while (src < scan) {
+      if (len < target_cap - 1) target[len++] = *src;
+      src++;
+    }
+  }
+  target[len] = '\0';
+  if (!was_quoted && len == 4 && strcasecmp(target, "null") == 0) {
+    is_null = true;
+  }
+
+  /* If we allocated dynamic buffer, also write truncated prefix into dest for fallback */
+  if (target != dest) {
+    uint32_t cpy = (len < max_len - 1) ? len : max_len - 1;
+    memcpy(dest, target, cpy);
+    dest[cpy] = '\0';
+  }
+
   if (out_is_null) *out_is_null = is_null;
   if (out_was_quoted) *out_was_quoted = was_quoted;
-  return p;
+  return scan;
+}
+
+__attribute__((unused)) static const char* parse_value_token_ex(const char* p, char* dest, uint32_t max_len, bool* out_is_null, bool* out_was_quoted) {
+  return parse_value_token_alloc(p, dest, max_len, NULL, out_is_null, out_was_quoted);
 }
 
 static const char* parse_value_token(const char* p, char* dest, uint32_t max_len) {
-  return parse_value_token_ex(p, dest, max_len, NULL, NULL);
+  return parse_value_token_alloc(p, dest, max_len, NULL, NULL, NULL);
 }
 
 static const char* parse_where_clause(const char* p, WhereClause* wc) {
@@ -866,18 +933,30 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
         if (col_idx >= MAX_COLUMNS) return PREPARE_SYNTAX_ERROR;
 
         char tmp_val[MAX_RAW_VAL];
+        char* dyn_val = NULL;
         bool val_is_null = false;
-        p = parse_value_token_ex(p, tmp_val, MAX_RAW_VAL, &val_is_null, NULL);
+        p = parse_value_token_alloc(p, tmp_val, MAX_RAW_VAL, &dyn_val, &val_is_null, NULL);
 
         /* Map to column position via col_list if provided */
         uint32_t dest = col_idx;
         if (col_list_count > 0 && col_idx < col_list_count) {
           dest = col_idx; /* store in order; executor maps by col_list later */
         }
-        snprintf(out->multi_raw_values[out->num_multi_rows][dest], MAX_RAW_VAL, "%s", tmp_val);
+        if (dyn_val) {
+          out->dyn_multi_raw_values[out->num_multi_rows][dest] = dyn_val;
+          snprintf(out->multi_raw_values[out->num_multi_rows][dest], MAX_RAW_VAL, "%.*s", MAX_RAW_VAL - 1, dyn_val);
+          if (out->num_multi_rows == 0) {
+            out->dyn_raw_values[dest] = strdup(dyn_val);
+            snprintf(out->raw_values[dest], MAX_RAW_VAL, "%.*s", MAX_RAW_VAL - 1, dyn_val);
+          }
+        } else {
+          snprintf(out->multi_raw_values[out->num_multi_rows][dest], MAX_RAW_VAL, "%s", tmp_val);
+          if (out->num_multi_rows == 0) {
+            snprintf(out->raw_values[dest], MAX_RAW_VAL, "%s", tmp_val);
+          }
+        }
         out->multi_raw_is_null[out->num_multi_rows][dest] = val_is_null;
         if (out->num_multi_rows == 0) {
-          snprintf(out->raw_values[dest], MAX_RAW_VAL, "%s", tmp_val);
           out->raw_is_null[dest] = val_is_null;
         }
         col_idx++;
@@ -926,7 +1005,7 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
             p = skip_whitespace(p);
             if (*p != '=') break;
             p++;
-            p = parse_value_token_ex(p, pair->str_val, MAX_RAW_VAL, &pair->is_null, NULL);
+            p = parse_value_token_alloc(p, pair->str_val, MAX_RAW_VAL, &pair->dyn_str_val, &pair->is_null, NULL);
             out->num_set_pairs++;
             p = skip_whitespace(p);
             if (*p == ',') p++;
@@ -1306,8 +1385,8 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
         if (*p == '\0' || *p == ';') break;
         if (out->num_order_by >= 4) break;
         OrderByItem* item = &out->order_by_items[out->num_order_by++];
-        p = parse_order_by_expr(p, item->col_name, sizeof(item->col_name));
-        if (strlen(item->col_name) == 0) return PREPARE_SYNTAX_ERROR;
+        p = parse_order_by_expr_alloc(p, item->col_name, sizeof(item->col_name), &item->dyn_col_name);
+        if (strlen(item->col_name) == 0 && item->dyn_col_name == NULL) return PREPARE_SYNTAX_ERROR;
 
         p = skip_whitespace(p);
         if (strncasecmp(p, "collate", 7) == 0 && (isspace((unsigned char)p[7]) || p[7] == '\0')) {
@@ -1340,6 +1419,9 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       }
       if (out->num_order_by > 0) {
         snprintf(out->order_by_col, sizeof(out->order_by_col), "%s", out->order_by_items[0].col_name);
+        if (out->order_by_items[0].dyn_col_name) {
+          out->dyn_order_by_col = strdup(out->order_by_items[0].dyn_col_name);
+        }
         out->order_by_desc = out->order_by_items[0].is_desc;
         out->order_by_collation = out->order_by_items[0].collation;
       }
@@ -1445,8 +1527,8 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
       p++;
       p = skip_whitespace(p);
 
-      if (*p == '\'' || *p == '"') {
-        p = parse_value_token_ex(p, pair->str_val, MAX_RAW_VAL, &pair->is_null, NULL);
+      if (*p == '\'' || *p == '"' || *p == '[') {
+        p = parse_value_token_alloc(p, pair->str_val, MAX_RAW_VAL, &pair->dyn_str_val, &pair->is_null, NULL);
         pair->is_null = false; /* explicitly quoted, cannot be SQL NULL */
       } else {
         uint32_t s_idx = 0;
@@ -1972,6 +2054,36 @@ PrepareResult prepare_statement(const char* input, Statement* out) {
 
 void statement_free_children(Statement* stmt) {
   if (!stmt) return;
+  for (uint32_t c = 0; c < MAX_COLUMNS; c++) {
+    if (stmt->dyn_raw_values[c]) {
+      free(stmt->dyn_raw_values[c]);
+      stmt->dyn_raw_values[c] = NULL;
+    }
+  }
+  for (uint32_t r = 0; r < MAX_MULTI_ROWS; r++) {
+    for (uint32_t c = 0; c < MAX_COLUMNS; c++) {
+      if (stmt->dyn_multi_raw_values[r][c]) {
+        free(stmt->dyn_multi_raw_values[r][c]);
+        stmt->dyn_multi_raw_values[r][c] = NULL;
+      }
+    }
+  }
+  for (uint32_t k = 0; k < 4; k++) {
+    if (stmt->order_by_items[k].dyn_col_name) {
+      free(stmt->order_by_items[k].dyn_col_name);
+      stmt->order_by_items[k].dyn_col_name = NULL;
+    }
+  }
+  if (stmt->dyn_order_by_col) {
+    free(stmt->dyn_order_by_col);
+    stmt->dyn_order_by_col = NULL;
+  }
+  for (uint32_t u = 0; u < stmt->num_set_pairs; u++) {
+    if (stmt->set_pairs[u].dyn_str_val) {
+      free(stmt->set_pairs[u].dyn_str_val);
+      stmt->set_pairs[u].dyn_str_val = NULL;
+    }
+  }
   for (uint32_t c = 0; c < stmt->num_ctes; c++) {
     if (stmt->ctes[c].cte_stmt) {
       statement_free_children(stmt->ctes[c].cte_stmt);

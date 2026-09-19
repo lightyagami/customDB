@@ -92,7 +92,7 @@ int main(int argc, char* argv[]) {
   memset(catalog, 0, sizeof(Catalog));
   catalog_load(catalog, pager);
 
-  char input_buffer[16384];
+  char input_buffer[65536];
 
   while (true) {
     print_prompt();

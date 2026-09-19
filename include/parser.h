@@ -82,6 +82,7 @@ typedef enum {
 
 typedef struct {
   char          col_name[256];
+  char*         dyn_col_name;
   bool          is_desc;
   CollationType collation;
 } OrderByItem;
@@ -121,6 +122,7 @@ typedef struct WhereClause WhereClause;
 typedef struct {
   char col_name[COL_NAME_SIZE];
   char str_val[MAX_RAW_VAL];
+  char* dyn_str_val;
   bool is_null;
 } SetPair;
 
@@ -206,6 +208,7 @@ struct Statement {
 
   /* INSERT */
   char     raw_values[MAX_COLUMNS][MAX_RAW_VAL];
+  char*    dyn_raw_values[MAX_COLUMNS];
   bool     raw_is_null[MAX_COLUMNS];
   uint32_t num_values;
   Value    bound_values[MAX_COLUMNS];
@@ -213,6 +216,7 @@ struct Statement {
   bool     is_multi_insert;
   uint32_t num_multi_rows;
   char     multi_raw_values[MAX_MULTI_ROWS][MAX_COLUMNS][MAX_RAW_VAL];
+  char*    dyn_multi_raw_values[MAX_MULTI_ROWS][MAX_COLUMNS];
   bool     multi_raw_is_null[MAX_MULTI_ROWS][MAX_COLUMNS];
   bool     is_insert_select;
   Statement* insert_select_stmt;
@@ -250,6 +254,7 @@ struct Statement {
   /* ORDER BY */
   bool          has_order_by;
   char          order_by_col[256];
+  char*         dyn_order_by_col;
   bool          order_by_desc;
   CollationType order_by_collation;
   uint32_t      num_order_by;

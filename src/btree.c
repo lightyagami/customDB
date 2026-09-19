@@ -246,6 +246,15 @@ void initialize_root_leaf(void* node) {
 #define OVERFLOW_HEADER_SIZE    4u
 #define OVERFLOW_PAYLOAD_SIZE   (PAGE_SIZE - OVERFLOW_HEADER_SIZE)
 #define BTREE_MAX_LOCAL_PAYLOAD 1024u
+#define OVERFLOW_STUB_HEADER    8u   /* [4B total_size][4B first_overflow_page] */
+
+/* On-disk invariant: a leaf cell is inline iff slot->size < BTREE_MAX_LOCAL_PAYLOAD.
+ * An overflow stub is ALWAYS exactly BTREE_MAX_LOCAL_PAYLOAD bytes (8-byte header
+ * + 1016 local bytes). Nothing may infer "stub vs inline" from the cell's data
+ * bytes: an inline record can decode to any header values. */
+static inline bool cell_is_overflow_stub(uint32_t slot_size) {
+  return slot_size >= BTREE_MAX_LOCAL_PAYLOAD;
+}
 
 static uint32_t btree_write_overflow_chain(Pager* pager, const uint8_t* data, uint32_t len) {
   if (len == 0) return 0;
@@ -325,7 +334,7 @@ static void btree_make_overflow_key(void) {
 }
 
 static __thread uint8_t* s_overflow_buf = NULL;
-static __thread uint32_t s_overflow_cap = 0;
+static __thread size_t s_overflow_cap = 0;
 
 __attribute__((destructor)) static void btree_thread_cleanup(void) {
   if (s_overflow_buf) {
@@ -367,11 +376,11 @@ static void serialize_cell_for_leaf(TableDef* def, Value* values, uint64_t expir
     }
   }
 
-  if (total_size <= BTREE_MAX_LOCAL_PAYLOAD) {
+  if (total_size < BTREE_MAX_LOCAL_PAYLOAD) {
     memcpy(out_cell, ser_buf, total_size);
     *out_cell_size = total_size;
   } else {
-    uint32_t local_chunk = BTREE_MAX_LOCAL_PAYLOAD - 8;
+    uint32_t local_chunk = BTREE_MAX_LOCAL_PAYLOAD - OVERFLOW_STUB_HEADER;
     uint32_t overflow_len = total_size - local_chunk;
     uint32_t first_overflow = btree_write_overflow_chain(pager, ser_buf + local_chunk, overflow_len);
 
@@ -401,14 +410,8 @@ static uint32_t btree_get_varint(const uint8_t* p, uint64_t* v) {
 
 static void extract_col0_from_packed_record(TableDef* def, const void* record_bytes, uint32_t cell_size, Value* out_val) {
   const uint8_t* in = (const uint8_t*)record_bytes;
-  if (cell_size >= BTREE_MAX_LOCAL_PAYLOAD) {
-    uint32_t total_size = 0;
-    uint32_t first_overflow_page = 0;
-    memcpy(&total_size, in, 4);
-    memcpy(&first_overflow_page, in + 4, 4);
-    if (total_size > cell_size && first_overflow_page != 0) {
-      in += 8;
-    }
+  if (cell_is_overflow_stub(cell_size)) {
+    in += OVERFLOW_STUB_HEADER;   /* column 0 lives in the inline 1016-byte prefix */
   }
 
   uint64_t total_hdr_size = 0;
@@ -736,7 +739,7 @@ void* cursor_value(Cursor* cursor) {
   PageSlot* slot = leaf_node_slot(node, cursor->cell_num);
   uint8_t* cell_data = (uint8_t*)node + slot->offset;
 
-  if (slot->size < BTREE_MAX_LOCAL_PAYLOAD) {
+  if (!cell_is_overflow_stub(slot->size)) {
     return cell_data;
   }
 
@@ -745,24 +748,35 @@ void* cursor_value(Cursor* cursor) {
   memcpy(&total_size, cell_data, 4);
   memcpy(&first_overflow_page, cell_data + 4, 4);
 
-  if (total_size <= slot->size || first_overflow_page == 0) {
+  uint32_t local_chunk = slot->size - OVERFLOW_STUB_HEADER;
+  /* A stub must describe more bytes than fit locally and point at a real page.
+   * Anything else is on-disk corruption; fail loudly instead of allocating
+   * garbage-sized buffers or following wild page numbers. */
+  if (total_size <= local_chunk || first_overflow_page == 0 ||
+      first_overflow_page == INVALID_PAGE_NUM ||
+      first_overflow_page < cursor->table->pager->reserved_catalog_pages) {
+    fprintf(stderr, "btree: corrupt overflow stub (page %u cell %u: total=%u first=%u)\n",
+            cursor->page_num, cursor->cell_num, total_size, first_overflow_page);
     return cell_data;
   }
 
-  if (s_overflow_cap < total_size + 64) {
-    s_overflow_cap = total_size + 65536;
-    s_overflow_buf = realloc(s_overflow_buf, s_overflow_cap);
+  size_t need = (size_t)total_size + 64;
+  if (s_overflow_cap < need) {
+    size_t new_cap = (size_t)total_size + 65536;
+    uint8_t* nb = realloc(s_overflow_buf, new_cap);
+    if (!nb) {
+      fprintf(stderr, "btree: out of memory reading %u-byte value\n", total_size);
+      return cell_data;
+    }
+    s_overflow_buf = nb;
+    s_overflow_cap = new_cap;
     pthread_once(&s_btree_overflow_once, btree_make_overflow_key);
     pthread_setspecific(s_btree_overflow_key, s_overflow_buf);
   }
 
-  uint32_t local_chunk = slot->size - 8;
-  memcpy(s_overflow_buf, cell_data + 8, local_chunk);
-
-  if (total_size > local_chunk && first_overflow_page != 0) {
-    btree_read_overflow_chain(cursor->table->pager, first_overflow_page, s_overflow_buf + local_chunk, total_size - local_chunk);
-  }
-
+  memcpy(s_overflow_buf, cell_data + OVERFLOW_STUB_HEADER, local_chunk);
+  btree_read_overflow_chain(cursor->table->pager, first_overflow_page,
+                            s_overflow_buf + local_chunk, total_size - local_chunk);
   return s_overflow_buf;
 }
 
@@ -926,7 +940,7 @@ static void internal_node_split_and_insert(Table* table, uint32_t parent_page, u
 }
 
 /* ── Leaf Insert with Slotted Defrag ─────────────────────────────────────── */
-static void leaf_node_split_and_insert(Cursor* cursor, Value* values, uint64_t expire_at, uint64_t xmin, uint64_t xmax);
+static void leaf_node_split_and_insert(Cursor* cursor, const uint8_t* new_cell, uint32_t new_cell_size);
 
 static void leaf_node_insert(Cursor* cursor, Value* values, uint64_t expire_at, uint64_t xmin, uint64_t xmax) {
   pager_journal_page(cursor->table->pager, cursor->page_num);
@@ -948,7 +962,7 @@ static void leaf_node_insert(Cursor* cursor, Value* values, uint64_t expire_at, 
     free_space = *leaf_node_free_space(node);
     /* If still full, split the node */
     if (free_space < slots_end || (free_space - slots_end) < needed) {
-      leaf_node_split_and_insert(cursor, values, expire_at, xmin, xmax);
+      leaf_node_split_and_insert(cursor, temp_buf, size);   /* reuse the cell: never re-serialize (would orphan the first overflow chain) */
       return;
     }
   }
@@ -972,7 +986,7 @@ static void leaf_node_insert(Cursor* cursor, Value* values, uint64_t expire_at, 
 }
 
 /* ── Slotted Split ───────────────────────────────────────────────────────── */
-static void leaf_node_split_and_insert(Cursor* cursor, Value* values, uint64_t expire_at, uint64_t xmin, uint64_t xmax) {
+static void leaf_node_split_and_insert(Cursor* cursor, const uint8_t* new_cell, uint32_t new_cell_size) {
   pager_journal_page(cursor->table->pager, cursor->page_num);
   void* old_node   = get_page(cursor->table->pager, cursor->page_num);
   
@@ -992,9 +1006,8 @@ static void leaf_node_split_and_insert(Cursor* cursor, Value* values, uint64_t e
   uint32_t total_cells = num_cells + 1;
   TempCell* temp_cells = malloc(sizeof(TempCell) * total_cells);
 
-  uint8_t new_val_buf[BTREE_MAX_LOCAL_PAYLOAD];
-  uint32_t new_val_size = 0;
-  serialize_cell_for_leaf(cursor->table->def, values, expire_at, xmin, xmax, cursor->table->pager, new_val_buf, &new_val_size);
+  const uint8_t* new_val_buf = new_cell;
+  uint32_t new_val_size = new_cell_size;
 
   /* Build list of all cells (existing + new) */
   for (uint32_t i = 0; i < total_cells; i++) {
@@ -1400,13 +1413,11 @@ void btree_delete(Cursor* cursor) {
   }
 
   PageSlot* slot = leaf_node_slot(node, ci);
-  if (slot->size >= BTREE_MAX_LOCAL_PAYLOAD) {
+  if (cell_is_overflow_stub(slot->size)) {
     uint8_t* cell_data = (uint8_t*)node + slot->offset;
-    uint32_t total_size = 0;
     uint32_t first_overflow_page = 0;
-    memcpy(&total_size, cell_data, 4);
     memcpy(&first_overflow_page, cell_data + 4, 4);
-    if (total_size > slot->size && first_overflow_page != 0) {
+    if (first_overflow_page != 0) {
       btree_free_overflow_chain(cursor->table->pager, first_overflow_page);
     }
   }
