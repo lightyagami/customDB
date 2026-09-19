@@ -432,6 +432,7 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
         Value r_vals[MAX_COLUMNS];
         deserialize_row(def, cursor_value(cur), r_vals);
         if (r_vals[0].int_val > max_id) max_id = r_vals[0].int_val;
+        value_free_row(r_vals, def->num_cols);
         cursor_advance(cur);
       }
       free(cur);
