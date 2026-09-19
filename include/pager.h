@@ -83,6 +83,9 @@ typedef struct {
    * Callers should check this and propagate the error rather than
    * proceeding with potentially unsafe writes. */
   bool     lock_error;
+  /* In-Process Concurrency Control */
+  struct FileLockNode* lock_node;
+  bool     is_explicit_tx;
 
   /* Performance & I/O Metrics */
   uint64_t disk_reads;
@@ -108,7 +111,7 @@ bool     pager_lock(Pager* pager, PagerLockState lock_type);
 void     pager_unlock(Pager* pager);
 
 /* Transactions & ACID Journaling */
-void     pager_begin_transaction(Pager* pager);
+bool     pager_begin_transaction(Pager* pager);
 bool     pager_ensure_write_lock(Pager* pager);
 void     pager_journal_page(Pager* pager, uint32_t page_num);
 void     pager_commit(Pager* pager);

@@ -1,4 +1,91 @@
 #include "pager.h"
+#include <limits.h>
+
+typedef struct FileLockNode {
+  dev_t dev;
+  ino_t ino;
+  char canonical_path[PATH_MAX];
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+  Pager* active_writer;
+  int ref_count;
+  struct FileLockNode* next;
+} FileLockNode;
+
+static FileLockNode* g_file_lock_head = NULL;
+static pthread_mutex_t g_file_lock_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static FileLockNode* get_file_lock_node(int fd, const char* filename) {
+  if (fd == -1 && !filename) return NULL;
+  struct stat st;
+  bool have_stat = false;
+  if (fd != -1 && fstat(fd, &st) == 0) {
+    have_stat = true;
+  } else if (filename && stat(filename, &st) == 0) {
+    have_stat = true;
+  }
+
+  char canon[PATH_MAX] = {0};
+  if (filename) {
+    if (!realpath(filename, canon)) {
+      strncpy(canon, filename, sizeof(canon) - 1);
+    }
+  }
+
+  pthread_mutex_lock(&g_file_lock_registry_mutex);
+  FileLockNode* curr = g_file_lock_head;
+  while (curr) {
+    bool match = false;
+    if (have_stat && curr->dev == st.st_dev && curr->ino == st.st_ino) {
+      match = true;
+    } else if (canon[0] != '\0' && curr->canonical_path[0] != '\0' && strcmp(curr->canonical_path, canon) == 0) {
+      match = true;
+    }
+    if (match) {
+      curr->ref_count++;
+      pthread_mutex_unlock(&g_file_lock_registry_mutex);
+      return curr;
+    }
+    curr = curr->next;
+  }
+
+  FileLockNode* node = calloc(1, sizeof(FileLockNode));
+  if (have_stat) {
+    node->dev = st.st_dev;
+    node->ino = st.st_ino;
+  }
+  if (canon[0] != '\0') {
+    strncpy(node->canonical_path, canon, sizeof(node->canonical_path) - 1);
+  }
+  pthread_mutex_init(&node->mutex, NULL);
+  pthread_cond_init(&node->cond, NULL);
+  node->active_writer = NULL;
+  node->ref_count = 1;
+  node->next = g_file_lock_head;
+  g_file_lock_head = node;
+  pthread_mutex_unlock(&g_file_lock_registry_mutex);
+  return node;
+}
+
+static void release_file_lock_node(FileLockNode* node) {
+  if (!node) return;
+  pthread_mutex_lock(&g_file_lock_registry_mutex);
+  FileLockNode** pp = &g_file_lock_head;
+  while (*pp) {
+    if (*pp == node) {
+      node->ref_count--;
+      if (node->ref_count <= 0) {
+        *pp = node->next;
+        pthread_mutex_destroy(&node->mutex);
+        pthread_cond_destroy(&node->cond);
+        free(node);
+      }
+      break;
+    }
+    pp = &(*pp)->next;
+  }
+  pthread_mutex_unlock(&g_file_lock_registry_mutex);
+}
 
 static void check_and_recover_journal(Pager* pager) {
   struct stat st;
@@ -136,6 +223,10 @@ Pager* pager_open(const char* filename) {
     pthread_rwlock_init(&pager->table_rwlocks[t], NULL);
   }
 
+  if (!pager->is_memory) {
+    pager->lock_node = get_file_lock_node(pager->file_descriptor, filename);
+  }
+
   return pager;
 }
 
@@ -206,7 +297,7 @@ static int lock_file_byte(int fd, off_t offset, short lock_type, bool wait) {
   lock.l_whence = SEEK_SET;
   lock.l_start = offset;
   lock.l_len = 1;
-  
+
   int cmd = wait ? F_SETLKW : F_SETLK;
   return fcntl(fd, cmd, &lock);
 }
@@ -218,7 +309,7 @@ static bool is_byte_locked(int fd, off_t offset, short lock_type) {
   lock.l_whence = SEEK_SET;
   lock.l_start = offset;
   lock.l_len = 1;
-  
+
   if (fcntl(fd, F_GETLK, &lock) == -1) return true;
   return (lock.l_type != F_UNLCK);
 }
@@ -342,6 +433,39 @@ void pager_refresh_if_modified(Pager* pager) {
 
 bool pager_ensure_write_lock(Pager* pager) {
   if (!pager) return false;
+
+  /* 1. Intra-process serialization via FileLockNode */
+  if (pager->lock_node) {
+    pthread_mutex_lock(&pager->lock_node->mutex);
+    if (pager->lock_node->active_writer != NULL && pager->lock_node->active_writer != pager) {
+      if (pager->lock_node->active_writer->is_explicit_tx) {
+        pthread_mutex_unlock(&pager->lock_node->mutex);
+        pager->lock_error = true;
+        fprintf(stderr, "Error: Database is locked by another transaction.\n");
+        return false;
+      }
+      struct timespec ts;
+      clock_gettime(CLOCK_REALTIME, &ts);
+      ts.tv_nsec += 500000000;
+      if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec += 1;
+        ts.tv_nsec -= 1000000000;
+      }
+      while (pager->lock_node->active_writer != NULL && pager->lock_node->active_writer != pager) {
+        int rc = pthread_cond_timedwait(&pager->lock_node->cond, &pager->lock_node->mutex, &ts);
+        if (rc != 0) {
+          pthread_mutex_unlock(&pager->lock_node->mutex);
+          pager->lock_error = true;
+          fprintf(stderr, "Error: Database is locked by another thread.\n");
+          return false;
+        }
+      }
+    }
+    pager->lock_node->active_writer = pager;
+    pthread_mutex_unlock(&pager->lock_node->mutex);
+  }
+
+  /* 2. Inter-process OS lock */
   if (!pager->is_memory && pager->lock_state < RESERVED_LOCK) {
     /* Retry up to 500ms to acquire RESERVED lock */
     int retries = 50;
@@ -350,6 +474,14 @@ bool pager_ensure_write_lock(Pager* pager) {
       if (--retries <= 0) {
         pager->lock_error = true;
         fprintf(stderr, "Error: Database is locked by another process.\n");
+        if (pager->lock_node) {
+          pthread_mutex_lock(&pager->lock_node->mutex);
+          if (pager->lock_node->active_writer == pager) {
+            pager->lock_node->active_writer = NULL;
+            pthread_cond_broadcast(&pager->lock_node->cond);
+          }
+          pthread_mutex_unlock(&pager->lock_node->mutex);
+        }
         return false;
       }
     }
@@ -378,9 +510,25 @@ bool pager_ensure_write_lock(Pager* pager) {
   return true;
 }
 
-void pager_begin_transaction(Pager* pager) {
+bool pager_begin_transaction(Pager* pager) {
+  if (!pager) return false;
   if (pager->in_transaction) {
-    return;
+    return true;
+  }
+  if (pager->lock_node) {
+    pthread_mutex_lock(&pager->lock_node->mutex);
+    if (pager->lock_node->active_writer != NULL && pager->lock_node->active_writer != pager) {
+      pthread_mutex_unlock(&pager->lock_node->mutex);
+      pager->lock_error = true;
+      return false;
+    }
+    pthread_mutex_unlock(&pager->lock_node->mutex);
+  }
+  if (!pager->is_memory && pager->file_descriptor != -1) {
+    if (is_byte_locked(pager->file_descriptor, RESERVED_BYTE, F_WRLCK)) {
+      pager->lock_error = true;
+      return false;
+    }
   }
   pager_refresh_if_modified(pager);
   pager->in_transaction = true;
@@ -390,6 +538,7 @@ void pager_begin_transaction(Pager* pager) {
     pager->file_length = (uint32_t)lseek(pager->file_descriptor, 0, SEEK_END);
   }
   pager->tx_snapshot_xid = pager_register_snapshot(pager);
+  return true;
 }
 
 void pager_shadow_page_write(Pager* pager, uint32_t page_num) {
@@ -712,6 +861,15 @@ void pager_commit(Pager* pager) {
       pager_unregister_snapshot(pager, pager->tx_snapshot_xid);
       pager->tx_snapshot_xid = 0;
     }
+    if (pager->lock_node) {
+      pthread_mutex_lock(&pager->lock_node->mutex);
+      if (pager->lock_node->active_writer == pager) {
+        pager->lock_node->active_writer = NULL;
+        pthread_cond_broadcast(&pager->lock_node->cond);
+      }
+      pthread_mutex_unlock(&pager->lock_node->mutex);
+    }
+    pager->is_explicit_tx = false;
     pager->writer_tid = 0;
     pager->in_transaction = false;
     pager_unlock(pager);
@@ -801,6 +959,15 @@ void pager_commit(Pager* pager) {
     pager_unregister_snapshot(pager, pager->tx_snapshot_xid);
     pager->tx_snapshot_xid = 0;
   }
+  if (pager->lock_node) {
+    pthread_mutex_lock(&pager->lock_node->mutex);
+    if (pager->lock_node->active_writer == pager) {
+      pager->lock_node->active_writer = NULL;
+      pthread_cond_broadcast(&pager->lock_node->cond);
+    }
+    pthread_mutex_unlock(&pager->lock_node->mutex);
+  }
+  pager->is_explicit_tx = false;
   pager->writer_tid = 0;
 
   pager->in_transaction = false;
@@ -892,6 +1059,15 @@ void pager_rollback(Pager* pager) {
     pager_unregister_snapshot(pager, pager->tx_snapshot_xid);
     pager->tx_snapshot_xid = 0;
   }
+  if (pager->lock_node) {
+    pthread_mutex_lock(&pager->lock_node->mutex);
+    if (pager->lock_node->active_writer == pager) {
+      pager->lock_node->active_writer = NULL;
+      pthread_cond_broadcast(&pager->lock_node->cond);
+    }
+    pthread_mutex_unlock(&pager->lock_node->mutex);
+  }
+  pager->is_explicit_tx = false;
   pager->writer_tid = 0;
 
   pager->in_transaction = false;
@@ -1080,6 +1256,16 @@ void pager_close(Pager* pager) {
     close(pager->wal_fd);
   }
   close(pager->file_descriptor);
+  if (pager->lock_node) {
+    pthread_mutex_lock(&pager->lock_node->mutex);
+    if (pager->lock_node->active_writer == pager) {
+      pager->lock_node->active_writer = NULL;
+      pthread_cond_broadcast(&pager->lock_node->cond);
+    }
+    pthread_mutex_unlock(&pager->lock_node->mutex);
+    release_file_lock_node(pager->lock_node);
+    pager->lock_node = NULL;
+  }
   if (pager->pages) {
     free(pager->pages);
   }

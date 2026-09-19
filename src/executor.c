@@ -83,15 +83,24 @@ static AttachedDb* find_attached_db(const char* alias) {
 
 /* Compile and run transaction statement on VDBE */
 static ExecuteResult run_transaction_vm(Statement* stmt, Catalog* catalog, Pager* pager) {
+  if (stmt->type == STATEMENT_BEGIN) {
+    if (!pager_begin_transaction(pager)) {
+      return EXECUTE_BUSY;
+    }
+    pager->is_explicit_tx = true;
+    return EXECUTE_SUCCESS;
+  }
+  if (stmt->type == STATEMENT_COMMIT) {
+    pager_commit(pager);
+    return EXECUTE_SUCCESS;
+  }
+  if (stmt->type == STATEMENT_ROLLBACK) {
+    pager_rollback(pager);
+    return EXECUTE_SUCCESS;
+  }
+
   Vdbe* vm = vdbe_create(pager, catalog);
-  int tx_op = 0;
-  if (stmt->type == STATEMENT_BEGIN)    tx_op = 1;
-  if (stmt->type == STATEMENT_COMMIT)   tx_op = 2;
-  if (stmt->type == STATEMENT_ROLLBACK) tx_op = 3;
-
-  vdbe_add_inst(vm, OP_Transaction, tx_op, 0, 0, (Value){0});
   vdbe_add_inst(vm, OP_Halt, 0, 0, 0, (Value){0});
-
   vdbe_run(vm);
   vdbe_free(vm);
   return EXECUTE_SUCCESS;
@@ -397,7 +406,9 @@ static bool sql_glob_match(const char* pattern, const char* str) {
 static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* catalog, Pager* pager) {
   bool auto_tx = false;
   if (!pager->in_transaction) {
-    pager_begin_transaction(pager);
+    if (!pager_begin_transaction(pager)) {
+      return EXECUTE_BUSY;
+    }
     auto_tx = true;
   }
   if (!pager_ensure_write_lock(pager)) {
@@ -4009,7 +4020,9 @@ bool eval_where_clause(TableDef* def, Value* row_vals, WhereClause* wc, Catalog*
 static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* catalog, Pager* pager) {
   bool auto_tx = false;
   if (!pager->in_transaction) {
-    pager_begin_transaction(pager);
+    if (!pager_begin_transaction(pager)) {
+      return EXECUTE_BUSY;
+    }
     auto_tx = true;
   }
   if (!pager_ensure_write_lock(pager)) {
@@ -4196,7 +4209,9 @@ static ExecuteResult run_delete_vm(Statement* stmt, TableDef* def, Catalog* cata
 static ExecuteResult run_update_vm(Statement* stmt, TableDef* def, Catalog* catalog, Pager* pager) {
   bool auto_tx = false;
   if (!pager->in_transaction) {
-    pager_begin_transaction(pager);
+    if (!pager_begin_transaction(pager)) {
+      return EXECUTE_BUSY;
+    }
     auto_tx = true;
   }
   if (!pager_ensure_write_lock(pager)) {
@@ -4454,7 +4469,9 @@ static ExecuteResult execute_create_table(Statement* stmt, Catalog* catalog, Pag
 
   bool auto_tx = false;
   if (!pager->in_transaction) {
-    pager_begin_transaction(pager);
+    if (!pager_begin_transaction(pager)) {
+      return EXECUTE_BUSY;
+    }
     auto_tx = true;
   }
   if (!pager_ensure_write_lock(pager)) {
@@ -4544,7 +4561,9 @@ static ExecuteResult execute_drop_table(Statement* stmt, Catalog* catalog, Pager
 
   bool auto_tx = false;
   if (!pager->in_transaction) {
-    pager_begin_transaction(pager);
+    if (!pager_begin_transaction(pager)) {
+      return EXECUTE_BUSY;
+    }
     auto_tx = true;
   }
   if (!pager_ensure_write_lock(pager)) {
@@ -4589,7 +4608,9 @@ static ExecuteResult execute_create_index(Statement* stmt, Catalog* catalog, Pag
 
   bool auto_tx = false;
   if (!pager->in_transaction) {
-    pager_begin_transaction(pager);
+    if (!pager_begin_transaction(pager)) {
+      return EXECUTE_BUSY;
+    }
     auto_tx = true;
   }
   if (!pager_ensure_write_lock(pager)) {
@@ -5249,7 +5270,9 @@ static ExecuteResult execute_create_vtable(Statement* stmt, Catalog* catalog, Pa
 
   bool auto_tx = false;
   if (!pager->in_transaction) {
-    pager_begin_transaction(pager);
+    if (!pager_begin_transaction(pager)) {
+      return EXECUTE_BUSY;
+    }
     auto_tx = true;
   }
   if (!pager_ensure_write_lock(pager)) {
@@ -5339,7 +5362,9 @@ static ExecuteResult execute_alter_table(Statement* stmt, Catalog* catalog, Page
 
   bool auto_tx = false;
   if (!pager->in_transaction) {
-    pager_begin_transaction(pager);
+    if (!pager_begin_transaction(pager)) {
+      return EXECUTE_BUSY;
+    }
     auto_tx = true;
   }
   if (!pager_ensure_write_lock(pager)) {
@@ -5513,7 +5538,9 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
     if (catalog->num_views >= MAX_VIEWS) return EXECUTE_BAD_SCHEMA;
     bool auto_tx = false;
     if (!pager->in_transaction) {
-      pager_begin_transaction(pager);
+      if (!pager_begin_transaction(pager)) {
+        return EXECUTE_BUSY;
+      }
       auto_tx = true;
     }
     if (!pager_ensure_write_lock(pager)) {
@@ -5535,7 +5562,9 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
       if (strcmp(catalog->views[i].view_name, stmt->view_name) == 0) {
         bool auto_tx = false;
         if (!pager->in_transaction) {
-          pager_begin_transaction(pager);
+          if (!pager_begin_transaction(pager)) {
+            return EXECUTE_BUSY;
+          }
           auto_tx = true;
         }
         if (!pager_ensure_write_lock(pager)) {
@@ -5560,7 +5589,9 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
     if (catalog->num_triggers >= MAX_TRIGGERS) return EXECUTE_BAD_SCHEMA;
     bool auto_tx = false;
     if (!pager->in_transaction) {
-      pager_begin_transaction(pager);
+      if (!pager_begin_transaction(pager)) {
+        return EXECUTE_BUSY;
+      }
       auto_tx = true;
     }
     if (!pager_ensure_write_lock(pager)) {
@@ -5585,7 +5616,9 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
       if (strcmp(catalog->triggers[i].name, stmt->trigger_name) == 0) {
         bool auto_tx = false;
         if (!pager->in_transaction) {
-          pager_begin_transaction(pager);
+          if (!pager_begin_transaction(pager)) {
+            return EXECUTE_BUSY;
+          }
           auto_tx = true;
         }
         if (!pager_ensure_write_lock(pager)) {

@@ -194,6 +194,108 @@ class TestNetworkServer(unittest.TestCase):
                     try: os.remove(f)
                     except OSError: pass
 
+    def test_wal_server_overlapping_transactions(self):
+        """Verify that when connection B attempts an explicit transaction while connection A
+        holds an active write lock, B receives an honest 'Database is locked' error rather than
+        silently dropping writes or reporting false durability."""
+        db_file = "test_srv_overlapping.db"
+        for f in [db_file, db_file + "-journal", db_file + "-wal", db_file + "-shm"]:
+            if os.path.exists(f):
+                try: os.remove(f)
+                except OSError: pass
+
+        # Create table via CLI in WAL mode
+        cli = subprocess.run(["./db", db_file],
+                             input="PRAGMA journal_mode = WAL;\nCREATE TABLE t (id INT, val TEXT);\n.exit\n",
+                             text=True, capture_output=True)
+        self.assertEqual(cli.returncode, 0)
+
+        port = 9880
+        server_proc = subprocess.Popen(["./db_server", str(port), db_file],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(0.3)
+
+        def recv_response(sock):
+            buf = ""
+            while "Executed." not in buf and "Error:" not in buf:
+                chunk = sock.recv(1024).decode('utf-8')
+                if not chunk: break
+                buf += chunk
+            return buf
+
+        try:
+            # Client A
+            sa = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sa.connect(("127.0.0.1", port))
+            sa.recv(1024)
+
+            # Client B
+            sb = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sb.connect(("127.0.0.1", port))
+            sb.recv(1024)
+
+            # A opens transaction and starts writing
+            sa.sendall(b"BEGIN;\n")
+            self.assertIn("Executed.", recv_response(sa))
+
+            sa.sendall(b"INSERT INTO t VALUES (1, 'A1');\n")
+            self.assertIn("Executed.", recv_response(sa))
+
+            # B attempts BEGIN while A's write transaction is active -> must be rejected
+            sb.sendall(b"BEGIN;\n")
+            res_b_begin = recv_response(sb)
+            self.assertIn("Error: Database is locked", res_b_begin)
+            self.assertNotIn("Executed.", res_b_begin)
+
+            # B attempts INSERT while A's write transaction is active -> must be rejected
+            sb.sendall(b"INSERT INTO t VALUES (3, 'B1');\n")
+            res_b_ins = recv_response(sb)
+            self.assertIn("Error: Database is locked", res_b_ins)
+            self.assertNotIn("Executed.", res_b_ins)
+
+            # A finishes its write transaction
+            sa.sendall(b"INSERT INTO t VALUES (2, 'A2');\n")
+            self.assertIn("Executed.", recv_response(sa))
+
+            sa.sendall(b"COMMIT;\n")
+            self.assertIn("Executed.", recv_response(sa))
+
+            # Verify A's rows are intact
+            sa.sendall(b"SELECT * FROM t ORDER BY id ASC;\n")
+            res_a = recv_response(sa)
+            self.assertIn("(1, A1)", res_a)
+            self.assertIn("(2, A2)", res_a)
+            self.assertNotIn("(3, B1)", res_a)
+
+            # Now that A has committed, B can open a transaction and write successfully
+            sb.sendall(b"BEGIN;\n")
+            self.assertIn("Executed.", recv_response(sb))
+
+            sb.sendall(b"INSERT INTO t VALUES (3, 'B1');\n")
+            self.assertIn("Executed.", recv_response(sb))
+
+            sb.sendall(b"COMMIT;\n")
+            self.assertIn("Executed.", recv_response(sb))
+
+            # Both A and B now see all 3 rows
+            sb.sendall(b"SELECT * FROM t ORDER BY id ASC;\n")
+            res_final = recv_response(sb)
+            self.assertIn("(1, A1)", res_final)
+            self.assertIn("(2, A2)", res_final)
+            self.assertIn("(3, B1)", res_final)
+
+            sa.sendall(b".exit\n")
+            sa.close()
+            sb.sendall(b".exit\n")
+            sb.close()
+        finally:
+            server_proc.terminate()
+            server_proc.wait(timeout=2)
+            for f in [db_file, db_file + "-journal", db_file + "-wal", db_file + "-shm"]:
+                if os.path.exists(f):
+                    try: os.remove(f)
+                    except OSError: pass
+
     def test_server_error_reporting(self):
         db_file = "test_srv_err.db"
         for f in [db_file, db_file + "-journal", db_file + "-wal", db_file + "-shm"]:
