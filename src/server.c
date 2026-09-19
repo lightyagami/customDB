@@ -258,7 +258,7 @@ static void handle_http_request(int fd, dbms* db, const char* initial_data, ssiz
       roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, "], \"rows\": [");
 
       int row_idx = 0;
-      int step_res;
+      int step_res = DBMS_DONE;
       while ((step_res = dbms_step(stmt)) == DBMS_ROW && roff + 1024 < BUFFER_SIZE * 2) {
         if (row_idx > 0) roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, ", ");
         roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, "[");
@@ -275,6 +275,17 @@ static void handle_http_request(int fd, dbms* db, const char* initial_data, ssiz
         }
         roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, "]");
         row_idx++;
+      }
+      if (step_res != DBMS_DONE && step_res != DBMS_ROW) {
+        const char* err = dbms_errmsg(db);
+        char err_json[BUFFER_SIZE];
+        char esc_err[512];
+        escape_json_string((err && *err) ? err : "Execution failed", esc_err, sizeof(esc_err));
+        snprintf(err_json, sizeof(err_json), "{\"error\": \"%s\"}", esc_err);
+        dbms_finalize(stmt);
+        free(resp);
+        send_http_response(fd, 400, "Bad Request", err_json);
+        return;
       }
       dbms_finalize(stmt);
       roff += snprintf(resp + roff, (BUFFER_SIZE * 2) - roff, "]}");
@@ -420,11 +431,13 @@ static void* client_worker(void* arg) {
           dbms_stmt* stmt = NULL;
           int prep_res = dbms_prepare_v2(db, query, (int)strlen(query), &stmt, NULL);
           if (prep_res != DBMS_OK) {
-            const char* err = "Error: SQL syntax or semantic error.\n";
-            write(fd, err, strlen(err));
+            const char* err = dbms_errmsg(db);
+            char err_buf[BUFFER_SIZE];
+            int elen = snprintf(err_buf, sizeof(err_buf), "Error: %s\n", (err && *err) ? err : "SQL syntax or semantic error.");
+            write(fd, err_buf, elen);
           } else {
             int col_count = dbms_column_count(stmt);
-            int step_res;
+            int step_res = DBMS_DONE;
             while ((step_res = dbms_step(stmt)) == DBMS_ROW) {
               char row_out[BUFFER_SIZE];
               int r_len = 0;
@@ -445,8 +458,15 @@ static void* client_worker(void* arg) {
               row_out[r_len++] = '\n';
               write(fd, row_out, r_len);
             }
+            if (step_res != DBMS_DONE && step_res != DBMS_ROW) {
+              const char* err = dbms_errmsg(db);
+              char err_buf[BUFFER_SIZE];
+              int elen = snprintf(err_buf, sizeof(err_buf), "Error: %s\n", (err && *err) ? err : "Execution failed.");
+              write(fd, err_buf, elen);
+            } else {
+              write(fd, "Executed.\n", 10);
+            }
             dbms_finalize(stmt);
-            write(fd, "Executed.\n", 10);
           }
         }
         sql_len = 0;

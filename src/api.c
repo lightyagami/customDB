@@ -241,6 +241,7 @@ int dbms_prepare_v2(dbms* pDb, const char* zSql, int nByte, dbms_stmt** ppStmt, 
 
   if (pDb->file_mutex) pthread_mutex_lock(pDb->file_mutex);
   pthread_mutex_lock(&pDb->mutex);
+  pager_refresh_if_modified(pDb->pager);
   catalog_load(&pDb->catalog, pDb->pager);
 
   char sql_buf[16384];
@@ -387,8 +388,11 @@ int dbms_step(dbms_stmt* pStmt) {
 
     if (!pStmt->executed) {
       resolve_param_placeholders(&pStmt->stmt);
+      pager_refresh_if_modified(pStmt->db->pager);
+      catalog_load(&pStmt->db->catalog, pStmt->db->pager);
       pStmt->target_def = catalog_find(&pStmt->db->catalog, pStmt->stmt.table_name);
       if (pStmt->target_def == NULL) {
+        snprintf(pStmt->db->last_error, sizeof(pStmt->db->last_error), "Table '%s' not found", pStmt->stmt.table_name);
         pthread_mutex_unlock(&pStmt->db->mutex);
         return DBMS_ERROR;
       }
@@ -448,10 +452,28 @@ int dbms_step(dbms_stmt* pStmt) {
     ExecuteResult res = execute_statement(&pStmt->stmt, &pStmt->db->catalog, pStmt->db->pager);
     pStmt->executed = true;
     if (res != EXECUTE_SUCCESS) {
+      switch (res) {
+        case EXECUTE_TABLE_NOT_FOUND:
+          snprintf(pStmt->db->last_error, sizeof(pStmt->db->last_error), "Table not found");
+          break;
+        case EXECUTE_DUPLICATE_KEY:
+          snprintf(pStmt->db->last_error, sizeof(pStmt->db->last_error), "Duplicate key violation");
+          break;
+        case EXECUTE_BUSY:
+          snprintf(pStmt->db->last_error, sizeof(pStmt->db->last_error), "Database is locked");
+          break;
+        case EXECUTE_BAD_SCHEMA:
+          snprintf(pStmt->db->last_error, sizeof(pStmt->db->last_error), "Bad schema or constraint violation");
+          break;
+        default:
+          snprintf(pStmt->db->last_error, sizeof(pStmt->db->last_error), "SQL execution error (%d)", res);
+          break;
+      }
       pthread_mutex_unlock(&pStmt->db->mutex);
       if (pStmt->db->file_mutex) pthread_mutex_unlock(pStmt->db->file_mutex);
       return DBMS_ERROR;
     }
+    catalog_load(&pStmt->db->catalog, pStmt->db->pager);
   }
 
   pthread_mutex_unlock(&pStmt->db->mutex);

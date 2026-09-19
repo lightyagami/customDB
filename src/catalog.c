@@ -203,6 +203,7 @@ void catalog_save(Catalog* catalog, Pager* pager) {
   }
   pager->reserved_catalog_pages = 33;
 
+  pager_shadow_page_write(pager, 0);
   uint8_t* page0 = (uint8_t*)get_page(pager, 0);
   memcpy(page0, &catalog->num_tables, 4);
 
@@ -210,6 +211,7 @@ void catalog_save(Catalog* catalog, Pager* pager) {
     uint32_t page_num = (t == 0) ? 0 : (t < 15 ? t : t + 1);
     uint32_t page_offset = (t == 0) ? 4 : 0;
 
+    pager_shadow_page_write(pager, page_num);
     uint8_t* page = (uint8_t*)get_page(pager, page_num);
     uint8_t* base = page + page_offset;
     TableDef* def = &catalog->tables[t];
@@ -262,6 +264,7 @@ void catalog_save(Catalog* catalog, Pager* pager) {
     memcpy(base + DISK_HISTORY_OFFSET, &is_h, 1);
   }
 
+  pager_shadow_page_write(pager, 15);
   uint8_t* vt_page_ptr = (uint8_t*)get_page(pager, 15);
   memcpy(vt_page_ptr, &catalog->num_views, 4);
   memcpy(vt_page_ptr + 4, catalog->views, sizeof(ViewDef) * 4);

@@ -4452,6 +4452,16 @@ static ExecuteResult execute_create_table(Statement* stmt, Catalog* catalog, Pag
     return stmt->if_not_exists ? EXECUTE_SUCCESS : EXECUTE_TABLE_EXISTS;
   }
 
+  bool auto_tx = false;
+  if (!pager->in_transaction) {
+    pager_begin_transaction(pager);
+    auto_tx = true;
+  }
+  if (!pager_ensure_write_lock(pager)) {
+    if (auto_tx) pager_rollback(pager);
+    return EXECUTE_BUSY;
+  }
+
   /* Add to catalog */
   TableDef* def = &catalog->tables[catalog->num_tables];
   memcpy(def, &stmt->new_table, sizeof(TableDef));
@@ -4461,6 +4471,7 @@ static ExecuteResult execute_create_table(Statement* stmt, Catalog* catalog, Pag
 
   /* Initialize root page of B+ Tree */
   uint32_t root_page = get_unused_page_num(pager);
+  pager_shadow_page_write(pager, root_page);
   void* root_node = get_page(pager, root_page);
   initialize_root_leaf(root_node);
 
@@ -4511,6 +4522,10 @@ static ExecuteResult execute_create_table(Statement* stmt, Catalog* catalog, Pag
     }
   }
 
+  if (auto_tx && pager->in_transaction) {
+    pager_commit(pager);
+  }
+
   return EXECUTE_SUCCESS;
 }
 
@@ -4525,6 +4540,16 @@ static ExecuteResult execute_drop_table(Statement* stmt, Catalog* catalog, Pager
 
   if (idx == UINT32_MAX) {
     return EXECUTE_TABLE_NOT_FOUND;
+  }
+
+  bool auto_tx = false;
+  if (!pager->in_transaction) {
+    pager_begin_transaction(pager);
+    auto_tx = true;
+  }
+  if (!pager_ensure_write_lock(pager)) {
+    if (auto_tx) pager_rollback(pager);
+    return EXECUTE_BUSY;
   }
 
   /* Reclaim root page and index root pages to freelist */
@@ -4546,6 +4571,10 @@ static ExecuteResult execute_drop_table(Statement* stmt, Catalog* catalog, Pager
 
   if (pager->auto_vacuum) {
     execute_vacuum(catalog, pager);
+  }
+
+  if (auto_tx && pager->in_transaction) {
+    pager_commit(pager);
   }
 
   printf("Table '%s' dropped.\n", stmt->table_name);
@@ -4589,6 +4618,7 @@ static ExecuteResult execute_create_index(Statement* stmt, Catalog* catalog, Pag
 
   /* Allocate root page for index B+ Tree */
   uint32_t root_page = get_unused_page_num(pager);
+  pager_shadow_page_write(pager, root_page);
   void* root_node = get_page(pager, root_page);
   initialize_root_leaf(root_node);
 
@@ -5217,6 +5247,16 @@ static ExecuteResult execute_analyze(Statement* stmt, Catalog* catalog, Pager* p
 static ExecuteResult execute_create_vtable(Statement* stmt, Catalog* catalog, Pager* pager) {
   if (catalog->num_tables >= MAX_TABLES) return EXECUTE_BAD_SCHEMA;
 
+  bool auto_tx = false;
+  if (!pager->in_transaction) {
+    pager_begin_transaction(pager);
+    auto_tx = true;
+  }
+  if (!pager_ensure_write_lock(pager)) {
+    if (auto_tx) pager_rollback(pager);
+    return EXECUTE_BUSY;
+  }
+
   TableDef* def = &catalog->tables[catalog->num_tables++];
   memset(def, 0, sizeof(TableDef));
   snprintf(def->name, sizeof(def->name), "%s", stmt->table_name);
@@ -5239,12 +5279,16 @@ static ExecuteResult execute_create_vtable(Statement* stmt, Catalog* catalog, Pa
     def->columns[2].size = 256;
 
     uint32_t root_page = get_unused_page_num(pager);
+    pager_shadow_page_write(pager, root_page);
     void* root_node = get_page(pager, root_page);
     initialize_root_leaf(root_node);
     def->root_page_num = root_page;
 
     tabledef_compute(def);
     catalog_save(catalog, pager);
+    if (auto_tx && pager->in_transaction) {
+      pager_commit(pager);
+    }
     printf("FTS5 Virtual Table '%s' created successfully.\n", stmt->table_name);
     return EXECUTE_SUCCESS;
   }
@@ -5280,6 +5324,9 @@ static ExecuteResult execute_create_vtable(Statement* stmt, Catalog* catalog, Pa
 
   tabledef_compute(def);
   catalog_save(catalog, pager);
+  if (auto_tx && pager->in_transaction) {
+    pager_commit(pager);
+  }
   printf("Virtual table '%s' created using module '%s' (%s).\n", def->name, def->vtab_module, def->vtab_args);
   return EXECUTE_SUCCESS;
 }
@@ -5290,8 +5337,19 @@ static ExecuteResult execute_alter_table(Statement* stmt, Catalog* catalog, Page
     return EXECUTE_TABLE_NOT_FOUND;
   }
 
+  bool auto_tx = false;
+  if (!pager->in_transaction) {
+    pager_begin_transaction(pager);
+    auto_tx = true;
+  }
+  if (!pager_ensure_write_lock(pager)) {
+    if (auto_tx) pager_rollback(pager);
+    return EXECUTE_BUSY;
+  }
+
   if (stmt->alter_type == ALTER_RENAME_TABLE) {
     if (catalog_find(catalog, stmt->new_table_name) != NULL) {
+      if (auto_tx) pager_rollback(pager);
       return EXECUTE_TABLE_EXISTS;
     }
     snprintf(def->name, sizeof(def->name), "%s", stmt->new_table_name);
@@ -5304,12 +5362,16 @@ static ExecuteResult execute_alter_table(Statement* stmt, Catalog* catalog, Page
       }
     }
     catalog_save(catalog, pager);
+    if (auto_tx && pager->in_transaction) {
+      pager_commit(pager);
+    }
     printf("Table '%s' renamed to '%s'.\n", stmt->table_name, stmt->new_table_name);
     return EXECUTE_SUCCESS;
   }
 
   if (stmt->alter_type == ALTER_ADD_COLUMN) {
     if (def->num_cols >= MAX_COLUMNS) {
+      if (auto_tx) pager_rollback(pager);
       return EXECUTE_BAD_SCHEMA;
     }
 
@@ -5322,6 +5384,7 @@ static ExecuteResult execute_alter_table(Statement* stmt, Catalog* catalog, Page
     tabledef_compute(&new_def);
 
     uint32_t new_root = get_unused_page_num(pager);
+    pager_shadow_page_write(pager, new_root);
     void* root_node = get_page(pager, new_root);
     initialize_root_leaf(root_node);
     new_def.root_page_num = new_root;
@@ -5355,6 +5418,9 @@ static ExecuteResult execute_alter_table(Statement* stmt, Catalog* catalog, Page
 
     *def = new_def;
     catalog_save(catalog, pager);
+    if (auto_tx && pager->in_transaction) {
+      pager_commit(pager);
+    }
     printf("Column '%s' added to table '%s'.\n", stmt->new_col.name, def->name);
     return EXECUTE_SUCCESS;
   }
@@ -5367,7 +5433,10 @@ static ExecuteResult execute_alter_table(Statement* stmt, Catalog* catalog, Page
         break;
       }
     }
-    if (drop_idx == -1) return EXECUTE_BAD_SCHEMA;
+    if (drop_idx == -1) {
+      if (auto_tx) pager_rollback(pager);
+      return EXECUTE_BAD_SCHEMA;
+    }
 
     Table old_tbl = { pager, def };
     Cursor* cur = btree_start(&old_tbl);
@@ -5380,6 +5449,7 @@ static ExecuteResult execute_alter_table(Statement* stmt, Catalog* catalog, Page
     tabledef_compute(&new_def);
 
     uint32_t new_root = get_unused_page_num(pager);
+    pager_shadow_page_write(pager, new_root);
     void* root_node = get_page(pager, new_root);
     initialize_root_leaf(root_node);
     new_def.root_page_num = new_root;
@@ -5409,10 +5479,16 @@ static ExecuteResult execute_alter_table(Statement* stmt, Catalog* catalog, Page
 
     *def = new_def;
     catalog_save(catalog, pager);
+    if (auto_tx && pager->in_transaction) {
+      pager_commit(pager);
+    }
     printf("Column '%s' dropped from table '%s'.\n", stmt->drop_col_name, def->name);
     return EXECUTE_SUCCESS;
   }
 
+  if (auto_tx && pager->in_transaction) {
+    pager_commit(pager);
+  }
   return EXECUTE_SUCCESS;
 }
 
@@ -5435,21 +5511,45 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
   }
   if (stmt->type == STATEMENT_CREATE_VIEW) {
     if (catalog->num_views >= MAX_VIEWS) return EXECUTE_BAD_SCHEMA;
+    bool auto_tx = false;
+    if (!pager->in_transaction) {
+      pager_begin_transaction(pager);
+      auto_tx = true;
+    }
+    if (!pager_ensure_write_lock(pager)) {
+      if (auto_tx) pager_rollback(pager);
+      return EXECUTE_BUSY;
+    }
     ViewDef* v = &catalog->views[catalog->num_views++];
     snprintf(v->view_name, sizeof(v->view_name), "%s", stmt->view_name);
     snprintf(v->select_sql, sizeof(v->select_sql), "%s", stmt->view_select_sql);
     catalog_save(catalog, pager);
+    if (auto_tx && pager->in_transaction) {
+      pager_commit(pager);
+    }
     printf("View '%s' created successfully.\n", stmt->view_name);
     return EXECUTE_SUCCESS;
   }
   if (stmt->type == STATEMENT_DROP_VIEW) {
     for (uint32_t i = 0; i < catalog->num_views; i++) {
       if (strcmp(catalog->views[i].view_name, stmt->view_name) == 0) {
+        bool auto_tx = false;
+        if (!pager->in_transaction) {
+          pager_begin_transaction(pager);
+          auto_tx = true;
+        }
+        if (!pager_ensure_write_lock(pager)) {
+          if (auto_tx) pager_rollback(pager);
+          return EXECUTE_BUSY;
+        }
         for (uint32_t j = i; j < catalog->num_views - 1; j++) {
           catalog->views[j] = catalog->views[j+1];
         }
         catalog->num_views--;
         catalog_save(catalog, pager);
+        if (auto_tx && pager->in_transaction) {
+          pager_commit(pager);
+        }
         printf("View '%s' dropped successfully.\n", stmt->view_name);
         return EXECUTE_SUCCESS;
       }
@@ -5458,6 +5558,15 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
   }
   if (stmt->type == STATEMENT_CREATE_TRIGGER) {
     if (catalog->num_triggers >= MAX_TRIGGERS) return EXECUTE_BAD_SCHEMA;
+    bool auto_tx = false;
+    if (!pager->in_transaction) {
+      pager_begin_transaction(pager);
+      auto_tx = true;
+    }
+    if (!pager_ensure_write_lock(pager)) {
+      if (auto_tx) pager_rollback(pager);
+      return EXECUTE_BUSY;
+    }
     TriggerDef* t = &catalog->triggers[catalog->num_triggers++];
     snprintf(t->name, sizeof(t->name), "%s", stmt->trigger_name);
     snprintf(t->target_table, sizeof(t->target_table), "%s", stmt->table_name);
@@ -5465,17 +5574,32 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
     t->event = stmt->trigger_event;
     snprintf(t->action_sql, sizeof(t->action_sql), "%s", stmt->trigger_action_sql);
     catalog_save(catalog, pager);
+    if (auto_tx && pager->in_transaction) {
+      pager_commit(pager);
+    }
     printf("Trigger '%s' created successfully on %s.\n", stmt->trigger_name, stmt->table_name);
     return EXECUTE_SUCCESS;
   }
   if (stmt->type == STATEMENT_DROP_TRIGGER) {
     for (uint32_t i = 0; i < catalog->num_triggers; i++) {
       if (strcmp(catalog->triggers[i].name, stmt->trigger_name) == 0) {
+        bool auto_tx = false;
+        if (!pager->in_transaction) {
+          pager_begin_transaction(pager);
+          auto_tx = true;
+        }
+        if (!pager_ensure_write_lock(pager)) {
+          if (auto_tx) pager_rollback(pager);
+          return EXECUTE_BUSY;
+        }
         for (uint32_t j = i; j < catalog->num_triggers - 1; j++) {
           catalog->triggers[j] = catalog->triggers[j+1];
         }
         catalog->num_triggers--;
         catalog_save(catalog, pager);
+        if (auto_tx && pager->in_transaction) {
+          pager_commit(pager);
+        }
         printf("Trigger '%s' dropped successfully.\n", stmt->trigger_name);
         return EXECUTE_SUCCESS;
       }
