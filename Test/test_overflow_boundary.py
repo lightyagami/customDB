@@ -24,12 +24,18 @@ PAGE = 4096
 
 
 def run_cli(db_path, cmds):
+    env = os.environ.copy()
+    env["ASAN_OPTIONS"] = "detect_leaks=1"
+    if os.path.exists("/usr/lib/libasan.so"):
+        env["LD_PRELOAD"] = "/usr/lib/libasan.so"
     p = subprocess.run(
         [str(DB_BIN), str(db_path)],
         input="\n".join(cmds) + "\n.exit\n",
         capture_output=True, text=True, timeout=120,
+        env=env,
     )
     return p
+
 
 
 @pytest.mark.parametrize("n", range(990, 1040))

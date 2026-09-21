@@ -605,8 +605,10 @@ static ExecuteResult run_insert_vm(Statement* stmt, TableDef* def, Catalog* cata
 
         if (fk_eq) {
           fk_found = true;
+          value_free_row(row_vals, target_def->num_cols);
           break;
         }
+        value_free_row(row_vals, target_def->num_cols);
         cursor_advance(target_cursor);
       }
       free(target_cursor);
@@ -3428,6 +3430,7 @@ static ExecuteResult run_aggregate_select(Statement* stmt, TableDef* def, Catalo
         }
       }
     }
+    value_free_row(row_vals, def->num_cols);
     cursor_advance(cursor);
   }
   free(cursor);
@@ -3529,7 +3532,8 @@ static ExecuteResult run_group_by_select(Statement* stmt, TableDef* def, Catalog
         }
         bucket_idx = (int)num_buckets++;
         GroupBucket* gb = &buckets[bucket_idx];
-        gb->key = key;
+        value_init(&gb->key);
+        value_copy(&gb->key, &key);
         for (uint32_t i = 0; i < stmt->num_select_cols; i++) {
           gb->counts[i] = 0;
           gb->sums[i] = 0.0;
@@ -3568,6 +3572,7 @@ static ExecuteResult run_group_by_select(Statement* stmt, TableDef* def, Catalog
         }
       }
     }
+    value_free_row(row_vals, def->num_cols);
     cursor_advance(cursor);
   }
   free(cursor);
@@ -3660,6 +3665,9 @@ static ExecuteResult run_group_by_select(Statement* stmt, TableDef* def, Catalog
       }
     }
     printf(")\n");
+  }
+  for (uint32_t b = 0; b < num_buckets; b++) {
+    value_free(&buckets[b].key);
   }
   free(buckets);
   return EXECUTE_SUCCESS;
@@ -4822,6 +4830,7 @@ static ExecuteResult execute_vacuum_into(Statement* stmt, Catalog* catalog, Page
             free(idx_cur);
           }
         }
+        value_free_row(values, def->num_cols);
         cursor_advance(src_cur);
       }
       free(src_cur);
@@ -4931,7 +4940,7 @@ static ExecuteResult execute_vacuum(Catalog* catalog, Pager* pager) {
           free(idx_cur);
         }
       }
-
+      value_free_row(values, def->num_cols);
       cursor_advance(src_cur);
     }
     free(src_cur);
@@ -5227,6 +5236,7 @@ static ExecuteResult execute_analyze(Statement* stmt, Catalog* catalog, Pager* p
       if (s_row[0].int_val >= (int32_t)next_stat_id) {
         next_stat_id = (uint32_t)s_row[0].int_val + 1;
       }
+      value_free_row(s_row, stat1_def->num_cols);
       cursor_advance(scur);
     }
     free(scur);
@@ -5446,6 +5456,7 @@ static ExecuteResult execute_alter_table(Statement* stmt, Catalog* catalog, Page
       btree_insert(ins_cur, new_vals);
       free(ins_cur);
 
+      value_free_row(old_vals, def->num_cols);
       cursor_advance(cur);
     }
     free(cur);
@@ -5507,6 +5518,7 @@ static ExecuteResult execute_alter_table(Statement* stmt, Catalog* catalog, Page
       btree_insert(ins_cur, new_vals);
       free(ins_cur);
 
+      value_free_row(old_vals, def->num_cols);
       cursor_advance(cur);
     }
     free(cur);
@@ -5683,6 +5695,7 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
             Cursor* idx_cur = btree_find(&idx_tbl, &idx_vals[0]);
             btree_insert(idx_cur, idx_vals);
             free(idx_cur);
+            value_free_row(row_vals, def->num_cols);
             cursor_advance(cur);
           }
           free(cur);
@@ -5881,6 +5894,7 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
               btree_insert(dst_cur, vals);
               free(dst_cur);
             }
+            value_free_row(vals, src_def->num_cols);
             cursor_advance(cur);
           }
           free(cur);
@@ -6043,9 +6057,13 @@ ExecuteResult execute_statement(Statement* stmt, Catalog* catalog, Pager* pager)
                 }
                 result = run_insert_vm(single_ins, def, effective_catalog, effective_pager);
                 free(single_ins);
-                if (result != EXECUTE_SUCCESS) break;
+                if (result != EXECUTE_SUCCESS) {
+                  value_free_row(r_vals, src_def->num_cols);
+                  break;
+                }
               }
             }
+            value_free_row(r_vals, src_def->num_cols);
             cursor_advance(cur);
           }
           free(cur);
