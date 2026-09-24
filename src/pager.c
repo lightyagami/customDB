@@ -383,6 +383,19 @@ void pager_refresh_if_modified(Pager* pager) {
   if (!pager || pager->in_transaction || pager->is_memory || pager->file_descriptor == -1) {
     return;
   }
+  struct stat st, cur_st;
+  bool inode_changed = false;
+  if (pager->main_filename[0] != '\0' && stat(pager->main_filename, &st) == 0 && fstat(pager->file_descriptor, &cur_st) == 0) {
+    if (st.st_ino != cur_st.st_ino || st.st_dev != cur_st.st_dev) {
+      int new_fd = open(pager->main_filename, O_RDWR | O_BINARY, S_IWUSR | S_IRUSR);
+      if (new_fd >= 0) {
+        close(pager->file_descriptor);
+        pager->file_descriptor = new_fd;
+        inode_changed = true;
+      }
+    }
+  }
+
   off_t cur_len = lseek(pager->file_descriptor, 0, SEEK_END);
   uint64_t disk_lsn = 0;
   if (cur_len >= PAGE_SIZE) {
@@ -415,7 +428,7 @@ void pager_refresh_if_modified(Pager* pager) {
   }
 
   uint64_t effective_lsn = (wal_max_lsn > disk_lsn) ? wal_max_lsn : disk_lsn;
-  bool modified = (effective_lsn > pager->wal_lsn || (uint32_t)cur_len != pager->file_length);
+  bool modified = (inode_changed || effective_lsn > pager->wal_lsn || (uint32_t)cur_len != pager->file_length);
   if (modified) {
     for (uint32_t i = 0; i < pager->max_pages; i++) {
       if (pager->pages[i]) {

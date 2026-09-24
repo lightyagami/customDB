@@ -153,9 +153,6 @@ def test_vacuum_preserves_multi_page_overflow_rows(tmp_path):
     finally:
         api.close()
 
-
-@pytest.mark.xfail(strict=True, reason="pre-existing: execute_vacuum copies logically deleted "
-                                        "(xmax != 0) row versions back in as live rows")
 def test_vacuum_does_not_resurrect_deleted_rows(tmp_path):
     p = run_cli(tmp_path / "r.db", [
         "CREATE TABLE t (id INT, name TEXT);",

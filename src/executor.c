@@ -4771,6 +4771,7 @@ static ExecuteResult execute_vacuum_into(Statement* stmt, Catalog* catalog, Page
   memcpy(target_catalog->triggers, catalog->triggers, sizeof(catalog->triggers));
   target_pager->reserved_catalog_pages = catalog_get_reserved_pages(catalog->num_tables);
   target_pager->auto_vacuum = pager->auto_vacuum;
+  target_pager->wal_lsn = pager->wal_lsn;
 
   for (uint32_t t = 0; t < catalog->num_tables; t++) {
     TableDef* def = &catalog->tables[t];
@@ -4800,12 +4801,29 @@ static ExecuteResult execute_vacuum_into(Statement* stmt, Catalog* catalog, Page
       Table src_table = { pager, def };
       Table dst_table = { target_pager, &target_def };
 
+      uint64_t min_active = pager_get_min_active_snapshot_xid(pager);
+      time_t now_ts = time(NULL);
       Cursor* src_cur = btree_start(&src_table);
       Value values[MAX_COLUMNS];
       while (!src_cur->end_of_table) {
-        deserialize_row(def, cursor_value(src_cur), values);
+        uint64_t expire_at = 0, xmin = 0, xmax = 0;
+        deserialize_row_with_mvcc(def, cursor_value(src_cur), values, &expire_at, &xmin, &xmax);
+
+        bool is_dead = false;
+        if (xmax != 0 && xmax <= min_active) {
+          is_dead = true;
+        } else if (expire_at > 0 && (time_t)expire_at < now_ts) {
+          is_dead = true;
+        }
+
+        if (is_dead) {
+          value_free_row(values, def->num_cols);
+          cursor_advance(src_cur);
+          continue;
+        }
+
         Cursor* dst_cur = btree_find(&dst_table, &values[0]);
-        btree_insert(dst_cur, values);
+        btree_insert_with_mvcc(dst_cur, values, expire_at, xmin, xmax);
         free(dst_cur);
 
         for (uint32_t c = 1; c < target_def.num_cols; c++) {
@@ -4875,6 +4893,7 @@ static ExecuteResult execute_vacuum(Catalog* catalog, Pager* pager) {
   memcpy(vac_catalog->triggers, catalog->triggers, sizeof(catalog->triggers));
   vac_pager->reserved_catalog_pages = catalog_get_reserved_pages(catalog->num_tables);
   vac_pager->auto_vacuum = pager->auto_vacuum;
+  vac_pager->wal_lsn = pager->wal_lsn;
 
   /* Copy all tables and their contents */
   for (uint32_t t = 0; t < catalog->num_tables; t++) {
@@ -4908,13 +4927,29 @@ static ExecuteResult execute_vacuum(Catalog* catalog, Pager* pager) {
     Table src_table = { pager, def };
     Table dst_table = { vac_pager, &vac_def };
 
+    uint64_t min_active = pager_get_min_active_snapshot_xid(pager);
+    time_t now_ts = time(NULL);
     Cursor* src_cur = btree_start(&src_table);
     Value values[MAX_COLUMNS];
     while (!src_cur->end_of_table) {
-      deserialize_row(def, cursor_value(src_cur), values);
-      
+      uint64_t expire_at = 0, xmin = 0, xmax = 0;
+      deserialize_row_with_mvcc(def, cursor_value(src_cur), values, &expire_at, &xmin, &xmax);
+
+      bool is_dead = false;
+      if (xmax != 0 && xmax <= min_active) {
+        is_dead = true;
+      } else if (expire_at > 0 && (time_t)expire_at < now_ts) {
+        is_dead = true;
+      }
+
+      if (is_dead) {
+        value_free_row(values, def->num_cols);
+        cursor_advance(src_cur);
+        continue;
+      }
+
       Cursor* dst_cur = btree_find(&dst_table, &values[0]);
-      btree_insert(dst_cur, values);
+      btree_insert_with_mvcc(dst_cur, values, expire_at, xmin, xmax);
       free(dst_cur);
 
       /* Insert into secondary indexes */

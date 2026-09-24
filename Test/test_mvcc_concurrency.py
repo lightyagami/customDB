@@ -247,3 +247,105 @@ def test_mvcc_concurrent_readers_and_writes_with_vacuum():
     if os.path.exists(db_file):
         os.remove(db_file)
 
+
+def test_mvcc_vacuum_concurrent_snapshot_isolation():
+    """Verify that VACUUM respects concurrent active snapshots and does not purge needed versions or resurrect dead ones."""
+    db_file = "test_mvcc_vac_iso.db"
+    for f in [db_file, f"{db_file}-wal", f"{db_file}-journal"]:
+        if os.path.exists(f):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+    env = os.environ.copy()
+    env["ASAN_OPTIONS"] = "detect_leaks=1"
+    if os.path.exists("/usr/lib/libasan.so"):
+        env["LD_PRELOAD"] = "/usr/lib/libasan.so"
+
+    # 1. Initialize table with initial row and secondary index
+    p_init = subprocess.Popen(["./db", db_file], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    p_init.communicate(
+        "PRAGMA journal_mode = WAL;\n"
+        "CREATE TABLE t (id INT, val TEXT);\n"
+        "CREATE INDEX idx_val ON t(val);\n"
+        "INSERT INTO t VALUES (1, 'initial');\n"
+        ".exit\n"
+    )
+
+    # 2. Start Reader A process with an open transaction holding snapshot 1
+    p_reader = subprocess.Popen(["./db", db_file], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    p_reader.stdin.write("begin\n")
+    p_reader.stdin.write("select * from t\n")
+    p_reader.stdin.flush()
+    time.sleep(0.2)
+
+    # 3. Writer B updates row 1, inserts row 2, and deletes row 2
+    p_writer = subprocess.Popen(["./db", db_file], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    p_writer.communicate(
+        "UPDATE t SET val = 'updated' WHERE id = 1;\n"
+        "INSERT INTO t VALUES (2, 'temp');\n"
+        "DELETE FROM t WHERE id = 2;\n"
+        ".exit\n"
+    )
+
+    # 4. VACUUM runs in separate process while Reader A still holds its snapshot
+    p_vac = subprocess.Popen(["./db", db_file], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    p_vac.communicate("VACUUM;\n.exit\n")
+
+    # 5. Reader A queries again within its transaction:
+    # Must still see 'initial' for id=1, and must NOT see row 2
+    p_reader.stdin.write("select * from t where id = 1\n")
+    p_reader.stdin.write("select count(*) from t\n")
+    p_reader.stdin.write("commit\n")
+    # After commit, Reader A sees updated state
+    p_reader.stdin.write("select * from t where id = 1\n")
+    p_reader.stdin.write("select count(*) from t\n")
+    p_reader.stdin.write(".exit\n")
+    out_r, _ = p_reader.communicate()
+
+    lines = [l.strip() for l in out_r.splitlines() if "(" in l and not l.startswith("CREATE")]
+    # First select inside tx: (1, initial)
+    assert "(1, initial)" in lines[0]
+    # Second select inside tx after VACUUM: still (1, initial)
+    assert "(1, initial)" in lines[1]
+    # Third select inside tx (count): 1
+    assert "(1)" in lines[2]
+
+    # After commit:
+    # Fourth select: (1, updated)
+    assert "(1, updated)" in lines[3]
+    # Fifth select: count is 1 (row 2 was NOT resurrected)
+    assert "(1)" in lines[4]
+
+    # 6. Verify with a brand new reader and through secondary index
+    p_check = subprocess.Popen(["./db", db_file], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    out_c, _ = p_check.communicate(
+        "SELECT * FROM t WHERE val = 'updated';\n"
+        "SELECT * FROM t WHERE val = 'temp';\n"
+        "SELECT count(*) FROM t;\n"
+        ".exit\n"
+    )
+    c_lines = [l.strip() for l in out_c.splitlines() if "(" in l and not l.startswith("CREATE")]
+    assert "(1, updated)" in c_lines[0]
+    # 'temp' was deleted, must not be found via index scan
+    assert not any("temp" in l for l in c_lines)
+    assert "(1)" in c_lines[1]
+
+    # 7. Run VACUUM again now that Reader A has committed
+    p_vac2 = subprocess.Popen(["./db", db_file], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    p_vac2.communicate("VACUUM;\n.exit\n")
+
+    p_final = subprocess.Popen(["./db", db_file], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    out_f, _ = p_final.communicate("SELECT count(*) FROM t;\n.exit\n")
+    f_lines = [l.strip() for l in out_f.splitlines() if "(" in l]
+    assert "(1)" in f_lines[0]
+
+    for f in [db_file, f"{db_file}-wal", f"{db_file}-journal"]:
+        if os.path.exists(f):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
