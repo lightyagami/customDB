@@ -87,28 +87,7 @@ static void release_file_lock_node(FileLockNode* node) {
   pthread_mutex_unlock(&g_file_lock_registry_mutex);
 }
 
-static void check_and_recover_journal(Pager* pager) {
-  struct stat st;
-  if (stat(pager->journal_filename, &st) == 0 && st.st_size > 0) {
-    int jfd = open(pager->journal_filename, O_RDONLY | O_BINARY);
-    if (jfd != -1) {
-      uint32_t pnum;
-      uint8_t page_buf[PAGE_SIZE];
-      while (read(jfd, &pnum, 4) == 4) {
-        if (read(jfd, page_buf, PAGE_SIZE) == PAGE_SIZE) {
-          lseek(pager->file_descriptor, (off_t)pnum * PAGE_SIZE, SEEK_SET);
-          ssize_t w = write(pager->file_descriptor, page_buf, PAGE_SIZE);
-          if (w != (ssize_t)PAGE_SIZE) {
-            fprintf(stderr, "[RECOVERY] Warning: failed to write recovered page %u\n", pnum);
-          }
-        }
-      }
-      close(jfd);
-      unlink(pager->journal_filename);
-      printf("[RECOVERY] Recovered database from journal '%s'.\n", pager->journal_filename);
-    }
-  }
-}
+static void check_and_recover_journal(Pager* pager);
 
 Pager* pager_open(const char* filename) {
   Pager* pager = malloc(sizeof(Pager));
@@ -377,6 +356,42 @@ void pager_unlock(Pager* pager) {
   lock_file_byte(pager->file_descriptor, PENDING_BYTE, F_UNLCK, false);
   
   pager->lock_state = NO_LOCK;
+}
+
+static void check_and_recover_journal(Pager* pager) {
+  struct stat st;
+  if (stat(pager->journal_filename, &st) == 0 && st.st_size > 0) {
+    /* Only attempt recovery if no other active writer holds the database lock.
+     * If RESERVED or SHARED is held by an active live writer, this journal belongs
+     * to a currently running transaction, NOT a crashed process! */
+    if (is_byte_locked(pager->file_descriptor, RESERVED_BYTE, F_WRLCK) ||
+        is_byte_locked(pager->file_descriptor, PENDING_BYTE, F_WRLCK)) {
+      return;
+    }
+    /* Acquire exclusive lock to perform recovery safely */
+    if (lock_file_byte(pager->file_descriptor, RESERVED_BYTE, F_WRLCK, false) == -1) {
+      return;
+    }
+
+    int jfd = open(pager->journal_filename, O_RDONLY | O_BINARY);
+    if (jfd != -1) {
+      uint32_t pnum;
+      uint8_t page_buf[PAGE_SIZE];
+      while (read(jfd, &pnum, 4) == 4) {
+        if (read(jfd, page_buf, PAGE_SIZE) == PAGE_SIZE) {
+          lseek(pager->file_descriptor, (off_t)pnum * PAGE_SIZE, SEEK_SET);
+          ssize_t w = write(pager->file_descriptor, page_buf, PAGE_SIZE);
+          if (w != (ssize_t)PAGE_SIZE) {
+            fprintf(stderr, "[RECOVERY] Warning: failed to write recovered page %u\n", pnum);
+          }
+        }
+      }
+      close(jfd);
+      unlink(pager->journal_filename);
+      printf("[RECOVERY] Recovered database from journal '%s'.\n", pager->journal_filename);
+    }
+    lock_file_byte(pager->file_descriptor, RESERVED_BYTE, F_UNLCK, false);
+  }
 }
 
 void pager_refresh_if_modified(Pager* pager) {
